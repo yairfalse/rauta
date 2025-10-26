@@ -5,15 +5,12 @@
 //! Shared data structures between eBPF and userspace components.
 //! All types are Pod-compatible (Plain Old Data) for BPF map usage.
 
-/// Marker trait for types that can be safely used in BPF maps
-///
-/// # Safety
-///
-/// Types implementing this trait must be:
-/// - `#[repr(C)]` or `#[repr(transparent)]`
-/// - Composed only of POD types (no pointers, no heap allocations)
-/// - Safe to transmute from a byte array
-/// - Have no padding bytes with undefined values
+// For userspace: import aya::Pod trait
+#[cfg(feature = "aya")]
+use aya::Pod;
+
+// For eBPF: No Pod trait needed - types are automatically compatible if #[repr(C)]
+#[cfg(feature = "aya-ebpf")]
 pub unsafe trait Pod: Copy + 'static {}
 
 /// Maximum path length for HTTP routing (99%+ coverage)
@@ -24,6 +21,10 @@ pub const MAX_BACKENDS: usize = 32;
 
 /// Maximum number of routing rules
 pub const MAX_ROUTES: u32 = 65536;
+
+/// Maglev lookup table size (must be prime for good distribution)
+/// Using 65537 (next prime after 65536) as recommended by Google's Maglev paper
+pub const MAGLEV_TABLE_SIZE: usize = 65537;
 
 /// HTTP methods supported for routing
 #[repr(u8)]
@@ -251,6 +252,119 @@ pub const fn fnv1a_hash(bytes: &[u8]) -> u64 {
         i += 1;
     }
     hash
+}
+
+/// Maglev Consistent Hashing Implementation
+///
+/// Based on Google's Maglev paper: https://research.google/pubs/pub44824/
+///
+/// Maglev provides O(1) lookup with minimal disruption (~1/N) when backends change.
+
+#[cfg(not(target_arch = "bpf"))]
+extern crate alloc;
+#[cfg(not(target_arch = "bpf"))]
+use alloc::vec;
+#[cfg(not(target_arch = "bpf"))]
+use alloc::vec::Vec;
+
+/// Build Maglev lookup table for a set of backends
+///
+/// Returns a table of size MAGLEV_TABLE_SIZE where each entry maps to a backend index.
+/// The algorithm ensures:
+/// - Even distribution across backends
+/// - Minimal disruption when backends change (~1/N)
+/// - Deterministic results for same backend set
+#[cfg(not(target_arch = "bpf"))]
+pub fn maglev_build_table(backends: &[Backend]) -> Vec<Option<u32>> {
+    if backends.is_empty() {
+        return vec![None; MAGLEV_TABLE_SIZE];
+    }
+
+    // Initialize table with None
+    let mut table = vec![None; MAGLEV_TABLE_SIZE];
+
+    // Generate permutations for each backend
+    let mut permutations = Vec::with_capacity(backends.len());
+    for (i, backend) in backends.iter().enumerate() {
+        permutations.push(generate_permutation(backend, i as u32));
+    }
+
+    // Fill the table
+    let mut filled = 0;
+    let mut n = 0;
+
+    // Continue until table is full
+    while filled < MAGLEV_TABLE_SIZE {
+        for (backend_idx, perm) in permutations.iter().enumerate() {
+            let c = perm[n % MAGLEV_TABLE_SIZE];
+
+            // Try to claim this slot
+            if table[c].is_none() {
+                table[c] = Some(backend_idx as u32);
+                filled += 1;
+
+                if filled == MAGLEV_TABLE_SIZE {
+                    break;
+                }
+            }
+        }
+        n += 1;
+    }
+
+    table
+}
+
+/// Generate permutation for a backend using Maglev's double hashing
+#[cfg(not(target_arch = "bpf"))]
+fn generate_permutation(backend: &Backend, backend_idx: u32) -> Vec<usize> {
+    // Generate two hash values for offset and skip
+    // Use backend IP + port as key, backend_idx as additional seed to avoid collisions
+    let key = ((backend.ipv4 as u64) << 16) | (backend.port as u64);
+
+    let offset = (hash_backend(key, backend_idx as u64) % MAGLEV_TABLE_SIZE as u64) as usize;
+    let skip = ((hash_backend(key, backend_idx as u64 + 1) % (MAGLEV_TABLE_SIZE as u64 - 1)) + 1) as usize;
+
+    // Generate permutation
+    let mut perm = Vec::with_capacity(MAGLEV_TABLE_SIZE);
+    for j in 0..MAGLEV_TABLE_SIZE {
+        perm.push((offset + j * skip) % MAGLEV_TABLE_SIZE);
+    }
+
+    perm
+}
+
+/// Hash function for Maglev permutation generation
+#[cfg(not(target_arch = "bpf"))]
+fn hash_backend(key: u64, seed: u64) -> u64 {
+    // FNV-1a hash with seed
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET ^ seed;
+
+    // Hash the key bytes
+    for i in 0..8 {
+        let byte = ((key >> (i * 8)) & 0xFF) as u8;
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+
+    hash
+}
+
+/// Lookup backend index for a given flow key using Maglev table
+///
+/// This is the fast-path function used in XDP.
+/// Takes O(1) time.
+#[inline(always)]
+pub fn maglev_lookup(flow_key: u64, table: &[Option<u32>]) -> Option<u32> {
+    if table.is_empty() {
+        return None;
+    }
+
+    // Hash the flow key and look up in table
+    let idx = (flow_key % table.len() as u64) as usize;
+    table.get(idx).copied().flatten()
 }
 
 #[cfg(test)]

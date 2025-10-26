@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use aya::{
     include_bytes_aligned,
-    maps::{HashMap, LruHashMap, PerCpuArray},
+    maps::{Array, HashMap, PerCpuArray},
     programs::{Xdp, XdpFlags},
-    Bpf,
+    Ebpf,
 };
 use common::{BackendList, Metrics, RouteKey};
 use std::net::Ipv4Addr;
@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
 
 /// Main control structure
 pub struct RautaControl {
-    bpf: Bpf,
+    bpf: Ebpf,
 }
 
 impl RautaControl {
@@ -84,13 +84,13 @@ impl RautaControl {
     pub async fn load(interface: &str, xdp_mode: &str) -> Result<Self, RautaError> {
         // Load BPF program from embedded bytes
         #[cfg(debug_assertions)]
-        let mut bpf = Bpf::load(include_bytes_aligned!(
+        let mut bpf = Ebpf::load(include_bytes_aligned!(
             "../../target/bpfel-unknown-none/debug/rauta"
         ))
         .map_err(|e| RautaError::BpfLoadError(e.to_string()))?;
 
         #[cfg(not(debug_assertions))]
-        let mut bpf = Bpf::load(include_bytes_aligned!(
+        let mut bpf = Ebpf::load(include_bytes_aligned!(
             "../../target/bpfel-unknown-none/release/rauta"
         ))
         .map_err(|e| RautaError::BpfLoadError(e.to_string()))?;
@@ -178,30 +178,90 @@ impl RautaControl {
             "Route added successfully"
         );
 
+        // TODO(architectural): Current limitation - single global MAGLEV_TABLE
+        //
+        // The current design has ONE global MAGLEV_TABLE but multiple routes with
+        // different backends. This only works correctly when:
+        // 1. All routes share the same backend pool (Kubernetes use case), OR
+        // 2. Only one route exists (current test case)
+        //
+        // For production, we need one of:
+        // - Per-route Maglev tables (requires BackendList to include table)
+        // - Global backend pool (requires refactoring routes to use backend IDs)
+        // - Simpler per-route hashing (fallback from Maglev)
+        //
+        // For now, test route works because it's the only route.
+        self.update_maglev_table(&[backend])?;
+
+        info!(
+            backends = backend_list.count,
+            table_size = common::MAGLEV_TABLE_SIZE,
+            "Maglev lookup table populated (LIMITATION: single route only)"
+        );
+
         Ok(())
     }
 
     /// Get metrics map for reporting
-    pub fn metrics_map(&mut self) -> PerCpuArray<&aya::maps::MapData, Metrics> {
+    pub fn metrics_map(&mut self) -> PerCpuArray<&mut aya::maps::MapData, Metrics> {
         PerCpuArray::try_from(self.bpf.map_mut("METRICS").expect("METRICS map not found"))
             .expect("Failed to access METRICS map")
     }
 
     /// Get routes map
-    pub fn routes_map(&mut self) -> HashMap<&aya::maps::MapData, RouteKey, BackendList> {
+    pub fn routes_map(&mut self) -> HashMap<&mut aya::maps::MapData, RouteKey, BackendList> {
         HashMap::try_from(self.bpf.map_mut("ROUTES").expect("ROUTES map not found"))
             .expect("Failed to access ROUTES map")
     }
 
-    /// Get flow cache map
-    pub fn flow_cache_map(&mut self) -> LruHashMap<&aya::maps::MapData, u64, u32> {
-        LruHashMap::try_from(self.bpf.map_mut("FLOW_CACHE").expect("FLOW_CACHE map not found"))
-            .expect("Failed to access FLOW_CACHE map")
+    /// Update Maglev lookup table for consistent hashing
+    ///
+    /// Builds a Maglev table for the given backends and populates the MAGLEV_TABLE BPF map.
+    /// This enables O(1) backend selection with minimal disruption (~1/N) when backends change.
+    pub fn update_maglev_table(&mut self, backends: &[common::Backend]) -> Result<(), RautaError> {
+        use common::{maglev_build_table, MAGLEV_TABLE_SIZE};
+
+        info!(
+            backend_count = backends.len(),
+            "Building Maglev lookup table"
+        );
+
+        // Build Maglev table (in userspace)
+        let table = maglev_build_table(backends);
+
+        // Get MAGLEV_TABLE map
+        let mut maglev_map: Array<_, u32> =
+            Array::try_from(self.bpf.map_mut("MAGLEV_TABLE").ok_or_else(|| {
+                RautaError::MapNotFound("MAGLEV_TABLE map not found".to_string())
+            })?)
+            .map_err(|e| {
+                RautaError::MapAccessError(format!("Failed to access MAGLEV_TABLE map: {}", e))
+            })?;
+
+        // Populate the BPF map
+        for (idx, backend_idx) in table.iter().enumerate() {
+            let value = backend_idx.unwrap_or(u32::MAX); // Use u32::MAX for empty slots
+            maglev_map
+                .set(idx as u32, value, 0)
+                .map_err(|e| {
+                    RautaError::MapAccessError(format!(
+                        "Failed to set Maglev table entry {}: {}",
+                        idx, e
+                    ))
+                })?;
+        }
+
+        info!(
+            entries = MAGLEV_TABLE_SIZE,
+            "Maglev table populated successfully"
+        );
+
+        Ok(())
     }
 }
 
 /// Report metrics periodically
-async fn metrics_reporter(mut metrics: PerCpuArray<&aya::maps::MapData, Metrics>) {
+async fn metrics_reporter(mut metrics: PerCpuArray<&mut aya::maps::MapData, Metrics>) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
     loop {

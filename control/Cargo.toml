@@ -10,9 +10,9 @@ tokio = { version = "1.41", features = ["full"] }
 anyhow = "1.0"
 thiserror = "1.0"
 
-# eBPF (Aya framework)
-aya = { git = "https://github.com/aya-rs/aya", features = ["async_tokio"] }
-aya-log = { git = "https://github.com/aya-rs/aya" }
+# eBPF (Aya framework) - Using stable 0.13.1 for macOS compatibility
+aya = "0.13"
+aya-log = "0.2"
 
 # Kubernetes
 kube = { version = "0.95", features = ["runtime", "derive"] }

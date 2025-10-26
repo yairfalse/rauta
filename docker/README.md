@@ -212,12 +212,14 @@ After validating in Docker:
 ```
 docker/
 ├── README.md          # This file
-├── build.sh           # Build RAUTA image
-├── test.sh            # Run integration tests
-└── benchmark.sh       # Performance benchmarks
-
-Dockerfile             # Multi-stage build
-docker-compose.yml     # Service orchestration
+├── build.sh               # Build RAUTA image
+├── build-quick.sh         # Quick build test (fast iteration)
+├── test.sh                # Run integration tests
+├── benchmark.sh           # Performance benchmarks
+├── Dockerfile.dev         # Development environment
+├── Dockerfile.prod        # Production multi-stage build
+├── docker-compose.yml     # Development compose (dev container)
+└── docker-compose.prod.yml # Production compose (full stack)
 ```
 
 ## References

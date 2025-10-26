@@ -16,7 +16,7 @@ Both provide excellent development experiences!
 ### One-Command Setup (Recommended)
 
 ```bash
-./setup.sh
+./scripts/setup.sh
 ```
 
 This auto-detects your platform and installs the right tools.
@@ -28,7 +28,7 @@ This auto-detects your platform and installs the right tools.
 ### Setup (One Time)
 
 ```bash
-./setup.sh
+./scripts/setup.sh
 ```
 
 This installs:
@@ -56,7 +56,7 @@ cd common
 cargo test
 
 # Auto-rebuild on changes
-./watch_bpf.sh
+./scripts/watch_bpf.sh
 ```
 
 **Build time**: ~5-10 seconds (incremental)
@@ -95,7 +95,7 @@ sudo pacman -S base-devel llvm clang libelf linux-headers
 ### Setup (One Time)
 
 ```bash
-./setup.sh
+./scripts/setup.sh
 ```
 
 This installs:
@@ -152,7 +152,7 @@ cargo check
 
 ```bash
 # Build everything
-./build_local.sh              # Linux: includes BPF
+./scripts/build_local.sh              # Linux: includes BPF
                               # macOS: common + control only
 
 # Build just BPF
@@ -166,7 +166,7 @@ cd control && cargo build --release
 cd common && cargo test
 
 # Auto-rebuild
-./watch_bpf.sh                # Linux only (requires cargo-watch)
+./scripts/watch_bpf.sh                # Linux only (requires cargo-watch)
 ```
 
 ### TDD Workflow (Both Platforms)
@@ -251,7 +251,7 @@ vim src/forwarding.rs             # Edit (just save, no build yet)
 **Linux**:
 ```bash
 # Watch mode - auto-rebuild
-./watch_bpf.sh
+./scripts/watch_bpf.sh
 # Rebuilds in 5 seconds on save!
 ```
 
@@ -403,14 +403,14 @@ A: No! Unit tests are instant. You only use Docker when testing BPF changes (~10
 
 ### Linux Setup
 
-1. **Run setup**: `./setup.sh`
-2. **Build project**: `./build_local.sh`
+1. **Run setup**: `./scripts/setup.sh`
+2. **Build project**: `./scripts/build_local.sh`
 3. **Run tests**: `cd common && cargo test`
 4. **Start developing**: Edit → Build → Test (all native!)
 
 ### macOS Setup
 
-1. **Run setup**: `./setup.sh`
+1. **Run setup**: `./scripts/setup.sh`
 2. **Run tests**: `cd common && cargo test`
 3. **Edit code**: VS Code or your favorite editor
 4. **Test BPF**: `./docker/build.sh` (when ready)

@@ -2,7 +2,13 @@
 
 **Kernel-accelerated Kubernetes Ingress Controller**
 
+[![CI](https://github.com/yairfalse/rauta/actions/workflows/ci.yml/badge.svg)](https://github.com/yairfalse/rauta/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+
 RAUTA is an experimental ingress controller that uses eBPF to route HTTP traffic directly in the Linux kernel, bypassing traditional userspace proxies for simple requests.
+
+> **Status**: 🚧 Experimental - Active Development on [`feat/maglev-implementation`](https://github.com/yairfalse/rauta/tree/feat/maglev-implementation)
 
 ## What We're Building
 
@@ -139,7 +145,7 @@ RAUTA uses **Maglev consistent hashing** for backend selection:
 **One-command setup** - auto-detects your platform:
 
 ```bash
-./setup.sh
+./scripts/setup.sh
 ```
 
 **Linux** 🐧 (Full Native Toolchain):
@@ -174,6 +180,8 @@ See [DEVELOPMENT.md](DEVELOPMENT.md) for platform-specific guides.
 ```
 
 See [docker/README.md](docker/README.md) for details.
+
+> 💡 **Build Issues?** Check [BUILD.md](BUILD.md) for platform-specific troubleshooting (macOS LLVM, Linux deps, CI setup)
 
 ### Project Structure
 
