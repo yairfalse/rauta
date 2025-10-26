@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 aya-ebpf = { git = "https://github.com/aya-rs/aya", default-features = false }
-common = { path = "../common", default-features = false }
+common = { path = "../common", default-features = false, features = ["aya-ebpf"] }
 
 [profile.dev]
 opt-level = 3

@@ -5,15 +5,12 @@
 //! Shared data structures between eBPF and userspace components.
 //! All types are Pod-compatible (Plain Old Data) for BPF map usage.
 
-/// Marker trait for types that can be safely used in BPF maps
-///
-/// # Safety
-///
-/// Types implementing this trait must be:
-/// - `#[repr(C)]` or `#[repr(transparent)]`
-/// - Composed only of POD types (no pointers, no heap allocations)
-/// - Safe to transmute from a byte array
-/// - Have no padding bytes with undefined values
+// For userspace: import aya::Pod trait
+#[cfg(feature = "aya")]
+use aya::Pod;
+
+// For eBPF: No Pod trait needed - types are automatically compatible if #[repr(C)]
+#[cfg(feature = "aya-ebpf")]
 pub unsafe trait Pod: Copy + 'static {}
 
 /// Maximum path length for HTTP routing (99%+ coverage)

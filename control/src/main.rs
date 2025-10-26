@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use aya::{
     include_bytes_aligned,
-    maps::{Array, HashMap, LruHashMap, PerCpuArray},
+    maps::{Array, HashMap, PerCpuArray},
     programs::{Xdp, XdpFlags},
-    Bpf,
+    Ebpf,
 };
 use common::{BackendList, Metrics, RouteKey};
 use std::net::Ipv4Addr;
@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
 
 /// Main control structure
 pub struct RautaControl {
-    bpf: Bpf,
+    bpf: Ebpf,
 }
 
 impl RautaControl {
@@ -84,13 +84,13 @@ impl RautaControl {
     pub async fn load(interface: &str, xdp_mode: &str) -> Result<Self, RautaError> {
         // Load BPF program from embedded bytes
         #[cfg(debug_assertions)]
-        let mut bpf = Bpf::load(include_bytes_aligned!(
+        let mut bpf = Ebpf::load(include_bytes_aligned!(
             "../../target/bpfel-unknown-none/debug/rauta"
         ))
         .map_err(|e| RautaError::BpfLoadError(e.to_string()))?;
 
         #[cfg(not(debug_assertions))]
-        let mut bpf = Bpf::load(include_bytes_aligned!(
+        let mut bpf = Ebpf::load(include_bytes_aligned!(
             "../../target/bpfel-unknown-none/release/rauta"
         ))
         .map_err(|e| RautaError::BpfLoadError(e.to_string()))?;
@@ -203,21 +203,15 @@ impl RautaControl {
     }
 
     /// Get metrics map for reporting
-    pub fn metrics_map(&mut self) -> PerCpuArray<&aya::maps::MapData, Metrics> {
+    pub fn metrics_map(&mut self) -> PerCpuArray<&mut aya::maps::MapData, Metrics> {
         PerCpuArray::try_from(self.bpf.map_mut("METRICS").expect("METRICS map not found"))
             .expect("Failed to access METRICS map")
     }
 
     /// Get routes map
-    pub fn routes_map(&mut self) -> HashMap<&aya::maps::MapData, RouteKey, BackendList> {
+    pub fn routes_map(&mut self) -> HashMap<&mut aya::maps::MapData, RouteKey, BackendList> {
         HashMap::try_from(self.bpf.map_mut("ROUTES").expect("ROUTES map not found"))
             .expect("Failed to access ROUTES map")
-    }
-
-    /// Get flow cache map
-    pub fn flow_cache_map(&mut self) -> LruHashMap<&aya::maps::MapData, u64, u32> {
-        LruHashMap::try_from(self.bpf.map_mut("FLOW_CACHE").expect("FLOW_CACHE map not found"))
-            .expect("Failed to access FLOW_CACHE map")
     }
 
     /// Update Maglev lookup table for consistent hashing
@@ -267,7 +261,7 @@ impl RautaControl {
 }
 
 /// Report metrics periodically
-async fn metrics_reporter(mut metrics: PerCpuArray<&aya::maps::MapData, Metrics>) {
+async fn metrics_reporter(mut metrics: PerCpuArray<&mut aya::maps::MapData, Metrics>) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
     loop {

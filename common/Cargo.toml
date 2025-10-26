@@ -5,7 +5,10 @@ edition = "2021"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"], optional = true }
+aya = { git = "https://github.com/aya-rs/aya", optional = true }
+aya-ebpf = { git = "https://github.com/aya-rs/aya", optional = true }
 
 [features]
-default = ["serde"]
+default = ["serde", "aya"]
 std = []
+aya-ebpf = ["dep:aya-ebpf"]
