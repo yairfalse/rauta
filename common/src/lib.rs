@@ -44,18 +44,47 @@ impl HttpMethod {
     /// Parse HTTP method from byte slice
     /// Returns None if method is unknown or slice is too short
     pub const fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 3 {
+        if bytes.len() < 4 {
+            // Minimum: "GET " = 4 bytes
             return None;
         }
 
         match (bytes[0], bytes[1], bytes[2]) {
-            (b'G', b'E', b'T') => Some(HttpMethod::GET),
-            (b'P', b'O', b'S') if bytes.len() >= 4 && bytes[3] == b'T' => Some(HttpMethod::POST),
-            (b'P', b'U', b'T') => Some(HttpMethod::PUT),
-            (b'D', b'E', b'L') if bytes.len() >= 6 => Some(HttpMethod::DELETE),
-            (b'H', b'E', b'A') if bytes.len() >= 4 && bytes[3] == b'D' => Some(HttpMethod::HEAD),
-            (b'O', b'P', b'T') if bytes.len() >= 7 => Some(HttpMethod::OPTIONS),
-            (b'P', b'A', b'T') if bytes.len() >= 5 && bytes[4] == b'H' => Some(HttpMethod::PATCH),
+            (b'G', b'E', b'T') if bytes[3] == b' ' => Some(HttpMethod::GET),
+            (b'P', b'O', b'S') if bytes.len() >= 5 && bytes[3] == b'T' && bytes[4] == b' ' => {
+                Some(HttpMethod::POST)
+            }
+            (b'P', b'U', b'T') if bytes[3] == b' ' => Some(HttpMethod::PUT),
+            (b'D', b'E', b'L')
+                if bytes.len() >= 7
+                    && bytes[3] == b'E'
+                    && bytes[4] == b'T'
+                    && bytes[5] == b'E'
+                    && bytes[6] == b' ' =>
+            {
+                Some(HttpMethod::DELETE)
+            }
+            (b'H', b'E', b'A') if bytes.len() >= 5 && bytes[3] == b'D' && bytes[4] == b' ' => {
+                Some(HttpMethod::HEAD)
+            }
+            (b'O', b'P', b'T')
+                if bytes.len() >= 8
+                    && bytes[3] == b'I'
+                    && bytes[4] == b'O'
+                    && bytes[5] == b'N'
+                    && bytes[6] == b'S'
+                    && bytes[7] == b' ' =>
+            {
+                Some(HttpMethod::OPTIONS)
+            }
+            (b'P', b'A', b'T')
+                if bytes.len() >= 6
+                    && bytes[3] == b'C'
+                    && bytes[4] == b'H'
+                    && bytes[5] == b' ' =>
+            {
+                Some(HttpMethod::PATCH)
+            }
             _ => None,
         }
     }
@@ -230,12 +259,16 @@ mod tests {
 
     #[test]
     fn test_http_method_from_bytes() {
-        assert_eq!(HttpMethod::from_bytes(b"GET"), Some(HttpMethod::GET));
-        assert_eq!(HttpMethod::from_bytes(b"POST"), Some(HttpMethod::POST));
-        assert_eq!(HttpMethod::from_bytes(b"PUT"), Some(HttpMethod::PUT));
-        assert_eq!(HttpMethod::from_bytes(b"DELETE"), Some(HttpMethod::DELETE));
+        // HTTP methods must be followed by a space (HTTP/1.1 spec)
+        assert_eq!(HttpMethod::from_bytes(b"GET /"), Some(HttpMethod::GET));
+        assert_eq!(HttpMethod::from_bytes(b"POST /"), Some(HttpMethod::POST));
+        assert_eq!(HttpMethod::from_bytes(b"PUT /"), Some(HttpMethod::PUT));
+        assert_eq!(HttpMethod::from_bytes(b"DELETE /"), Some(HttpMethod::DELETE));
+
+        // Invalid methods should return None
         assert_eq!(HttpMethod::from_bytes(b"INVALID"), None);
         assert_eq!(HttpMethod::from_bytes(b"GE"), None);
+        assert_eq!(HttpMethod::from_bytes(b"GET"), None); // Missing space!
     }
 
     #[test]

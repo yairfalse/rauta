@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  # Backend HTTP server (target for RAUTA routing)
+  backend:
+    image: python:3.11-slim
+    container_name: rauta-backend
+    command: python3 -m http.server 8080
+    networks:
+      rauta-net:
+        ipv4_address: 10.0.1.10
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # RAUTA control plane (XDP load balancer)
+  rauta:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rauta-control
+    privileged: true  # Required for XDP
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+      - BPF
+    environment:
+      - RAUTA_INTERFACE=eth0
+      - RAUTA_XDP_MODE=skb  # Generic XDP mode for containers
+      - RUST_LOG=info
+    networks:
+      rauta-net:
+        ipv4_address: 10.0.1.5
+    depends_on:
+      - backend
+    command: /bin/bash -c "sleep 5 && ./bin/rauta-control"
+
+  # Test client (wrk load generator)
+  client:
+    image: williamyeh/wrk
+    container_name: rauta-client
+    networks:
+      rauta-net:
+        ipv4_address: 10.0.1.20
+    depends_on:
+      - rauta
+      - backend
+    command: sleep infinity
+
+networks:
+  rauta-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.1.0/24

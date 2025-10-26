@@ -1,0 +1,107 @@
+# RAUTA Build and Test Environment
+#
+# Multi-stage Docker build:
+# 1. Build stage: Compile BPF program and control plane
+# 2. Runtime stage: Minimal image for testing
+
+FROM rust:1.75-bookworm as builder
+
+# Install BPF development dependencies
+RUN apt-get update && apt-get install -y \
+    clang \
+    llvm \
+    libelf-dev \
+    linux-headers-generic \
+    pkg-config \
+    build-essential \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install bpf-linker for eBPF compilation
+RUN cargo install bpf-linker
+
+# Add BPF target for Rust
+RUN rustup target add bpfel-unknown-none
+
+# Set working directory
+WORKDIR /rauta
+
+# Copy workspace manifests first (for caching)
+COPY common/Cargo.toml common/Cargo.toml
+COPY bpf/Cargo.toml bpf/Cargo.toml
+COPY control/Cargo.toml control/Cargo.toml
+COPY cli/Cargo.toml cli/Cargo.toml
+
+# Create dummy source files to cache dependencies
+RUN mkdir -p common/src bpf/src control/src cli/src && \
+    echo "pub fn dummy() {}" > common/src/lib.rs && \
+    echo "fn main() {}" > bpf/src/main.rs && \
+    echo "fn main() {}" > control/src/main.rs && \
+    echo "fn main() {}" > cli/src/main.rs
+
+# Build dependencies (this layer will be cached)
+RUN cd common && cargo build --release && \
+    cd ../control && cargo build --release || true
+
+# Remove dummy files
+RUN rm -rf common/src bpf/src control/src cli/src
+
+# Copy actual source code
+COPY common/src common/src
+COPY bpf/src bpf/src
+COPY control/src control/src
+COPY cli/src cli/src
+
+# Build BPF program
+RUN cd bpf && \
+    cargo build --release --target=bpfel-unknown-none && \
+    ls -lah ../target/bpfel-unknown-none/release/
+
+# Build control plane
+RUN cd control && cargo build --release
+
+# Build CLI
+RUN cd cli && cargo build --release
+
+# ============================================
+# Runtime stage - minimal image for testing
+# ============================================
+FROM ubuntu:22.04
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    iproute2 \
+    iputils-ping \
+    curl \
+    tcpdump \
+    iperf3 \
+    wrk \
+    python3 \
+    python3-pip \
+    bpftool \
+    linux-tools-generic \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install httpbin for realistic HTTP testing
+RUN pip3 install httpbin gunicorn
+
+# Create rauta user
+RUN useradd -m -s /bin/bash rauta
+
+WORKDIR /home/rauta
+
+# Copy built artifacts from builder
+COPY --from=builder /rauta/target/bpfel-unknown-none/release/rauta ./bpf/rauta
+COPY --from=builder /rauta/target/release/control ./bin/rauta-control
+COPY --from=builder /rauta/target/release/cli ./bin/rautactl
+
+# Copy test scripts
+COPY tests/integration_test.sh ./tests/
+RUN chmod +x ./tests/integration_test.sh
+
+# Set ownership
+RUN chown -R rauta:rauta /home/rauta
+
+# Default command
+CMD ["/bin/bash"]

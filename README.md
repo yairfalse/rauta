@@ -122,7 +122,79 @@ RAUTA uses **Maglev consistent hashing** for backend selection:
 
 ## Current Status
 
-**Research and design phase.** We're validating the architecture and studying production eBPF load balancers to understand what works at scale.
+**✅ Tier 1 (XDP) Implemented** - HTTP/1.1 parsing and XDP_TX forwarding complete!
+
+### What's Working
+
+- ✅ HTTP/1.1 method parsing (GET, POST, PUT, DELETE, HEAD, PATCH, OPTIONS)
+- ✅ FNV-1a path hashing for fast route lookups
+- ✅ Fibonacci hashing for backend selection
+- ✅ LRU flow affinity cache (Cilium pattern)
+- ✅ XDP_TX hairpin NAT with checksum recalculation
+- ✅ Per-CPU metrics (lock-free counters)
+- ✅ 18 unit tests passing (TDD approach)
+
+### Quick Start (Cross-Platform)
+
+**One-command setup** - auto-detects your platform:
+
+```bash
+./setup.sh
+```
+
+**Linux** 🐧 (Full Native Toolchain):
+```bash
+# Everything works natively!
+cd bpf && cargo +nightly build --release --target=bpfel-unknown-none
+cd common && cargo test
+```
+
+**macOS** 🍎 (Hybrid Workflow):
+```bash
+# Fast unit tests
+cd common && cargo test
+
+# Build BPF in Docker (when needed)
+./docker/build.sh
+```
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for platform-specific guides.
+
+### Docker (All Platforms)
+
+```bash
+# Build RAUTA (compiles BPF + control plane)
+./docker/build.sh
+
+# Run integration tests
+./docker/test.sh
+
+# Benchmark performance
+./docker/benchmark.sh
+```
+
+See [docker/README.md](docker/README.md) for details.
+
+### Project Structure
+
+```
+rauta/
+├── common/          # Shared types (Pod-compatible for BPF)
+├── bpf/             # XDP program (HTTP parsing + forwarding)
+│   ├── src/main.rs        # XDP entry point (~330 lines)
+│   └── src/forwarding.rs  # Packet forwarding (~240 lines)
+├── control/         # Control plane (Aya framework)
+│   └── src/main.rs        # BPF loader + metrics (~240 lines)
+├── tests/           # Integration tests
+└── docker/          # Docker build environment
+```
+
+### What's Next
+
+- ⏳ Tier 2 (TC-BPF) - Prefix matching with BPF LPM tries
+- ⏳ Tier 3 (Rust userspace) - HTTP/2, gRPC, regex matching
+- ⏳ Kubernetes integration - Watch Ingress resources
+- ⏳ CLI tool - `rautactl` for route management
 
 RAUTA is a learning project exploring the boundaries of kernel networking and Kubernetes integration.
 

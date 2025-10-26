@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-aya-bpf = "0.1"
-common = { path = "../common" }
+aya-ebpf = { git = "https://github.com/aya-rs/aya", default-features = false }
+common = { path = "../common", default-features = false }
 
 [profile.dev]
 opt-level = 3

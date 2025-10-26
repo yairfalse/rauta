@@ -1,7 +1,9 @@
 #![no_std]
 #![no_main]
 
-use aya_bpf::{
+mod forwarding;
+
+use aya_ebpf::{
     bindings::xdp_action,
     macros::{map, xdp},
     maps::{HashMap, LruHashMap, PerCpuArray},
@@ -291,7 +293,7 @@ fn try_rauta_ingress(ctx: XdpContext) -> Result<u32, ()> {
 
     // Select backend
     let client_ip = unsafe { (*ip).saddr };
-    let _backend = match select_backend(client_ip, path_hash, backend_list) {
+    let backend = match select_backend(client_ip, path_hash, backend_list) {
         Some(b) => b,
         None => {
             inc_metric(|m| m.packets_dropped += 1);
@@ -299,12 +301,20 @@ fn try_rauta_ingress(ctx: XdpContext) -> Result<u32, ()> {
         }
     };
 
-    // TODO: Implement packet forwarding (XDP_TX hairpin or IPIP encapsulation)
-    // For now, we've validated the routing works - pass to userspace
-    inc_metric(|m| m.packets_tier1 += 1);
-
-    // Placeholder: Would normally do XDP_TX or XDP_REDIRECT here
-    Ok(xdp_action::XDP_PASS)
+    // Forward packet to backend
+    match forwarding::forward_to_backend(&ctx, backend) {
+        Ok(xdp_action::XDP_TX) => {
+            // Successfully forwarded in XDP (Tier 1)
+            inc_metric(|m| m.packets_tier1 += 1);
+            Ok(xdp_action::XDP_TX)
+        }
+        Ok(xdp_action::XDP_PASS) | Err(_) => {
+            // Forward failed - fall back to kernel (Tier 3)
+            inc_metric(|m| m.packets_tier3 += 1);
+            Ok(xdp_action::XDP_PASS)
+        }
+        Ok(action) => Ok(action),
+    }
 }
 
 /// Helper to get typed pointer at offset with bounds checking

@@ -11,8 +11,8 @@ anyhow = "1.0"
 thiserror = "1.0"
 
 # eBPF (Aya framework)
-aya = { version = "0.12", features = ["async_tokio"] }
-aya-log = "0.2"
+aya = { git = "https://github.com/aya-rs/aya", features = ["async_tokio"] }
+aya-log = { git = "https://github.com/aya-rs/aya" }
 
 # Kubernetes
 kube = { version = "0.95", features = ["runtime", "derive"] }
@@ -30,4 +30,5 @@ serde_json = "1.0"
 libc = "0.2"
 
 [build-dependencies]
-aya-gen = "0.1"
+# Note: aya-build is the correct package for build scripts, not aya-gen
+# We don't need this currently as we're not generating bindings

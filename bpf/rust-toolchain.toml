@@ -1,0 +1,6 @@
+[toolchain]
+channel = "nightly"
+components = ["rustfmt", "clippy"]
+
+# Note: bpfel-unknown-none target is handled by bpf-linker
+# No need to install via rustup
