@@ -6,11 +6,11 @@ mod forwarding;
 use aya_ebpf::{
     bindings::xdp_action,
     macros::{map, xdp},
-    maps::{HashMap, LruHashMap, PerCpuArray},
+    maps::{Array, HashMap, LruHashMap, PerCpuArray},
     programs::XdpContext,
 };
 use core::mem;
-use common::{Backend, BackendList, HttpMethod, Metrics, RouteKey, MAX_ROUTES};
+use common::{Backend, BackendList, HttpMethod, Metrics, RouteKey, MAGLEV_TABLE_SIZE, MAX_ROUTES};
 
 /// Routing table: RouteKey -> BackendList
 /// Hash map for exact path matching (Tier 1)
@@ -27,6 +27,12 @@ static FLOW_CACHE: LruHashMap<u64, u32> = LruHashMap::<u64, u32>::with_max_entri
 /// Using index 0 for global metrics
 #[map]
 static METRICS: PerCpuArray<Metrics> = PerCpuArray::<Metrics>::with_max_entries(1, 0);
+
+/// Maglev consistent hashing lookup table
+/// Array of backend indices for O(1) lookup with minimal disruption
+/// Populated by control plane using maglev_build_table()
+#[map]
+static MAGLEV_TABLE: Array<u32> = Array::<u32>::with_max_entries(MAGLEV_TABLE_SIZE as u32, 0);
 
 /// Maximum HTTP request line length to parse
 const MAX_HTTP_LINE: usize = 512;
@@ -171,14 +177,25 @@ fn select_backend(client_ip: u32, path_hash: u64, backends: &BackendList) -> Opt
         }
     }
 
-    // Simple hash-based selection (Maglev-like)
-    let hash = flow_key.wrapping_mul(0x9e3779b97f4a7c15); // Fibonacci hashing
-    let idx = (hash % backends.count as u64) as usize;
+    // Maglev consistent hashing lookup
+    // O(1) lookup with minimal disruption (~1/N) when backends change
+    let table_idx = (flow_key % MAGLEV_TABLE_SIZE as u64) as u32;
 
-    // Cache the selection
-    let _ = unsafe { FLOW_CACHE.insert(&flow_key, &(idx as u32), 0) };
+    // Look up backend index in Maglev table
+    let backend_idx = match unsafe { MAGLEV_TABLE.get(table_idx) } {
+        Some(idx) => *idx as usize,
+        None => return None, // Table not initialized
+    };
 
-    Some(&backends.backends[idx])
+    // Validate index is within current backend list
+    if backend_idx >= backends.count as usize {
+        return None;
+    }
+
+    // Cache the selection for connection affinity
+    let _ = unsafe { FLOW_CACHE.insert(&flow_key, &(backend_idx as u32), 0) };
+
+    Some(&backends.backends[backend_idx])
 }
 
 /// Increment metrics counter (per-CPU, lock-free)
