@@ -182,18 +182,27 @@ fn select_backend(client_ip: u32, path_hash: u64, backends: &BackendList) -> Opt
     let table_idx = (flow_key % MAGLEV_TABLE_SIZE as u64) as u32;
 
     // Look up backend index in Maglev table
-    let backend_idx = match unsafe { MAGLEV_TABLE.get(table_idx) } {
-        Some(idx) => *idx as usize,
+    let backend_idx_u32 = match unsafe { MAGLEV_TABLE.get(table_idx) } {
+        Some(idx) => *idx,
         None => return None, // Table not initialized
     };
 
+    // Check for empty slot sentinel (u32::MAX)
+    if backend_idx_u32 == u32::MAX {
+        return None;
+    }
+
+    let backend_idx = backend_idx_u32 as usize;
+
     // Validate index is within current backend list
     if backend_idx >= backends.count as usize {
+        // Remove stale cache entry before returning
+        let _ = unsafe { FLOW_CACHE.remove(&flow_key) };
         return None;
     }
 
     // Cache the selection for connection affinity
-    let _ = unsafe { FLOW_CACHE.insert(&flow_key, &(backend_idx as u32), 0) };
+    let _ = unsafe { FLOW_CACHE.insert(&flow_key, &backend_idx_u32, 0) };
 
     Some(&backends.backends[backend_idx])
 }

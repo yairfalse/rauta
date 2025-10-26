@@ -11,7 +11,7 @@ anyhow = "1.0"
 thiserror = "1.0"
 
 # eBPF (Aya framework)
-aya = { git = "https://github.com/aya-rs/aya", features = ["async_tokio"] }
+aya = { git = "https://github.com/aya-rs/aya" }
 aya-log = { git = "https://github.com/aya-rs/aya" }
 
 # Kubernetes

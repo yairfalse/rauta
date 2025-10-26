@@ -234,7 +234,7 @@ impl RautaControl {
 
         // Populate the BPF map
         for (idx, backend_idx) in table.iter().enumerate() {
-            let value = backend_idx.unwrap_or(0); // Use 0 for empty slots
+            let value = backend_idx.unwrap_or(u32::MAX); // Use u32::MAX for empty slots
             maglev_map
                 .set(idx as u32, value, 0)
                 .map_err(|e| {

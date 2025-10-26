@@ -321,11 +321,11 @@ pub fn maglev_build_table(backends: &[Backend]) -> Vec<Option<u32>> {
 #[cfg(not(target_arch = "bpf"))]
 fn generate_permutation(backend: &Backend, backend_idx: u32) -> Vec<usize> {
     // Generate two hash values for offset and skip
-    // We use the backend's IP and port as the key
-    let key = ((backend.ipv4 as u64) << 32) | (backend.port as u64) | ((backend_idx as u64) << 16);
+    // Use backend IP + port as key, backend_idx as additional seed to avoid collisions
+    let key = ((backend.ipv4 as u64) << 16) | (backend.port as u64);
 
-    let offset = (hash_backend(key, 0) % MAGLEV_TABLE_SIZE as u64) as usize;
-    let skip = ((hash_backend(key, 1) % (MAGLEV_TABLE_SIZE as u64 - 1)) + 1) as usize;
+    let offset = (hash_backend(key, backend_idx as u64) % MAGLEV_TABLE_SIZE as u64) as usize;
+    let skip = ((hash_backend(key, backend_idx as u64 + 1) % (MAGLEV_TABLE_SIZE as u64 - 1)) + 1) as usize;
 
     // Generate permutation
     let mut perm = Vec::with_capacity(MAGLEV_TABLE_SIZE);
