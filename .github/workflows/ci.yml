@@ -1,0 +1,172 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Fast checks - always run (fail early)
+  quick-checks:
+    name: Quick Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (common)
+        run: cd common && cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Clippy (control)
+        run: cd control && cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Unit tests
+        run: cd common && cargo test --all-features
+
+  # Build BPF - only if BPF or common code changed
+  build-bpf:
+    name: Build BPF Program
+    runs-on: ubuntu-latest
+    if: |
+      contains(github.event.pull_request.title, '[bpf]') ||
+      contains(github.event.commits[0].message, 'bpf') ||
+      github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install LLVM and Clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm clang libelf-dev
+
+      - name: Cache bpf-linker
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: ${{ runner.os }}-bpf-linker
+
+      - name: Install bpf-linker
+        run: cargo install bpf-linker || true
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            bpf/target
+          key: ${{ runner.os }}-cargo-bpf-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build BPF program
+        run: cd bpf && cargo +nightly build --release --target=bpfel-unknown-none
+
+      - name: Upload BPF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rauta-bpf
+          path: bpf/target/bpfel-unknown-none/release/rauta-bpf
+          retention-days: 7
+
+  # Build control plane
+  build-control:
+    name: Build Control Plane
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            control/target
+          key: ${{ runner.os }}-cargo-control-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build control plane (release)
+        run: cd control && cargo build --release
+
+      - name: Upload control plane artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rauta-control
+          path: control/target/release/control
+          retention-days: 7
+
+  # Security audit
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run security audit
+        run: cargo audit
+
+  # All checks must pass
+  ci-success:
+    name: CI Success
+    if: always()
+    needs: [quick-checks, build-bpf, build-control, security]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs succeeded
+        run: |
+          if [[ "${{ needs.quick-checks.result }}" != "success" ]]; then
+            echo "Quick checks failed"
+            exit 1
+          fi
+          if [[ "${{ needs.build-control.result }}" != "success" ]]; then
+            echo "Control plane build failed"
+            exit 1
+          fi
+          if [[ "${{ needs.security.result }}" != "success" ]]; then
+            echo "Security audit failed"
+            exit 1
+          fi
+          # BPF build is optional (only runs if BPF code changed)
+          if [[ "${{ needs.build-bpf.result }}" == "failure" ]]; then
+            echo "BPF build failed"
+            exit 1
+          fi
+          echo "✅ All CI checks passed!"
