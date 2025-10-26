@@ -145,7 +145,7 @@ RAUTA uses **Maglev consistent hashing** for backend selection:
 **One-command setup** - auto-detects your platform:
 
 ```bash
-./setup.sh
+./scripts/setup.sh
 ```
 
 **Linux** 🐧 (Full Native Toolchain):

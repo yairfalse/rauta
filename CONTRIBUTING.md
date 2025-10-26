@@ -11,7 +11,7 @@ git clone https://github.com/YOUR_USERNAME/rauta.git
 cd rauta
 
 # 3. Set up development environment
-./setup.sh
+./scripts/setup.sh
 
 # 4. Create a branch
 git checkout -b feat/your-feature
@@ -60,8 +60,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 
 # Build (must succeed!)
-./build_local.sh  # Linux
-./docker/build.sh # macOS
+./scripts/build_local.sh  # Linux
+./docker/build.sh         # macOS
 ```
 
 ### Code Quality Rules
