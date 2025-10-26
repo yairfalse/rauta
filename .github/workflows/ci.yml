@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, feat/*]
   pull_request:
     branches: [main, dev]
 
@@ -88,13 +88,13 @@ jobs:
           key: ${{ runner.os }}-cargo-bpf-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build BPF program
-        run: cd bpf && cargo +nightly build --release --target=bpfel-unknown-none
+        run: cd bpf && cargo +nightly build --release --target=bpfel-unknown-none -Z build-std=core
 
       - name: Upload BPF artifact
         uses: actions/upload-artifact@v4
         with:
           name: rauta-bpf
-          path: bpf/target/bpfel-unknown-none/release/rauta-bpf
+          path: target/bpfel-unknown-none/release/rauta
           retention-days: 7
 
   # Build control plane
