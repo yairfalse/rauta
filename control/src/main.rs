@@ -178,13 +178,25 @@ impl RautaControl {
             "Route added successfully"
         );
 
-        // Populate Maglev lookup table for consistent hashing
+        // TODO(architectural): Current limitation - single global MAGLEV_TABLE
+        //
+        // The current design has ONE global MAGLEV_TABLE but multiple routes with
+        // different backends. This only works correctly when:
+        // 1. All routes share the same backend pool (Kubernetes use case), OR
+        // 2. Only one route exists (current test case)
+        //
+        // For production, we need one of:
+        // - Per-route Maglev tables (requires BackendList to include table)
+        // - Global backend pool (requires refactoring routes to use backend IDs)
+        // - Simpler per-route hashing (fallback from Maglev)
+        //
+        // For now, test route works because it's the only route.
         self.update_maglev_table(&[backend])?;
 
         info!(
             backends = backend_list.count,
             table_size = common::MAGLEV_TABLE_SIZE,
-            "Maglev lookup table populated"
+            "Maglev lookup table populated (LIMITATION: single route only)"
         );
 
         Ok(())
