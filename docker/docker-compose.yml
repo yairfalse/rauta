@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  rauta-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: rauta-dev
+    privileged: true  # Required for eBPF
+    volumes:
+      - .:/workspace
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/workspace/target
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    network_mode: host  # Required for network eBPF programs
+
+volumes:
+  cargo-cache:
+  target-cache:

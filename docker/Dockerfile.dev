@@ -1,0 +1,29 @@
+# Development container for RAUTA eBPF development on macOS
+FROM rust:1.83-slim
+
+# Install system dependencies for eBPF development
+RUN apt-get update && apt-get install -y \
+    llvm \
+    clang \
+    libelf-dev \
+    linux-headers-generic \
+    pkg-config \
+    make \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust components
+RUN rustup component add rustfmt clippy rust-src
+
+# Install eBPF tooling
+RUN cargo install bpf-linker --no-default-features
+RUN cargo install cargo-generate
+
+# Set working directory
+WORKDIR /workspace
+
+# Set up Rust environment
+ENV RUST_BACKTRACE=1
+
+CMD ["/bin/bash"]

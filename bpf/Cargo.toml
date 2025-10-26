@@ -1,0 +1,22 @@
+[package]
+name = "bpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-bpf = "0.1"
+common = { path = "../common" }
+
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
+
+[[bin]]
+name = "rauta"
+path = "src/main.rs"

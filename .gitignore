@@ -1,0 +1,65 @@
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# eBPF
+*.o
+*.ll
+*.bc
+vmlinux.h
+.output/
+
+# Build artifacts
+*.so
+*.a
+*.dylib
+*.dll
+*.exe
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+logs/
+
+# Test artifacts
+test-results/
+coverage/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# BPF CO-RE (BTF)
+.btf/
+
+# Aya build artifacts
+rauta-bpf/target/
+rauta-bpf/.output/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# Documentation (research notes - not for commit)
+docs/

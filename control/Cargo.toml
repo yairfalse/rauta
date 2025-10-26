@@ -1,0 +1,33 @@
+[package]
+name = "control"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Core
+common = { path = "../common" }
+tokio = { version = "1.41", features = ["full"] }
+anyhow = "1.0"
+thiserror = "1.0"
+
+# eBPF (Aya framework)
+aya = { version = "0.12", features = ["async_tokio"] }
+aya-log = "0.2"
+
+# Kubernetes
+kube = { version = "0.95", features = ["runtime", "derive"] }
+k8s-openapi = { version = "0.23", features = ["v1_30"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Networking
+libc = "0.2"
+
+[build-dependencies]
+aya-gen = "0.1"
