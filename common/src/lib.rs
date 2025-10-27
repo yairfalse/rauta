@@ -162,8 +162,13 @@ impl Backend {
     }
 }
 
-/// List of backend servers for a route
+/// List of backend servers for a route with embedded Maglev table
 /// Fixed-size array to work with BPF maps
+///
+/// Memory layout:
+/// - backends: 32 × 8 bytes = 256 bytes
+/// - maglev_table: 4099 × 1 byte = 4099 bytes
+/// - Total: ~4.2KB per route (vs 262KB with separate table!)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BackendList {
@@ -171,8 +176,12 @@ pub struct BackendList {
     pub backends: [Backend; MAX_BACKENDS],
     /// Number of active backends (rest are unused)
     pub count: u32,
-    /// Maglev ring size (must be prime, typically 65537)
-    pub ring_size: u32,
+    /// Padding for alignment
+    pub _pad: u32,
+    /// Embedded compact Maglev lookup table (4KB)
+    /// Each entry is a backend index (0..count)
+    /// Pre-computed by control plane for O(1) XDP lookup
+    pub maglev_table: [u8; COMPACT_MAGLEV_SIZE],
 }
 
 // Safety: BackendList is a POD type with no padding or pointers
@@ -188,7 +197,8 @@ impl BackendList {
         Self {
             backends: [ZERO_BACKEND; MAX_BACKENDS],
             count: 0,
-            ring_size: 65537, // Prime number for Maglev
+            _pad: 0,
+            maglev_table: [0u8; COMPACT_MAGLEV_SIZE],
         }
     }
 }
