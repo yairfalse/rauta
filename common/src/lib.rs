@@ -30,6 +30,11 @@ pub const MAX_ROUTES: u32 = 65536;
 /// Using 65537 (next prime after 65536) as recommended by Google's Maglev paper
 pub const MAGLEV_TABLE_SIZE: usize = 65537;
 
+/// Compact Maglev table size for embedded per-route tables
+/// Using 4099 (prime) for memory efficiency: 4KB per route instead of 262KB
+/// With MAX_BACKENDS=32, this still provides excellent distribution
+pub const COMPACT_MAGLEV_SIZE: usize = 4099;
+
 /// HTTP methods supported for routing
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +374,99 @@ pub fn maglev_lookup(flow_key: u64, table: &[Option<u32>]) -> Option<u32> {
     // Hash the flow key and look up in table
     let idx = (flow_key % table.len() as u64) as usize;
     table.get(idx).copied().flatten()
+}
+
+/// Build compact Maglev lookup table for embedded per-route tables
+///
+/// Returns a table of size COMPACT_MAGLEV_SIZE (4099) with u8 backend indices.
+/// This is memory-efficient: 4KB per route instead of 262KB.
+///
+/// # Arguments
+/// * `backends` - Slice of backends for this route (max 32)
+///
+/// # Returns
+/// Vec of u8 backend indices (each < MAX_BACKENDS)
+#[cfg(not(target_arch = "bpf"))]
+pub fn maglev_build_compact_table(backends: &[Backend]) -> Vec<u8> {
+    if backends.is_empty() {
+        return vec![0u8; COMPACT_MAGLEV_SIZE];
+    }
+
+    // Validate backend count
+    assert!(
+        backends.len() <= MAX_BACKENDS,
+        "Cannot build compact table for {} backends (max {})",
+        backends.len(),
+        MAX_BACKENDS
+    );
+
+    // Initialize table with 0 (will always have at least 1 backend)
+    let mut table = vec![0u8; COMPACT_MAGLEV_SIZE];
+
+    // Generate permutations for each backend
+    let mut permutations = Vec::with_capacity(backends.len());
+    for (i, backend) in backends.iter().enumerate() {
+        permutations.push(generate_permutation_compact(backend, i as u32));
+    }
+
+    // Track which slots are filled
+    let mut filled = vec![false; COMPACT_MAGLEV_SIZE];
+    let mut filled_count = 0;
+
+    // Fill the table using Maglev algorithm
+    let mut n = 0;
+    while filled_count < COMPACT_MAGLEV_SIZE {
+        for (backend_idx, perm) in permutations.iter().enumerate() {
+            let c = perm[n % COMPACT_MAGLEV_SIZE];
+
+            // Try to claim this slot
+            if !filled[c] {
+                table[c] = backend_idx as u8;
+                filled[c] = true;
+                filled_count += 1;
+
+                if filled_count == COMPACT_MAGLEV_SIZE {
+                    break;
+                }
+            }
+        }
+        n += 1;
+    }
+
+    table
+}
+
+/// Generate permutation for compact table using Maglev's double hashing
+#[cfg(not(target_arch = "bpf"))]
+fn generate_permutation_compact(backend: &Backend, backend_idx: u32) -> Vec<usize> {
+    // Generate two hash values for offset and skip
+    let key = ((backend.ipv4 as u64) << 16) | (backend.port as u64);
+
+    let offset = (hash_backend(key, backend_idx as u64) % COMPACT_MAGLEV_SIZE as u64) as usize;
+    let skip = ((hash_backend(key, backend_idx as u64 + 1) % (COMPACT_MAGLEV_SIZE as u64 - 1)) + 1) as usize;
+
+    // Generate permutation
+    let mut perm = Vec::with_capacity(COMPACT_MAGLEV_SIZE);
+    for j in 0..COMPACT_MAGLEV_SIZE {
+        perm.push((offset + j * skip) % COMPACT_MAGLEV_SIZE);
+    }
+
+    perm
+}
+
+/// Lookup backend index in compact Maglev table
+///
+/// This is the fast-path function for embedded tables in XDP.
+/// Takes O(1) time.
+#[inline(always)]
+pub fn maglev_lookup_compact(flow_key: u64, table: &[u8]) -> u8 {
+    if table.is_empty() {
+        return 0;
+    }
+
+    // Hash the flow key and look up in table
+    let idx = (flow_key % COMPACT_MAGLEV_SIZE as u64) as usize;
+    table[idx]
 }
 
 #[cfg(test)]
