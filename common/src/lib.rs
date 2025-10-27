@@ -13,6 +13,10 @@ use aya::Pod;
 #[cfg(feature = "aya-ebpf")]
 pub unsafe trait Pod: Copy + 'static {}
 
+// For tests without aya/aya-ebpf: Dummy Pod trait
+#[cfg(not(any(feature = "aya", feature = "aya-ebpf")))]
+pub unsafe trait Pod: Copy + 'static {}
+
 /// Maximum path length for HTTP routing (99%+ coverage)
 pub const MAX_PATH_LEN: usize = 256;
 

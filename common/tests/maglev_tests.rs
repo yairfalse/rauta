@@ -277,6 +277,115 @@ fn test_maglev_deterministic() {
     assert_eq!(table1, table2, "Maglev table should be deterministic");
 }
 
+/// EMBEDDED COMPACT MAGLEV TESTS
+/// Testing per-route embedded Maglev tables for multi-route scenarios
+
+#[test]
+fn test_embedded_compact_maglev_multi_route() {
+    // Route 1: /api/users with backends [10.0.1.1, 10.0.1.2]
+    let route1_backends = vec![
+        Backend::new(0x0a000101, 8080, 100), // 10.0.1.1:8080
+        Backend::new(0x0a000102, 8080, 100), // 10.0.1.2:8080
+    ];
+
+    // Route 2: /api/orders with backends [10.0.2.1, 10.0.2.2]
+    let route2_backends = vec![
+        Backend::new(0x0a000201, 9000, 100), // 10.0.2.1:9000
+        Backend::new(0x0a000202, 9000, 100), // 10.0.2.2:9000
+    ];
+
+    // Build embedded tables for each route
+    let table1 = common::maglev_build_compact_table(&route1_backends);
+    let table2 = common::maglev_build_compact_table(&route2_backends);
+
+    // Tables should be different (different backends)
+    assert_ne!(
+        table1.as_slice(),
+        table2.as_slice(),
+        "Different routes should have different Maglev tables"
+    );
+
+    // Each table should reference only its own backends (indices 0-1)
+    assert!(table1.iter().all(|&idx| idx < 2), "Route 1 table should only reference backends 0-1");
+    assert!(table2.iter().all(|&idx| idx < 2), "Route 2 table should only reference backends 0-1");
+
+    // Test backend selection using embedded tables
+    let flow_key = 0x12345678u64;
+
+    let idx1 = common::maglev_lookup_compact(flow_key, &table1);
+    let idx2 = common::maglev_lookup_compact(flow_key, &table2);
+
+    // Both should select valid backend indices
+    assert!(idx1 < 2, "Route 1 should select backend index 0 or 1");
+    assert!(idx2 < 2, "Route 2 should select backend index 0 or 1");
+
+    // Verify actual backends are different (from different pools)
+    let backend1 = &route1_backends[idx1 as usize];
+    let backend2 = &route2_backends[idx2 as usize];
+
+    // Route 1 backends are in 10.0.1.0/24, Route 2 in 10.0.2.0/24
+    assert!((backend1.ipv4 & 0xFFFFFF00) == 0x0a000100);
+    assert!((backend2.ipv4 & 0xFFFFFF00) == 0x0a000200);
+}
+
+#[test]
+fn test_embedded_compact_table_size() {
+    // Compact table should use 4099 (prime) for good distribution
+    use common::COMPACT_MAGLEV_SIZE;
+
+    assert_eq!(COMPACT_MAGLEV_SIZE, 4099);
+    assert!(is_prime(COMPACT_MAGLEV_SIZE));
+}
+
+#[test]
+fn test_embedded_compact_table_fits_in_u8() {
+    // With MAX_BACKENDS = 32, we can use u8 for backend indices
+    use common::MAX_BACKENDS;
+
+    assert!(MAX_BACKENDS <= 256, "MAX_BACKENDS must fit in u8");
+
+    let backends: Vec<Backend> = (0..MAX_BACKENDS)
+        .map(|i| Backend::new(0x0a000100 + i as u32, 8080, 100))
+        .collect();
+
+    let table = common::maglev_build_compact_table(&backends);
+
+    // All indices should fit in u8 (< MAX_BACKENDS)
+    assert!(
+        table.iter().all(|&idx| idx < MAX_BACKENDS as u8),
+        "All backend indices should fit in u8"
+    );
+}
+
+#[test]
+fn test_embedded_compact_distribution() {
+    // Compact table (4099 entries) should have similar distribution to full table
+    let backends = vec![
+        Backend::new(0x0a000101, 8080, 100),
+        Backend::new(0x0a000102, 8080, 100),
+        Backend::new(0x0a000103, 8080, 100),
+    ];
+
+    let table = common::maglev_build_compact_table(&backends);
+
+    // Count distribution
+    let mut counts = vec![0usize; backends.len()];
+    for &idx in table.iter() {
+        counts[idx as usize] += 1;
+    }
+
+    // Each backend should get roughly 33% (within 5% variance)
+    for (i, count) in counts.iter().enumerate() {
+        let percentage = (*count as f64) / (common::COMPACT_MAGLEV_SIZE as f64);
+        assert!(
+            (percentage - 0.333).abs() < 0.05,
+            "Backend {} has {:.2}% distribution (expected ~33.3%)",
+            i,
+            percentage * 100.0
+        );
+    }
+}
+
 // Helper function to check if number is prime
 fn is_prime(n: usize) -> bool {
     if n <= 1 {
