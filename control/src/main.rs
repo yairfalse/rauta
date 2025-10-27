@@ -166,7 +166,12 @@ impl RautaControl {
         backend_list.backends[0] = backend;
         backend_list.count = 1;
 
-        // Insert route into BPF map
+        // Build embedded compact Maglev table for this route
+        // This is the key improvement: each route gets its own 4KB table!
+        let compact_table = common::maglev_build_compact_table(&[backend]);
+        backend_list.maglev_table.copy_from_slice(&compact_table);
+
+        // Insert route with embedded table into BPF map
         routes
             .insert(route_key, backend_list, 0)
             .map_err(|e| RautaError::MapAccessError(format!("Failed to insert route: {}", e)))?;
@@ -175,28 +180,9 @@ impl RautaControl {
             method = "GET",
             path = "/api/users",
             backend = "10.0.1.1:8080",
-            "Route added successfully"
-        );
-
-        // TODO(architectural): Current limitation - single global MAGLEV_TABLE
-        //
-        // The current design has ONE global MAGLEV_TABLE but multiple routes with
-        // different backends. This only works correctly when:
-        // 1. All routes share the same backend pool (Kubernetes use case), OR
-        // 2. Only one route exists (current test case)
-        //
-        // For production, we need one of:
-        // - Per-route Maglev tables (requires BackendList to include table)
-        // - Global backend pool (requires refactoring routes to use backend IDs)
-        // - Simpler per-route hashing (fallback from Maglev)
-        //
-        // For now, test route works because it's the only route.
-        self.update_maglev_table(&[backend])?;
-
-        info!(
             backends = backend_list.count,
-            table_size = common::MAGLEV_TABLE_SIZE,
-            "Maglev lookup table populated (LIMITATION: single route only)"
+            table_size = common::COMPACT_MAGLEV_SIZE,
+            "Route added with embedded compact Maglev table (4KB per route)"
         );
 
         Ok(())
