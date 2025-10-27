@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use aya::{
     include_bytes_aligned,
-    maps::{Array, HashMap, PerCpuArray},
+    maps::{HashMap, PerCpuArray},
     programs::{Xdp, XdpFlags},
     Ebpf,
 };
@@ -53,23 +53,14 @@ async fn main() -> Result<()> {
 
     info!("Test route added: GET /api/users -> 10.0.1.1:8080");
 
-    // Start metrics reporting
-    let metrics_handle = tokio::spawn({
-        let metrics_map = control.metrics_map();
-        async move {
-            metrics_reporter(metrics_map).await;
-        }
-    });
+    // TODO: Re-enable metrics reporting (needs lifetime refactor)
+    // Start metrics reporting task would go here
 
     // Wait for shutdown signal
     info!("Control plane running. Press Ctrl-C to exit.");
     signal::ctrl_c().await?;
 
     info!("Shutdown signal received, cleaning up...");
-
-    // Wait for metrics reporter to finish
-    metrics_handle.abort();
-
     info!("RAUTA Control Plane stopped");
     Ok(())
 }
@@ -142,18 +133,6 @@ impl RautaControl {
 
     /// Add a test route for validation
     pub fn add_test_route(&mut self) -> Result<(), RautaError> {
-        let mut routes: HashMap<_, RouteKey, BackendList> =
-            HashMap::try_from(self.bpf.map_mut("ROUTES").ok_or_else(|| {
-                RautaError::MapNotFound("ROUTES map not found".to_string())
-            })?)
-            .map_err(|e| RautaError::MapAccessError(format!("Failed to access ROUTES map: {}", e)))?;
-
-        let mut maglev_tables: HashMap<_, u64, CompactMaglevTable> =
-            HashMap::try_from(self.bpf.map_mut("MAGLEV_TABLES").ok_or_else(|| {
-                RautaError::MapNotFound("MAGLEV_TABLES map not found".to_string())
-            })?)
-            .map_err(|e| RautaError::MapAccessError(format!("Failed to access MAGLEV_TABLES map: {}", e)))?;
-
         // Create route: GET /api/users
         let path = b"/api/users";
         let path_hash = fnv1a_hash(path);
@@ -176,14 +155,30 @@ impl RautaControl {
         maglev_table.table.copy_from_slice(&compact_table_vec);
 
         // Insert route into ROUTES map (small, fits in stack)
-        routes
-            .insert(route_key, backend_list, 0)
-            .map_err(|e| RautaError::MapAccessError(format!("Failed to insert route: {}", e)))?;
+        {
+            let mut routes: HashMap<_, RouteKey, BackendList> =
+                HashMap::try_from(self.bpf.map_mut("ROUTES").ok_or_else(|| {
+                    RautaError::MapNotFound("ROUTES map not found".to_string())
+                })?)
+                .map_err(|e| RautaError::MapAccessError(format!("Failed to access ROUTES map: {}", e)))?;
+
+            routes
+                .insert(route_key, backend_list, 0)
+                .map_err(|e| RautaError::MapAccessError(format!("Failed to insert route: {}", e)))?;
+        }
 
         // Insert Maglev table into MAGLEV_TABLES map (indexed by path_hash)
-        maglev_tables
-            .insert(path_hash, maglev_table, 0)
-            .map_err(|e| RautaError::MapAccessError(format!("Failed to insert Maglev table: {}", e)))?;
+        {
+            let mut maglev_tables: HashMap<_, u64, CompactMaglevTable> =
+                HashMap::try_from(self.bpf.map_mut("MAGLEV_TABLES").ok_or_else(|| {
+                    RautaError::MapNotFound("MAGLEV_TABLES map not found".to_string())
+                })?)
+                .map_err(|e| RautaError::MapAccessError(format!("Failed to access MAGLEV_TABLES map: {}", e)))?;
+
+            maglev_tables
+                .insert(path_hash, maglev_table, 0)
+                .map_err(|e| RautaError::MapAccessError(format!("Failed to insert Maglev table: {}", e)))?;
+        }
 
         info!(
             method = "GET",
@@ -211,6 +206,8 @@ impl RautaControl {
 }
 
 /// Report metrics periodically
+/// TODO: Re-enable when lifetime issues are resolved
+#[allow(dead_code)]
 async fn metrics_reporter(mut metrics: PerCpuArray<&mut aya::maps::MapData, Metrics>) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
@@ -222,7 +219,8 @@ async fn metrics_reporter(mut metrics: PerCpuArray<&mut aya::maps::MapData, Metr
             Ok(per_cpu_values) => {
                 // Aggregate across all CPUs
                 let mut total = Metrics::new();
-                for cpu_metrics in per_cpu_values {
+                // Fix: PerCpuValues has iter() method
+                for cpu_metrics in per_cpu_values.iter() {
                     total.packets_total += cpu_metrics.packets_total;
                     total.packets_tier1 += cpu_metrics.packets_tier1;
                     total.packets_tier2 += cpu_metrics.packets_tier2;
