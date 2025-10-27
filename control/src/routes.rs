@@ -1,4 +1,4 @@
-use common::{Backend, BackendList, HttpMethod, RouteKey, fnv1a_hash};
+use common::{fnv1a_hash, Backend, BackendList, HttpMethod, RouteKey};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 

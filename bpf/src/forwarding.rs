@@ -1,7 +1,6 @@
 /// Packet forwarding module
 ///
 /// XDP_TX hairpin NAT implementation for L7 HTTP load balancing.
-
 use aya_ebpf::bindings::xdp_action;
 use aya_ebpf::programs::XdpContext;
 use common::Backend;
@@ -109,13 +108,8 @@ pub fn forward_to_backend(ctx: &XdpContext, backend: &Backend) -> Result<u32, ()
     // For simplicity, we'll use incremental checksum update
     unsafe {
         let old_tcp_check = (*tcp).check;
-        let tcp_check = update_tcp_checksum(
-            old_tcp_check,
-            old_daddr,
-            new_daddr,
-            old_dport,
-            new_dport,
-        );
+        let tcp_check =
+            update_tcp_checksum(old_tcp_check, old_daddr, new_daddr, old_dport, new_dport);
         (*tcp).check = tcp_check;
     }
 

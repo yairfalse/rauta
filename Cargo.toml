@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "common",
+    "bpf",
+    "control",
+    "cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["RAUTA Contributors"]
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1

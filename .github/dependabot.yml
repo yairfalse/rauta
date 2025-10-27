@@ -1,0 +1,78 @@
+version: 2
+updates:
+  # Rust dependencies - Weekly updates with conservative grouping
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 5
+
+    # Group related dependencies to reduce PR noise
+    groups:
+      # Development and testing dependencies
+      development-dependencies:
+        patterns:
+          - "criterion"
+          - "tracing-*"
+          - "tokio-test"
+          - "anyhow"
+          - "thiserror"
+        update-types:
+          - "minor"
+          - "patch"
+
+      # Kubernetes client dependencies
+      kubernetes-dependencies:
+        patterns:
+          - "kube*"
+          - "k8s-openapi"
+        update-types:
+          - "patch"
+
+      # eBPF stack - Only patch updates auto-grouped
+      # Major/minor need manual review due to verifier compatibility
+      ebpf-stack:
+        patterns:
+          - "aya"
+          - "aya-ebpf"
+          - "aya-log"
+          - "aya-log-ebpf"
+        update-types:
+          - "patch"
+
+    # Ignore major/minor updates for critical eBPF dependencies
+    # These require manual review and verifier testing
+    ignore:
+      - dependency-name: "aya"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "aya-ebpf"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "aya-log"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "aya-log-ebpf"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+    labels:
+      - "dependencies"
+      - "rust"
+
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+
+    reviewers:
+      - "yair"  # Replace with actual GitHub username
+
+  # GitHub Actions - Monthly updates
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+      day: "monday"
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "ci"

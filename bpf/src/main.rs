@@ -9,14 +9,20 @@ use aya_ebpf::{
     maps::{Array, HashMap, LruHashMap, PerCpuArray},
     programs::XdpContext,
 };
+use common::{Backend, BackendList, CompactMaglevTable, HttpMethod, Metrics, RouteKey, MAX_ROUTES};
 use core::mem;
-use common::{Backend, BackendList, HttpMethod, Metrics, RouteKey, MAGLEV_TABLE_SIZE, MAX_ROUTES};
 
 /// Routing table: RouteKey -> BackendList
 /// Hash map for exact path matching (Tier 1)
 #[map]
 static ROUTES: HashMap<RouteKey, BackendList> =
     HashMap::<RouteKey, BackendList>::with_max_entries(MAX_ROUTES, 0);
+
+/// Per-route Maglev tables: path_hash -> CompactMaglevTable[4099]
+/// Separate map to avoid BPF stack overflow (4KB per table)
+#[map]
+static MAGLEV_TABLES: HashMap<u64, CompactMaglevTable> =
+    HashMap::<u64, CompactMaglevTable>::with_max_entries(MAX_ROUTES, 0);
 
 /// Flow affinity cache: (client_ip, path_hash) -> backend_index
 /// LRU map automatically evicts old flows (Cilium pattern)
@@ -27,12 +33,6 @@ static FLOW_CACHE: LruHashMap<u64, u32> = LruHashMap::<u64, u32>::with_max_entri
 /// Using index 0 for global metrics
 #[map]
 static METRICS: PerCpuArray<Metrics> = PerCpuArray::<Metrics>::with_max_entries(1, 0);
-
-/// Maglev consistent hashing lookup table
-/// Array of backend indices for O(1) lookup with minimal disruption
-/// Populated by control plane using maglev_build_table()
-#[map]
-static MAGLEV_TABLE: Array<u32> = Array::<u32>::with_max_entries(MAGLEV_TABLE_SIZE as u32, 0);
 
 /// Maximum HTTP request line length to parse
 const MAX_HTTP_LINE: usize = 512;
@@ -158,8 +158,11 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Select backend using simple hash-based load balancing
+/// Select backend using separate compact Maglev table
 /// Uses client IP + path hash for consistent routing
+///
+/// Key improvement: Each route has its own 4KB Maglev table in separate map!
+/// This avoids BPF stack overflow (4KB table > 512B stack limit)
 #[inline(always)]
 fn select_backend(client_ip: u32, path_hash: u64, backends: &BackendList) -> Option<&Backend> {
     if backends.count == 0 || backends.count > common::MAX_BACKENDS as u32 {
@@ -177,22 +180,18 @@ fn select_backend(client_ip: u32, path_hash: u64, backends: &BackendList) -> Opt
         }
     }
 
-    // Maglev consistent hashing lookup
-    // O(1) lookup with minimal disruption (~1/N) when backends change
-    let table_idx = (flow_key % MAGLEV_TABLE_SIZE as u64) as u32;
-
-    // Look up backend index in Maglev table
-    let backend_idx_u32 = match unsafe { MAGLEV_TABLE.get(table_idx) } {
-        Some(idx) => *idx,
-        None => return None, // Table not initialized
+    // Look up Maglev table for this route (indexed by path_hash)
+    let maglev_table = match unsafe { MAGLEV_TABLES.get(&path_hash) } {
+        Some(table) => table,
+        None => return None, // No table for this route
     };
 
-    // Check for empty slot sentinel (u32::MAX)
-    if backend_idx_u32 == u32::MAX {
-        return None;
-    }
+    // Compact Maglev lookup (per-route table!)
+    // O(1) lookup with minimal disruption (~1/N) when backends change
+    let table_idx = (flow_key % (common::COMPACT_MAGLEV_SIZE as u64)) as usize;
 
-    let backend_idx = backend_idx_u32 as usize;
+    // Look up backend index in THIS route's Maglev table
+    let backend_idx = maglev_table.table[table_idx] as usize;
 
     // Validate index is within current backend list
     if backend_idx >= backends.count as usize {
@@ -202,6 +201,7 @@ fn select_backend(client_ip: u32, path_hash: u64, backends: &BackendList) -> Opt
     }
 
     // Cache the selection for connection affinity
+    let backend_idx_u32 = backend_idx as u32;
     let _ = unsafe { FLOW_CACHE.insert(&flow_key, &backend_idx_u32, 0) };
 
     Some(&backends.backends[backend_idx])
