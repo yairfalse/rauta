@@ -6,7 +6,7 @@ mod forwarding;
 use aya_ebpf::{
     bindings::xdp_action,
     macros::{map, xdp},
-    maps::{Array, HashMap, LruHashMap, PerCpuArray},
+    maps::{HashMap, LruHashMap, PerCpuArray},
     programs::XdpContext,
 };
 use common::{Backend, BackendList, CompactMaglevTable, HttpMethod, Metrics, RouteKey, MAX_ROUTES};
@@ -79,35 +79,17 @@ struct TcpHdr {
 
 /// Parse HTTP method from packet data
 /// Returns (method, method_length) or None
+///
+/// TDD GREEN: Refactored to use common::HttpMethod::from_bytes()
+/// This eliminates duplicate logic and ensures tests validate actual BPF behavior
 #[inline(always)]
 fn parse_http_method(data: &[u8]) -> Option<(HttpMethod, usize)> {
-    if data.len() < 3 {
-        return None;
-    }
+    // Use common parser (single source of truth!)
+    let method = HttpMethod::from_bytes(data)?;
 
-    // Check for common methods (GET, POST, PUT, DELETE)
-    match (data[0], data[1], data[2]) {
-        (b'G', b'E', b'T') if data.get(3) == Some(&b' ') => Some((HttpMethod::GET, 3)),
-        (b'P', b'O', b'S') if data.len() >= 5 && data[3] == b'T' && data[4] == b' ' => {
-            Some((HttpMethod::POST, 4))
-        }
-        (b'P', b'U', b'T') if data.get(3) == Some(&b' ') => Some((HttpMethod::PUT, 3)),
-        (b'D', b'E', b'L') if data.len() >= 7 && &data[3..7] == b"ETE " => {
-            Some((HttpMethod::DELETE, 6))
-        }
-        (b'H', b'E', b'A') if data.len() >= 5 && data[3] == b'D' && data[4] == b' ' => {
-            Some((HttpMethod::HEAD, 4))
-        }
-        (b'P', b'A', b'T')
-            if data.len() >= 6 && data[3] == b'C' && data[4] == b'H' && data[5] == b' ' =>
-        {
-            Some((HttpMethod::PATCH, 5))
-        }
-        (b'O', b'P', b'T') if data.len() >= 8 && &data[3..8] == b"IONS " => {
-            Some((HttpMethod::OPTIONS, 7))
-        }
-        _ => None,
-    }
+    // Return method with its length for path parsing
+    let method_len = method.len() as usize;
+    Some((method, method_len))
 }
 
 /// Extract path from HTTP request and compute FNV-1a hash
