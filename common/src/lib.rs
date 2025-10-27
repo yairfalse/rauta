@@ -162,13 +162,16 @@ impl Backend {
     }
 }
 
-/// List of backend servers for a route with embedded Maglev table
+/// List of backend servers for a route
 /// Fixed-size array to work with BPF maps
 ///
 /// Memory layout:
 /// - backends: 32 × 8 bytes = 256 bytes
-/// - maglev_table: 4099 × 1 byte = 4099 bytes
-/// - Total: ~4.2KB per route (vs 262KB with separate table!)
+/// - count: 4 bytes
+/// - Total: 260 bytes ✅ Fits in BPF stack (512B limit)
+///
+/// Note: Maglev tables stored separately in MAGLEV_TABLES map
+/// to avoid BPF stack overflow (table is 4KB)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BackendList {
@@ -178,10 +181,6 @@ pub struct BackendList {
     pub count: u32,
     /// Padding for alignment
     pub _pad: u32,
-    /// Embedded compact Maglev lookup table (4KB)
-    /// Each entry is a backend index (0..count)
-    /// Pre-computed by control plane for O(1) XDP lookup
-    pub maglev_table: [u8; COMPACT_MAGLEV_SIZE],
 }
 
 // Safety: BackendList is a POD type with no padding or pointers
@@ -198,7 +197,26 @@ impl BackendList {
             backends: [ZERO_BACKEND; MAX_BACKENDS],
             count: 0,
             _pad: 0,
-            maglev_table: [0u8; COMPACT_MAGLEV_SIZE],
+        }
+    }
+}
+
+/// Compact Maglev lookup table (stored separately to avoid BPF stack overflow)
+/// 4KB per route - stored in MAGLEV_TABLES map indexed by path_hash
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CompactMaglevTable {
+    /// Backend indices (0..MAX_BACKENDS)
+    pub table: [u8; COMPACT_MAGLEV_SIZE],
+}
+
+// Safety: CompactMaglevTable is a POD type
+unsafe impl Pod for CompactMaglevTable {}
+
+impl CompactMaglevTable {
+    pub const fn empty() -> Self {
+        Self {
+            table: [0u8; COMPACT_MAGLEV_SIZE],
         }
     }
 }

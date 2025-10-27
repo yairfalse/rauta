@@ -10,13 +10,19 @@ use aya_ebpf::{
     programs::XdpContext,
 };
 use core::mem;
-use common::{Backend, BackendList, HttpMethod, Metrics, RouteKey, MAX_ROUTES};
+use common::{Backend, BackendList, CompactMaglevTable, HttpMethod, Metrics, RouteKey, MAX_ROUTES};
 
 /// Routing table: RouteKey -> BackendList
 /// Hash map for exact path matching (Tier 1)
 #[map]
 static ROUTES: HashMap<RouteKey, BackendList> =
     HashMap::<RouteKey, BackendList>::with_max_entries(MAX_ROUTES, 0);
+
+/// Per-route Maglev tables: path_hash -> CompactMaglevTable[4099]
+/// Separate map to avoid BPF stack overflow (4KB per table)
+#[map]
+static MAGLEV_TABLES: HashMap<u64, CompactMaglevTable> =
+    HashMap::<u64, CompactMaglevTable>::with_max_entries(MAX_ROUTES, 0);
 
 /// Flow affinity cache: (client_ip, path_hash) -> backend_index
 /// LRU map automatically evicts old flows (Cilium pattern)
@@ -152,11 +158,11 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Select backend using embedded compact Maglev table
+/// Select backend using separate compact Maglev table
 /// Uses client IP + path hash for consistent routing
 ///
-/// Key improvement: Each route now has its own 4KB Maglev table embedded in BackendList!
-/// This enables true multi-route support with per-route consistent hashing.
+/// Key improvement: Each route has its own 4KB Maglev table in separate map!
+/// This avoids BPF stack overflow (4KB table > 512B stack limit)
 #[inline(always)]
 fn select_backend(client_ip: u32, path_hash: u64, backends: &BackendList) -> Option<&Backend> {
     if backends.count == 0 || backends.count > common::MAX_BACKENDS as u32 {
@@ -174,12 +180,18 @@ fn select_backend(client_ip: u32, path_hash: u64, backends: &BackendList) -> Opt
         }
     }
 
-    // Embedded compact Maglev lookup (per-route table!)
+    // Look up Maglev table for this route (indexed by path_hash)
+    let maglev_table = match unsafe { MAGLEV_TABLES.get(&path_hash) } {
+        Some(table) => table,
+        None => return None, // No table for this route
+    };
+
+    // Compact Maglev lookup (per-route table!)
     // O(1) lookup with minimal disruption (~1/N) when backends change
     let table_idx = (flow_key % common::COMPACT_MAGLEV_SIZE as u64) as usize;
 
-    // Look up backend index in THIS route's embedded Maglev table
-    let backend_idx = backends.maglev_table[table_idx] as usize;
+    // Look up backend index in THIS route's Maglev table
+    let backend_idx = maglev_table.table[table_idx] as usize;
 
     // Validate index is within current backend list
     if backend_idx >= backends.count as usize {

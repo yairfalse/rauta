@@ -5,7 +5,7 @@ use aya::{
     programs::{Xdp, XdpFlags},
     Ebpf,
 };
-use common::{BackendList, Metrics, RouteKey};
+use common::{Backend, BackendList, CompactMaglevTable, HttpMethod, Metrics, RouteKey, fnv1a_hash};
 use std::net::Ipv4Addr;
 use tokio::signal;
 use tracing::{info, warn};
@@ -142,13 +142,17 @@ impl RautaControl {
 
     /// Add a test route for validation
     pub fn add_test_route(&mut self) -> Result<(), RautaError> {
-        use common::{fnv1a_hash, Backend, HttpMethod};
-
         let mut routes: HashMap<_, RouteKey, BackendList> =
             HashMap::try_from(self.bpf.map_mut("ROUTES").ok_or_else(|| {
                 RautaError::MapNotFound("ROUTES map not found".to_string())
             })?)
             .map_err(|e| RautaError::MapAccessError(format!("Failed to access ROUTES map: {}", e)))?;
+
+        let mut maglev_tables: HashMap<_, u64, CompactMaglevTable> =
+            HashMap::try_from(self.bpf.map_mut("MAGLEV_TABLES").ok_or_else(|| {
+                RautaError::MapNotFound("MAGLEV_TABLES map not found".to_string())
+            })?)
+            .map_err(|e| RautaError::MapAccessError(format!("Failed to access MAGLEV_TABLES map: {}", e)))?;
 
         // Create route: GET /api/users
         let path = b"/api/users";
@@ -166,15 +170,20 @@ impl RautaControl {
         backend_list.backends[0] = backend;
         backend_list.count = 1;
 
-        // Build embedded compact Maglev table for this route
-        // This is the key improvement: each route gets its own 4KB table!
-        let compact_table = common::maglev_build_compact_table(&[backend]);
-        backend_list.maglev_table.copy_from_slice(&compact_table);
+        // Build compact Maglev table for this route (separate map!)
+        let compact_table_vec = common::maglev_build_compact_table(&[backend]);
+        let mut maglev_table = CompactMaglevTable::empty();
+        maglev_table.table.copy_from_slice(&compact_table_vec);
 
-        // Insert route with embedded table into BPF map
+        // Insert route into ROUTES map (small, fits in stack)
         routes
             .insert(route_key, backend_list, 0)
             .map_err(|e| RautaError::MapAccessError(format!("Failed to insert route: {}", e)))?;
+
+        // Insert Maglev table into MAGLEV_TABLES map (indexed by path_hash)
+        maglev_tables
+            .insert(path_hash, maglev_table, 0)
+            .map_err(|e| RautaError::MapAccessError(format!("Failed to insert Maglev table: {}", e)))?;
 
         info!(
             method = "GET",
@@ -182,7 +191,7 @@ impl RautaControl {
             backend = "10.0.1.1:8080",
             backends = backend_list.count,
             table_size = common::COMPACT_MAGLEV_SIZE,
-            "Route added with embedded compact Maglev table (4KB per route)"
+            "Route added with separate compact Maglev table (avoids BPF stack overflow)"
         );
 
         Ok(())
