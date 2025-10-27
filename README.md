@@ -8,7 +8,7 @@
 
 RAUTA is an experimental ingress controller that uses eBPF to route HTTP traffic directly in the Linux kernel, bypassing traditional userspace proxies for simple requests.
 
-> **Status**: 🚧 Experimental - Active Development on [`feat/maglev-implementation`](https://github.com/yairfalse/rauta/tree/feat/maglev-implementation)
+> **Status**: 🚧 Experimental - Active Development
 
 ## What We're Building
 
@@ -60,8 +60,9 @@ RAUTA handles these common cases in the kernel using eBPF (extended Berkeley Pac
 
 **Tier 1 (XDP)** - Fastest path, kernel-only:
 - Parses HTTP/1.1 GET requests at the NIC driver level
-- Looks up exact paths in an eBPF hash map
-- Selects backend using Maglev consistent hashing
+- Looks up exact paths in an eBPF hash map (ROUTES)
+- Selects backend using per-route compact Maglev table (MAGLEV_TABLES)
+- O(1) consistent hashing with connection affinity (LRU flow cache)
 - Encapsulates packet (IPIP) and forwards directly to pod
 - Never touches userspace
 
@@ -104,11 +105,16 @@ The controller compiles this into eBPF map entries that route traffic at line ra
 
 ## Load Balancing
 
-RAUTA uses **Maglev consistent hashing** for backend selection:
-- O(1) lookup time
-- Minimal disruption when backends change (1/N)
-- Per-connection consistent routing
-- Backend health-aware failover
+RAUTA uses **per-route compact Maglev consistent hashing** for backend selection:
+
+- **Per-route tables**: Each route gets its own 4KB Maglev table (vs. single global 262KB table)
+- **Compact design**: 4099-entry tables with u8 indices (supports up to 32 backends per route)
+- **O(1) lookup**: Constant-time backend selection using pre-computed permutations
+- **Minimal disruption**: ~1/N re-balancing when backends change (Google Maglev algorithm)
+- **Connection affinity**: LRU flow cache for consistent per-connection routing
+- **Stack-safe**: Separate map storage avoids BPF 512-byte stack limit
+
+See [documents/maglev-architecture.md](documents/maglev-architecture.md) for detailed design and performance analysis.
 
 ## Performance Goals
 
@@ -134,11 +140,11 @@ RAUTA uses **Maglev consistent hashing** for backend selection:
 
 - ✅ HTTP/1.1 method parsing (GET, POST, PUT, DELETE, HEAD, PATCH, OPTIONS)
 - ✅ FNV-1a path hashing for fast route lookups
-- ✅ Fibonacci hashing for backend selection
+- ✅ **Per-route compact Maglev consistent hashing** (4KB per route, stack-safe)
 - ✅ LRU flow affinity cache (Cilium pattern)
 - ✅ XDP_TX hairpin NAT with checksum recalculation
 - ✅ Per-CPU metrics (lock-free counters)
-- ✅ 18 unit tests passing (TDD approach)
+- ✅ 22 unit tests passing (TDD approach)
 
 ### Quick Start (Cross-Platform)
 
