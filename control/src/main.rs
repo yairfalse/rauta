@@ -199,51 +199,6 @@ impl RautaControl {
         HashMap::try_from(self.bpf.map_mut("ROUTES").expect("ROUTES map not found"))
             .expect("Failed to access ROUTES map")
     }
-
-    /// Update Maglev lookup table for consistent hashing
-    ///
-    /// Builds a Maglev table for the given backends and populates the MAGLEV_TABLE BPF map.
-    /// This enables O(1) backend selection with minimal disruption (~1/N) when backends change.
-    pub fn update_maglev_table(&mut self, backends: &[common::Backend]) -> Result<(), RautaError> {
-        use common::{maglev_build_table, MAGLEV_TABLE_SIZE};
-
-        info!(
-            backend_count = backends.len(),
-            "Building Maglev lookup table"
-        );
-
-        // Build Maglev table (in userspace)
-        let table = maglev_build_table(backends);
-
-        // Get MAGLEV_TABLE map
-        let mut maglev_map: Array<_, u32> =
-            Array::try_from(self.bpf.map_mut("MAGLEV_TABLE").ok_or_else(|| {
-                RautaError::MapNotFound("MAGLEV_TABLE map not found".to_string())
-            })?)
-            .map_err(|e| {
-                RautaError::MapAccessError(format!("Failed to access MAGLEV_TABLE map: {}", e))
-            })?;
-
-        // Populate the BPF map
-        for (idx, backend_idx) in table.iter().enumerate() {
-            let value = backend_idx.unwrap_or(u32::MAX); // Use u32::MAX for empty slots
-            maglev_map
-                .set(idx as u32, value, 0)
-                .map_err(|e| {
-                    RautaError::MapAccessError(format!(
-                        "Failed to set Maglev table entry {}: {}",
-                        idx, e
-                    ))
-                })?;
-        }
-
-        info!(
-            entries = MAGLEV_TABLE_SIZE,
-            "Maglev table populated successfully"
-        );
-
-        Ok(())
-    }
 }
 
 /// Report metrics periodically

@@ -28,12 +28,6 @@ static FLOW_CACHE: LruHashMap<u64, u32> = LruHashMap::<u64, u32>::with_max_entri
 #[map]
 static METRICS: PerCpuArray<Metrics> = PerCpuArray::<Metrics>::with_max_entries(1, 0);
 
-/// Maglev consistent hashing lookup table
-/// Array of backend indices for O(1) lookup with minimal disruption
-/// Populated by control plane using maglev_build_table()
-#[map]
-static MAGLEV_TABLE: Array<u32> = Array::<u32>::with_max_entries(MAGLEV_TABLE_SIZE as u32, 0);
-
 /// Maximum HTTP request line length to parse
 const MAX_HTTP_LINE: usize = 512;
 
