@@ -1,86 +1,142 @@
 # RAUTA
 
-**Kernel-accelerated Kubernetes Ingress Controller**
+**Simple Kubernetes Ingress Controller**
 
 [![CI](https://github.com/yairfalse/rauta/actions/workflows/ci.yml/badge.svg)](https://github.com/yairfalse/rauta/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
-RAUTA is an experimental ingress controller that uses eBPF to route HTTP traffic directly in the Linux kernel, bypassing traditional userspace proxies for simple requests.
+> **Status**: 🚧 Experimental - We're trying our best to make this work
 
-> **Status**: 🚧 Experimental - Active Development
+---
 
-## What We're Building
+## What is RAUTA?
 
-Most HTTP requests follow simple patterns: `GET /api/users` or `POST /orders`. These don't need complex regex matching or protocol translation - they just need fast packet forwarding to the right backend pod.
+RAUTA is an experimental ingress controller for Kubernetes. Our goal is to make ingress as easy as possible.
 
-RAUTA handles these common cases in the kernel using eBPF (extended Berkeley Packet Filter), achieving sub-microsecond latency. Complex requests that need full HTTP/2 support or regex routing fall back to a Rust-based userspace proxy.
+**What we're building:**
+- Standard K8s Ingress resources (no custom config)
+- Simple deployment (one kubectl command)
+- Built-in observability (see what's happening)
+- Written in Rust (memory safe, fast)
+
+**This is a learning project.** We're building in public and figuring things out as we go.
+
+---
+
+## Quick Start
+
+```bash
+# Install RAUTA
+kubectl apply -f https://rauta.io/install.yaml
+
+# Create standard Ingress
+kubectl apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-app
+spec:
+  rules:
+  - host: myapp.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: my-service
+            port:
+              number: 8080
+EOF
+```
+
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                         Client                               │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
-         ┌───────────────────────────────────┐
-         │   Tier 1: XDP (eXpress Data Path) │
-         │   • HTTP/1.1 GET requests         │
-         │   • Exact path match: /api/users  │
-         │   • Latency: <1μs                 │
-         │   • 60% of traffic                │
-         └───────────┬───────────────────────┘
-                     │ miss
-                     ▼
-         ┌───────────────────────────────────┐
-         │   Tier 2: TC-BPF                  │
-         │   • HTTP POST/PUT/DELETE          │
-         │   • Prefix match: /api/*          │
-         │   • Latency: ~10μs                │
-         │   • 30% of traffic                │
-         └───────────┬───────────────────────┘
-                     │ miss
-                     ▼
-         ┌───────────────────────────────────┐
-         │   Tier 3: Rust Userspace          │
-         │   • HTTP/2, gRPC, TLS             │
-         │   • Regex: /users/[0-9]+          │
-         │   • Latency: ~100μs               │
-         │   • 10% of traffic                │
-         └───────────┬───────────────────────┘
-                     │
-                     ▼
-         ┌───────────────────────────────────┐
-         │       Backend Pods (K8s)          │
-         └───────────────────────────────────┘
+┌─────────────────────────────────────────┐
+│         Kubernetes Cluster              │
+│                                         │
+│  ┌─────────┐  ┌─────────┐             │
+│  │ Service │  │ Service │             │
+│  │  (pods) │  │  (pods) │             │
+│  └────▲────┘  └────▲────┘             │
+│       │            │                    │
+│       └────────────┘                    │
+│                │                        │
+│         ┌──────▼──────┐                │
+│         │    RAUTA    │                │
+│         │  (2 pods)   │                │
+│         └──────▲──────┘                │
+│                │                        │
+└────────────────┼────────────────────────┘
+                 │
+            Client requests
 ```
 
-## How It Works
+**How it works:**
+1. Watches K8s Ingress resources
+2. Watches Service/Endpoints for backend IPs
+3. Routes HTTP traffic to backend pods
+4. Logs requests for debugging
+5. Exports metrics to Prometheus
 
-**Tier 1 (XDP)** - Fastest path, kernel-only:
-- Parses HTTP/1.1 GET requests at the NIC driver level
-- Looks up exact paths in an eBPF hash map (ROUTES)
-- Selects backend using per-route compact Maglev table (MAGLEV_TABLES)
-- O(1) consistent hashing with connection affinity (LRU flow cache)
-- Encapsulates packet (IPIP) and forwards directly to pod
-- Never touches userspace
+Pure Rust userspace proxy. Simple and straightforward.
 
-**Tier 2 (TC-BPF)** - Fast path, kernel-only:
-- Handles HTTP POST/PUT/DELETE methods
-- Uses longest prefix matching for paths like `/api/*`
-- Same Maglev hashing and IPIP encapsulation
-- Still in kernel, just after network stack allocation
+---
 
-**Tier 3 (Rust)** - Complex path, userspace:
-- Full HTTP/2 and gRPC support
-- Regex path matching
-- TLS termination
-- Built with tokio + hyper + rustls
+## Features
 
-## Kubernetes Integration
+### Current Status (MVP in progress)
 
-RAUTA watches Kubernetes Ingress resources and automatically updates eBPF maps:
+- ✅ HTTP/1.1 routing
+- ✅ Maglev load balancing
+- ✅ Request logging
+- ✅ Prometheus metrics
+- 🔄 K8s Ingress sync (in progress)
+- 🔄 Backend health checks (in progress)
+
+### Planned
+
+- ⏳ TLS termination
+- ⏳ HTTP/2 support
+- ⏳ WebSocket support
+- ⏳ Simple web UI
+
+**Note:** This is experimental. Features may change.
+
+---
+
+## Observability
+
+RAUTA tries to make it easy to see what's happening:
+
+**Request Logs:**
+```bash
+curl http://rauta:9000/requests
+
+# Shows recent requests:
+GET /api/users 200 12ms → 10.0.1.42:8080
+POST /orders 201 45ms → 10.0.2.15:8080
+```
+
+**Metrics:**
+```bash
+curl http://rauta:9000/metrics
+
+# Prometheus metrics:
+# rauta_requests_total
+# rauta_request_duration_seconds
+# rauta_backend_errors_total
+```
+
+---
+
+## Configuration
+
+RAUTA uses standard Kubernetes Ingress resources:
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -93,7 +149,7 @@ spec:
     http:
       paths:
       - path: /users
-        pathType: Exact
+        pathType: Prefix
         backend:
           service:
             name: user-service
@@ -101,121 +157,136 @@ spec:
               number: 8080
 ```
 
-The controller compiles this into eBPF map entries that route traffic at line rate.
+No special configuration needed. Just standard K8s.
 
-## Load Balancing
+---
 
-RAUTA uses **per-route compact Maglev consistent hashing** for backend selection:
+## Development
 
-- **Per-route tables**: Each route gets its own 4KB Maglev table (vs. single global 262KB table)
-- **Compact design**: 4099-entry tables with u8 indices (supports up to 32 backends per route)
-- **O(1) lookup**: Constant-time backend selection using pre-computed permutations
-- **Minimal disruption**: ~1/N re-balancing when backends change (Google Maglev algorithm)
-- **Connection affinity**: LRU flow cache for consistent per-connection routing
-- **Stack-safe**: Separate map storage avoids BPF 512-byte stack limit
-
-See [documents/maglev-architecture.md](documents/maglev-architecture.md) for detailed design and performance analysis.
-
-## Performance Goals
-
-- **Tier 1 latency**: <1μs p99 (XDP exact match)
-- **Tier 2 latency**: ~10μs p99 (TC-BPF prefix match)
-- **Tier 3 latency**: ~100μs p99 (Rust userspace)
-- **Throughput**: 1M+ requests/sec per core (Tier 1)
-- **Memory**: <100MB baseline, <5MB per 1000 routes
-
-## Technology Stack
-
-- **eBPF**: Aya framework (Rust eBPF toolkit)
-- **Userspace**: Rust with tokio, hyper, rustls
-- **Kubernetes**: kube-rs client library
-- **Load balancing**: Maglev algorithm
-- **Encapsulation**: IPIP (20-byte overhead)
-
-## Current Status
-
-**✅ Tier 1 (XDP) Implemented** - HTTP/1.1 parsing and XDP_TX forwarding complete!
-
-### What's Working
-
-- ✅ HTTP/1.1 method parsing (GET, POST, PUT, DELETE, HEAD, PATCH, OPTIONS)
-- ✅ FNV-1a path hashing for fast route lookups
-- ✅ **Per-route compact Maglev consistent hashing** (4KB per route, stack-safe)
-- ✅ LRU flow affinity cache (Cilium pattern)
-- ✅ XDP_TX hairpin NAT with checksum recalculation
-- ✅ Per-CPU metrics (lock-free counters)
-- ✅ 22 unit tests passing (TDD approach)
-
-### Quick Start (Cross-Platform)
-
-**One-command setup** - auto-detects your platform:
+### Build
 
 ```bash
-./scripts/setup.sh
+git clone https://github.com/yairfalse/rauta
+cd rauta
+
+cargo build --release
+cargo test
 ```
 
-**Linux** 🐧 (Full Native Toolchain):
-```bash
-# Everything works natively!
-cd bpf && cargo +nightly build --release --target=bpfel-unknown-none
-cd common && cargo test
-```
-
-**macOS** 🍎 (Hybrid Workflow):
-```bash
-# Fast unit tests
-cd common && cargo test
-
-# Build BPF in Docker (when needed)
-./docker/build.sh
-```
-
-See [DEVELOPMENT.md](DEVELOPMENT.md) for platform-specific guides.
-
-### Docker (All Platforms)
+### Run Locally
 
 ```bash
-# Build RAUTA (compiles BPF + control plane)
-./docker/build.sh
-
-# Run integration tests
-./docker/test.sh
-
-# Benchmark performance
-./docker/benchmark.sh
+export KUBECONFIG=~/.kube/config
+cargo run --bin rauta
 ```
 
-See [docker/README.md](docker/README.md) for details.
+---
 
-> 💡 **Build Issues?** Check [BUILD.md](BUILD.md) for platform-specific troubleshooting (macOS LLVM, Linux deps, CI setup)
+## false-systems Ecosystem
 
-### Project Structure
+RAUTA can integrate with other false-systems tools:
 
-```
-rauta/
-├── common/          # Shared types (Pod-compatible for BPF)
-├── bpf/             # XDP program (HTTP parsing + forwarding)
-│   ├── src/main.rs        # XDP entry point (~330 lines)
-│   └── src/forwarding.rs  # Packet forwarding (~240 lines)
-├── control/         # Control plane (Aya framework)
-│   └── src/main.rs        # BPF loader + metrics (~240 lines)
-├── tests/           # Integration tests
-└── docker/          # Docker build environment
-```
+**The Stack:**
+- **TAPIO**: K8s observer (eBPF + Go)
+- **RAUTA**: Ingress controller (Rust)
+- **AHTI**: Correlation engine (Go)
+- **URPO**: Trace explorer (Rust)
 
-### What's Next
+**Integration:**
+- RAUTA → NATS → TAPIO (correlate ingress with pod metrics)
+- RAUTA → OTLP → URPO (trace visualization)
+- RAUTA → NATS → AHTI (service graph)
 
-- ⏳ Tier 2 (TC-BPF) - Prefix matching with BPF LPM tries
-- ⏳ Tier 3 (Rust userspace) - HTTP/2, gRPC, regex matching
-- ⏳ Kubernetes integration - Watch Ingress resources
-- ⏳ CLI tool - `rautactl` for route management
+RAUTA works standalone, but can plug into the ecosystem if you want.
 
-RAUTA is a learning project exploring the boundaries of kernel networking and Kubernetes integration.
+All projects are experimental and named after Finnish mythology/elements.
+
+---
+
+## Contributing
+
+This is a community learning project. We're figuring things out as we go.
+
+**Ways to help:**
+- Try RAUTA and share feedback
+- Report bugs or issues
+- Suggest improvements
+- Contribute code (any size welcome!)
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+
+---
+
+## Project Goals
+
+**What we're trying to do:**
+- Make K8s ingress as simple as possible
+- Use standard K8s resources (Ingress)
+- Make it easy to see what's happening
+- Learn Rust and K8s together
+- Build something useful for small teams
+
+**What this is:**
+- Experimental project
+- Learning in public
+- Community effort
+- Free and open source
+
+---
+
+## Roadmap
+
+### Phase 1: MVP (Weeks 1-8) - Current
+
+- Basic HTTP proxy
+- K8s Ingress sync
+- Load balancing
+- Request logging
+
+### Phase 2: Improvements (Weeks 9-12)
+
+- TLS support
+- HTTP/2
+- Better UI
+- More features
+
+### Phase 3: Community
+
+- Documentation
+- Examples
+- Tutorials
+- Help users
+
+**Timeline is flexible.** We're learning and building at our own pace.
+
+---
+
+## Why Rust?
+
+We chose Rust because:
+- Memory safe (fewer bugs)
+- Fast (good performance)
+- Good ecosystem (tokio, hyper, kube-rs)
+- Fun to learn
+
+We're still learning Rust. This project helps us practice.
+
+---
 
 ## Name
 
-**Rauta** (Finnish: "iron") - Named after the element that Rust prevents, fitting the Finnish naming theme of our tooling ecosystem.
+**Rauta** (Finnish: "iron")
+
+Named after the element that Rust prevents. Part of our Finnish naming theme.
+
+---
 
 ## License
 
-Apache 2.0
+Apache 2.0 - Free and open source.
+
+---
+
+**RAUTA: Trying to make K8s ingress simple.** 🦀
+
+We're doing our best. Feedback welcome!
