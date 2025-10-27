@@ -10,7 +10,7 @@ use aya_ebpf::{
     programs::XdpContext,
 };
 use core::mem;
-use common::{Backend, BackendList, HttpMethod, Metrics, RouteKey, MAGLEV_TABLE_SIZE, MAX_ROUTES};
+use common::{Backend, BackendList, HttpMethod, Metrics, RouteKey, MAX_ROUTES};
 
 /// Routing table: RouteKey -> BackendList
 /// Hash map for exact path matching (Tier 1)
@@ -158,8 +158,11 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Select backend using simple hash-based load balancing
+/// Select backend using embedded compact Maglev table
 /// Uses client IP + path hash for consistent routing
+///
+/// Key improvement: Each route now has its own 4KB Maglev table embedded in BackendList!
+/// This enables true multi-route support with per-route consistent hashing.
 #[inline(always)]
 fn select_backend(client_ip: u32, path_hash: u64, backends: &BackendList) -> Option<&Backend> {
     if backends.count == 0 || backends.count > common::MAX_BACKENDS as u32 {
@@ -177,22 +180,12 @@ fn select_backend(client_ip: u32, path_hash: u64, backends: &BackendList) -> Opt
         }
     }
 
-    // Maglev consistent hashing lookup
+    // Embedded compact Maglev lookup (per-route table!)
     // O(1) lookup with minimal disruption (~1/N) when backends change
-    let table_idx = (flow_key % MAGLEV_TABLE_SIZE as u64) as u32;
+    let table_idx = (flow_key % common::COMPACT_MAGLEV_SIZE as u64) as usize;
 
-    // Look up backend index in Maglev table
-    let backend_idx_u32 = match unsafe { MAGLEV_TABLE.get(table_idx) } {
-        Some(idx) => *idx,
-        None => return None, // Table not initialized
-    };
-
-    // Check for empty slot sentinel (u32::MAX)
-    if backend_idx_u32 == u32::MAX {
-        return None;
-    }
-
-    let backend_idx = backend_idx_u32 as usize;
+    // Look up backend index in THIS route's embedded Maglev table
+    let backend_idx = backends.maglev_table[table_idx] as usize;
 
     // Validate index is within current backend list
     if backend_idx >= backends.count as usize {
@@ -202,6 +195,7 @@ fn select_backend(client_ip: u32, path_hash: u64, backends: &BackendList) -> Opt
     }
 
     // Cache the selection for connection affinity
+    let backend_idx_u32 = backend_idx as u32;
     let _ = unsafe { FLOW_CACHE.insert(&flow_key, &backend_idx_u32, 0) };
 
     Some(&backends.backends[backend_idx])
