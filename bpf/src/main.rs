@@ -188,7 +188,7 @@ fn select_backend(client_ip: u32, path_hash: u64, backends: &BackendList) -> Opt
 
     // Compact Maglev lookup (per-route table!)
     // O(1) lookup with minimal disruption (~1/N) when backends change
-    let table_idx = (flow_key % common::COMPACT_MAGLEV_SIZE as u64) as usize;
+    let table_idx = (flow_key % (common::COMPACT_MAGLEV_SIZE as u64)) as usize;
 
     // Look up backend index in THIS route's Maglev table
     let backend_idx = maglev_table.table[table_idx] as usize;

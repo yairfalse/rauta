@@ -355,7 +355,7 @@ fn generate_permutation(backend: &Backend, backend_idx: u32) -> Vec<usize> {
     // Use backend IP + port as key, backend_idx as additional seed to avoid collisions
     let key = ((backend.ipv4 as u64) << 16) | (backend.port as u64);
 
-    let offset = (hash_backend(key, backend_idx as u64) % MAGLEV_TABLE_SIZE as u64) as usize;
+    let offset = (hash_backend(key, backend_idx as u64) % (MAGLEV_TABLE_SIZE as u64)) as usize;
     let skip =
         ((hash_backend(key, backend_idx as u64 + 1) % (MAGLEV_TABLE_SIZE as u64 - 1)) + 1) as usize;
 
@@ -468,7 +468,7 @@ fn generate_permutation_compact(backend: &Backend, backend_idx: u32) -> Vec<usiz
     // Generate two hash values for offset and skip
     let key = ((backend.ipv4 as u64) << 16) | (backend.port as u64);
 
-    let offset = (hash_backend(key, backend_idx as u64) % COMPACT_MAGLEV_SIZE as u64) as usize;
+    let offset = (hash_backend(key, backend_idx as u64) % (COMPACT_MAGLEV_SIZE as u64)) as usize;
     let skip = ((hash_backend(key, backend_idx as u64 + 1) % (COMPACT_MAGLEV_SIZE as u64 - 1)) + 1)
         as usize;
 
@@ -492,7 +492,7 @@ pub fn maglev_lookup_compact(flow_key: u64, table: &[u8]) -> u8 {
     }
 
     // Hash the flow key and look up in table
-    let idx = (flow_key % COMPACT_MAGLEV_SIZE as u64) as usize;
+    let idx = (flow_key % (COMPACT_MAGLEV_SIZE as u64)) as usize;
     table[idx]
 }
 
