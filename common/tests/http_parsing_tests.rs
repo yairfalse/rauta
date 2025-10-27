@@ -18,10 +18,16 @@ fn test_http_method_from_bytes_all_methods() {
     assert_eq!(HttpMethod::from_bytes(b"GET /"), Some(HttpMethod::GET));
     assert_eq!(HttpMethod::from_bytes(b"POST /"), Some(HttpMethod::POST));
     assert_eq!(HttpMethod::from_bytes(b"PUT /"), Some(HttpMethod::PUT));
-    assert_eq!(HttpMethod::from_bytes(b"DELETE /"), Some(HttpMethod::DELETE));
+    assert_eq!(
+        HttpMethod::from_bytes(b"DELETE /"),
+        Some(HttpMethod::DELETE)
+    );
     assert_eq!(HttpMethod::from_bytes(b"HEAD /"), Some(HttpMethod::HEAD));
     assert_eq!(HttpMethod::from_bytes(b"PATCH /"), Some(HttpMethod::PATCH));
-    assert_eq!(HttpMethod::from_bytes(b"OPTIONS /"), Some(HttpMethod::OPTIONS));
+    assert_eq!(
+        HttpMethod::from_bytes(b"OPTIONS /"),
+        Some(HttpMethod::OPTIONS)
+    );
 }
 
 #[test]
@@ -95,7 +101,8 @@ fn test_fnv1a_hash_empty_input() {
 #[test]
 fn test_fnv1a_hash_long_paths() {
     // Test with realistic long paths
-    let long_path = b"/api/v1/namespaces/default/pods/my-pod-12345/logs?follow=true&timestamps=true";
+    let long_path =
+        b"/api/v1/namespaces/default/pods/my-pod-12345/logs?follow=true&timestamps=true";
     let hash = fnv1a_hash(long_path);
 
     // Should not panic and should produce a hash
@@ -130,7 +137,11 @@ fn test_real_http_request_lines() {
 
     for request in &requests {
         let method = HttpMethod::from_bytes(request);
-        assert!(method.is_some(), "Failed to parse: {:?}", std::str::from_utf8(request));
+        assert!(
+            method.is_some(),
+            "Failed to parse: {:?}",
+            std::str::from_utf8(request)
+        );
     }
 }
 
@@ -145,7 +156,10 @@ fn test_path_extraction_simulation() {
 
     // Extract path (would be done in BPF)
     let path_start = method.len() as usize + 1; // Skip "GET "
-    let path_end = request[path_start..].iter().position(|&b| b == b' ').unwrap();
+    let path_end = request[path_start..]
+        .iter()
+        .position(|&b| b == b' ')
+        .unwrap();
     let path = &request[path_start..path_start + path_end];
 
     // Compute hash

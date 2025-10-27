@@ -88,10 +88,7 @@ impl HttpMethod {
                 Some(HttpMethod::OPTIONS)
             }
             (b'P', b'A', b'T')
-                if bytes.len() >= 6
-                    && bytes[3] == b'C'
-                    && bytes[4] == b'H'
-                    && bytes[5] == b' ' =>
+                if bytes.len() >= 6 && bytes[3] == b'C' && bytes[4] == b'H' && bytes[5] == b' ' =>
             {
                 Some(HttpMethod::PATCH)
             }
@@ -359,7 +356,8 @@ fn generate_permutation(backend: &Backend, backend_idx: u32) -> Vec<usize> {
     let key = ((backend.ipv4 as u64) << 16) | (backend.port as u64);
 
     let offset = (hash_backend(key, backend_idx as u64) % MAGLEV_TABLE_SIZE as u64) as usize;
-    let skip = ((hash_backend(key, backend_idx as u64 + 1) % (MAGLEV_TABLE_SIZE as u64 - 1)) + 1) as usize;
+    let skip =
+        ((hash_backend(key, backend_idx as u64 + 1) % (MAGLEV_TABLE_SIZE as u64 - 1)) + 1) as usize;
 
     // Generate permutation
     let mut perm = Vec::with_capacity(MAGLEV_TABLE_SIZE);
@@ -471,7 +469,8 @@ fn generate_permutation_compact(backend: &Backend, backend_idx: u32) -> Vec<usiz
     let key = ((backend.ipv4 as u64) << 16) | (backend.port as u64);
 
     let offset = (hash_backend(key, backend_idx as u64) % COMPACT_MAGLEV_SIZE as u64) as usize;
-    let skip = ((hash_backend(key, backend_idx as u64 + 1) % (COMPACT_MAGLEV_SIZE as u64 - 1)) + 1) as usize;
+    let skip = ((hash_backend(key, backend_idx as u64 + 1) % (COMPACT_MAGLEV_SIZE as u64 - 1)) + 1)
+        as usize;
 
     // Generate permutation
     let mut perm = Vec::with_capacity(COMPACT_MAGLEV_SIZE);
@@ -507,7 +506,10 @@ mod tests {
         assert_eq!(HttpMethod::from_bytes(b"GET /"), Some(HttpMethod::GET));
         assert_eq!(HttpMethod::from_bytes(b"POST /"), Some(HttpMethod::POST));
         assert_eq!(HttpMethod::from_bytes(b"PUT /"), Some(HttpMethod::PUT));
-        assert_eq!(HttpMethod::from_bytes(b"DELETE /"), Some(HttpMethod::DELETE));
+        assert_eq!(
+            HttpMethod::from_bytes(b"DELETE /"),
+            Some(HttpMethod::DELETE)
+        );
 
         // Invalid methods should return None
         assert_eq!(HttpMethod::from_bytes(b"INVALID"), None);

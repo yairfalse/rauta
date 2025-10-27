@@ -5,7 +5,7 @@ use aya::{
     programs::{Xdp, XdpFlags},
     Ebpf,
 };
-use common::{Backend, BackendList, CompactMaglevTable, HttpMethod, Metrics, RouteKey, fnv1a_hash};
+use common::{fnv1a_hash, Backend, BackendList, CompactMaglevTable, HttpMethod, Metrics, RouteKey};
 use std::net::Ipv4Addr;
 use tokio::signal;
 use tracing::{info, warn};
@@ -96,9 +96,9 @@ impl RautaControl {
             })?;
 
         // Load the program
-        program.load().map_err(|e| {
-            RautaError::BpfLoadError(format!("Failed to load XDP program: {}", e))
-        })?;
+        program
+            .load()
+            .map_err(|e| RautaError::BpfLoadError(format!("Failed to load XDP program: {}", e)))?;
 
         // Parse XDP flags
         let flags = match xdp_mode {
@@ -106,10 +106,7 @@ impl RautaControl {
             "skb" | "generic" => XdpFlags::SKB_MODE,
             "hw" | "offload" => XdpFlags::HW_MODE,
             _ => {
-                warn!(
-                    mode = xdp_mode,
-                    "Unknown XDP mode, defaulting to SKB_MODE"
-                );
+                warn!(mode = xdp_mode, "Unknown XDP mode, defaulting to SKB_MODE");
                 XdpFlags::SKB_MODE
             }
         };
@@ -156,15 +153,18 @@ impl RautaControl {
 
         // Insert route into ROUTES map (small, fits in stack)
         {
-            let mut routes: HashMap<_, RouteKey, BackendList> =
-                HashMap::try_from(self.bpf.map_mut("ROUTES").ok_or_else(|| {
-                    RautaError::MapNotFound("ROUTES map not found".to_string())
-                })?)
-                .map_err(|e| RautaError::MapAccessError(format!("Failed to access ROUTES map: {}", e)))?;
+            let mut routes: HashMap<_, RouteKey, BackendList> = HashMap::try_from(
+                self.bpf
+                    .map_mut("ROUTES")
+                    .ok_or_else(|| RautaError::MapNotFound("ROUTES map not found".to_string()))?,
+            )
+            .map_err(|e| {
+                RautaError::MapAccessError(format!("Failed to access ROUTES map: {}", e))
+            })?;
 
-            routes
-                .insert(route_key, backend_list, 0)
-                .map_err(|e| RautaError::MapAccessError(format!("Failed to insert route: {}", e)))?;
+            routes.insert(route_key, backend_list, 0).map_err(|e| {
+                RautaError::MapAccessError(format!("Failed to insert route: {}", e))
+            })?;
         }
 
         // Insert Maglev table into MAGLEV_TABLES map (indexed by path_hash)
@@ -173,11 +173,15 @@ impl RautaControl {
                 HashMap::try_from(self.bpf.map_mut("MAGLEV_TABLES").ok_or_else(|| {
                     RautaError::MapNotFound("MAGLEV_TABLES map not found".to_string())
                 })?)
-                .map_err(|e| RautaError::MapAccessError(format!("Failed to access MAGLEV_TABLES map: {}", e)))?;
+                .map_err(|e| {
+                    RautaError::MapAccessError(format!("Failed to access MAGLEV_TABLES map: {}", e))
+                })?;
 
             maglev_tables
                 .insert(path_hash, maglev_table, 0)
-                .map_err(|e| RautaError::MapAccessError(format!("Failed to insert Maglev table: {}", e)))?;
+                .map_err(|e| {
+                    RautaError::MapAccessError(format!("Failed to insert Maglev table: {}", e))
+                })?;
         }
 
         info!(

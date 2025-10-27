@@ -2,8 +2,7 @@
 ///
 /// Testing the Maglev algorithm implementation for backend selection.
 /// Based on the Google Maglev paper: https://research.google/pubs/pub44824/
-
-use common::{Backend, maglev_build_table, maglev_lookup, MAGLEV_TABLE_SIZE};
+use common::{maglev_build_table, maglev_lookup, Backend, MAGLEV_TABLE_SIZE};
 
 #[test]
 fn test_maglev_table_size_is_prime() {
@@ -67,7 +66,10 @@ fn test_maglev_two_backends_distribution() {
         assert!(
             diff < max_diff,
             "Backend {} has {} entries, expected ~{} (±{})",
-            i, count, expected_per_backend, max_diff
+            i,
+            count,
+            expected_per_backend,
+            max_diff
         );
     }
 }
@@ -306,8 +308,14 @@ fn test_embedded_compact_maglev_multi_route() {
     );
 
     // Each table should reference only its own backends (indices 0-1)
-    assert!(table1.iter().all(|&idx| idx < 2), "Route 1 table should only reference backends 0-1");
-    assert!(table2.iter().all(|&idx| idx < 2), "Route 2 table should only reference backends 0-1");
+    assert!(
+        table1.iter().all(|&idx| idx < 2),
+        "Route 1 table should only reference backends 0-1"
+    );
+    assert!(
+        table2.iter().all(|&idx| idx < 2),
+        "Route 2 table should only reference backends 0-1"
+    );
 
     // Test backend selection using embedded tables
     let flow_key = 0x12345678u64;

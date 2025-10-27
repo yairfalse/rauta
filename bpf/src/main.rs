@@ -9,8 +9,8 @@ use aya_ebpf::{
     maps::{Array, HashMap, LruHashMap, PerCpuArray},
     programs::XdpContext,
 };
-use core::mem;
 use common::{Backend, BackendList, CompactMaglevTable, HttpMethod, Metrics, RouteKey, MAX_ROUTES};
+use core::mem;
 
 /// Routing table: RouteKey -> BackendList
 /// Hash map for exact path matching (Tier 1)
