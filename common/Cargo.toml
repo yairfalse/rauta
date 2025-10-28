@@ -9,6 +9,9 @@ aya = { version = "0.13", optional = true }
 aya-ebpf = { version = "0.1", optional = true }
 
 [features]
-default = ["serde", "aya"]
+# Stage 1: Only serde by default (no eBPF)
+# Stage 2+: Add aya back to default
+default = ["serde"]
 std = []
+aya = ["dep:aya"]
 aya-ebpf = ["dep:aya-ebpf"]

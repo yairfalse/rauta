@@ -2,9 +2,14 @@
 resolver = "2"
 members = [
     "common",
-    "bpf",
     "control",
-    "cli",
+    # Stage 2+: Add back when needed
+    # "bpf",
+    # "cli",
+]
+default-members = [
+    "common",
+    "control",
 ]
 
 [workspace.package]

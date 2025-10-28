@@ -1,0 +1,303 @@
+================================================================================
+ENVOY HTTP ROUTING ARCHITECTURE - VISUAL OVERVIEW
+================================================================================
+
+1. REQUEST ARRIVAL & ROUTING DECISION
+================================================================================
+
+     HTTP Request (GET /api/users, Host: api.example.com)
+              |
+              v
+     +-----------------+
+     | TLS Termination | (Listener level, not router)
+     +-----------------+
+              |
+              v
+     +------------------------------------------+
+     | HTTP Connection Manager (HCM)           |
+     | - Decodes HTTP headers                  |
+     | - Passes to filter chain                |
+     +------------------------------------------+
+              |
+              v
+     +------------------------------------------+
+     | Router Filter (router_http_filter)      |
+     | - Main routing logic                    |
+     | - This is where decisions happen        |
+     +------------------------------------------+
+              |
+              v
+     +=== ROUTE SELECTION ===+
+     |
+     +----> Step 1: Select VirtualHost by domain
+     |      ┌─────────────────────────────────────┐
+     |      | Route Configuration                 |
+     |      | ├─ VirtualHost "api_backend"        |
+     |      | │  domains: ["api.example.com"]     |
+     |      | │  ├─ Route 1: /api/users           |
+     |      | │  ├─ Route 2: /api/posts           |
+     |      | │  └─ Route 3: /admin/...           |
+     |      | ├─ VirtualHost "web_backend"        |
+     |      | │  domains: ["*.example.com"]       |
+     |      | │  ...                              |
+     |      | └─ VirtualHost "*" (catch-all)      |
+     |      └─────────────────────────────────────┘
+     |      Match: "api.example.com" → "api_backend" ✓
+     |
+     +----> Step 2: Select Route within VirtualHost
+     |      (Iterate routes in order, first match wins)
+     |      
+     |      Route 1: match { prefix: "/api/" }
+     |      Method: GET (implicit ALL)
+     |      Path: "/api/users" ✓
+     |      → MATCHED
+     |
+     v
+     +=== LOAD BALANCER SELECTION ===+
+     |
+     | Hash input (if hash_policy set):
+     | - header: "user-id" → user value
+     | - OR cookie: "session-id" → cookie value
+     | - OR connection: source_ip + port
+     |
+     | Lookup in Maglev table (65537 entries):
+     | table[hash_value % 65537] → Backend
+     |
+     | If no affinity needed: Round-robin / Random
+     |
+     v
+     Backend Selection: backend-1.internal:8080
+     
+     
+2. CONFIGURATION HIERARCHY & MATCHING
+================================================================================
+
+     RouteConfiguration (versioned, immutable after creation)
+     │
+     ├─ metadata                    (Route config level metadata)
+     ├─ request_headers_to_add       (Appended to all requests)
+     ├─ request_headers_to_remove    (Removed from all requests)
+     │
+     └─ VirtualHosts[] (domain-based multiplexing)
+         │
+         ├─ name: "api_backend"
+         ├─ domains: ["api.example.com", "api.*.example.com"]
+         ├─ require_tls: EXTERNAL_ONLY or ALL
+         ├─ request_headers_to_add   (Added to requests in this vhost)
+         ├─ response_headers_to_add  (Added to responses)
+         │
+         └─ Routes[] (matched in order)
+             │
+             ├─ match
+             │  ├─ prefix: "/api/"
+             │  ├─ OR path: "/api/exact"
+             │  ├─ OR safe_regex: "^/v[0-9]+/.*"
+             │  ├─ OR path_separated_prefix: "/api" (trie-optimized)
+             │  ├─ method: GET | POST | DELETE | ...
+             │  ├─ headers[]
+             │  │  ├─ name: "x-feature-flag"
+             │  │  ├─ string_match { exact: "enabled" }
+             │  └─ query_parameters[]
+             │
+             ├─ route (RouteAction)
+             │  ├─ cluster: "backend_cluster"
+             │  ├─ OR weighted_clusters:
+             │  │  ├─ clusters: [{name: "v1", weight: 80}]
+             │  │  └─ clusters: [{name: "v2", weight: 20}]
+             │  ├─ timeout: 30s
+             │  ├─ retry_policy
+             │  │  ├─ num_retries: 3
+             │  │  ├─ retry_on: "5xx,reset,503-unavailable"
+             │  │  └─ per_try_timeout: 10s
+             │  ├─ hash_policy[]
+             │  │  ├─ header { name: "user-id" }
+             │  │  ├─ OR cookie { name: "sessionid" }
+             │  │  └─ OR connection_properties
+             │  └─ request_headers_to_add (route-specific)
+             │
+             └─ OR direct_response (no backend, respond directly)
+                ├─ status: 200 | 404 | 500
+                └─ body: "content"
+
+
+3. STATISTICS & OBSERVABILITY
+================================================================================
+
+     Router Level Stats (per worker thread):
+     ├─ no_cluster              (COUNTER) - No upstream cluster found
+     ├─ no_route                (COUNTER) - No matching route  
+     ├─ rq_total                (COUNTER) - Total requests
+     ├─ rq_direct_response      (COUNTER) - Direct responses (no upstream)
+     ├─ rq_redirect             (COUNTER) - HTTP redirects (30x)
+     └─ rq_active               (GAUGE)   - Active in-flight requests
+     
+     Per-Route Stats (per named route):
+     ├─ requests                (COUNTER) - Requests matching this route
+     ├─ active                  (GAUGE)   - Active requests on this route
+     ├─ request_latency_us      (HISTOGRAM)
+     │  ├─ p50, p90, p95, p99, p99.9
+     ├─ upstream_latency_us     (HISTOGRAM)
+     └─ errors
+        ├─ 5xx                  (COUNTER)
+        ├─ 4xx                  (COUNTER)
+        └─ timeout              (COUNTER)
+     
+     Latency Breakdown:
+     Total = downstream time + upstream time
+     
+     Downstream Time:
+     ├─ Time to receive complete request
+     └─ Includes retry attempts
+     
+     Upstream Time:
+     ├─ Connection pool lookup
+     ├─ Connection establishment (if new)
+     ├─ HTTP encoding
+     ├─ Network latency
+     ├─ First byte from upstream (TTFB)
+     └─ Time to receive complete response
+
+
+4. LOAD BALANCER ALGORITHMS
+================================================================================
+
+     a) Ring Hash (Ketama)
+     ═══════════════════════════════════════════════════════════════════════
+     
+        Hash Input: user-id, cookie, or source IP
+        Hash Value: 0 ... 2^64-1
+        Ring Size: configurable (e.g., 1024 - 8M)
+        
+        Construction:
+        ┌─────────────────────────────────────────────────────┐
+        │ Ring:  [Backend-1, Backend-2, Backend-3, Backend-1] │
+        │        ^        ^        ^        ^         ^        │
+        │        0        100      200      300       400      │
+        │ Hash Space: 0 ────────────────────────────► 2^64-1   │
+        └─────────────────────────────────────────────────────┘
+        
+        Lookup: binary search on sorted (hash, backend) pairs
+        O(log N) complexity, consistent distribution
+        
+     
+     b) Maglev Hash (Google)
+     ═══════════════════════════════════════════════════════════════════════
+     
+        Hash Input: same as ring hash
+        Table Size: Fixed 65537 (prime number)
+        
+        Construction:
+        1. For each backend:
+           offset = hash(backend_name) % 65537
+           skip = (hash(backend_name, seed=1) % (65537-1)) + 1
+        
+        2. Round-robin fill table:
+           for iter = 1 to N:
+               for backend in backends:
+                   next_slot = (offset + iter * skip) % 65537
+                   if table[next_slot] is empty:
+                       table[next_slot] = backend
+        
+        Lookup: Direct index
+        table[hash % 65537] → Backend
+        O(1) complexity, very uniform distribution
+        
+        Advantage over Ring: More even backend load distribution
+        Disadvantage: Fixed table size
+
+
+5. HEADER MODIFICATION PIPELINE
+================================================================================
+
+     Specificity Order (from least to most specific):
+     
+     1. Global Level (RouteConfiguration)
+        request_headers_to_add: [host, x-custom]
+        request_headers_to_remove: [x-internal]
+     
+     2. VirtualHost Level
+        request_headers_to_add: [x-vhost]
+        request_headers_to_remove: [x-secret]
+     
+     3. Route Level
+        request_headers_to_add: [x-route]
+        request_headers_to_remove: []
+     
+     Final Headers (applied in order):
+     ├─ x-custom: "global"      (added at level 1)
+     ├─ x-internal: (removed)   (removed at level 1)
+     ├─ x-vhost: "value"        (added at level 2)
+     ├─ x-secret: (removed)     (removed at level 2)
+     └─ x-route: "specific"     (added at level 3)
+     
+     Header mutation is done ONCE during route selection,
+     then headers reused for all retries on same route.
+
+
+6. HOT RELOAD / ROUTE UPDATE FLOW
+================================================================================
+
+     RDS API (Route Discovery Service) - Streaming
+     │
+     ├─ Control Plane sends new RouteConfiguration
+     │  └─ version_info: "123"
+     │     virtual_hosts: [...]
+     │
+     └─> RdsRouteConfigSubscription receives update
+         │
+         ├─ Validate (clusters exist, regex valid)
+         │
+         ├─ Create new immutable RouteConfig object
+         │
+         ├─ Atomically swap in thread-local storage
+         │  ├─ Worker 1: old_config → new_config
+         │  ├─ Worker 2: old_config → new_config
+         │  └─ Worker 3: old_config → new_config
+         │
+         └─ In-flight requests: continue on old config (no disruption)
+            New requests: use new config
+
+
+7. PERFORMANCE OPTIMIZATIONS
+================================================================================
+
+     Hot Path Fast:
+     ✓ VirtualHost lookup: trie (O(log N))
+     ✓ Route lookup: linear (O(N), but N small, ~10 routes)
+     ✓ Exact path match: hash table (O(1))
+     ✓ Load balancer: Maglev O(1) or RingHash O(log N)
+     ✓ No allocations (reuse header maps, buffers)
+     
+     Cold Path Acceptable:
+     ○ Regex matching: compiled upfront (O(1) match time)
+     ○ Route creation: happens at bootstrap (O(N*M))
+     ○ Header parsing: cached per route
+     
+     Memory Management:
+     • Route tree is immutable (no locks needed)
+     • Object pooling for upstream requests
+     • Bounded maps (no unbounded growth)
+     • String views (no copies) for header values
+     
+     Estimated Latency per Request:
+     ├─ VirtualHost selection: 1-5 μs
+     ├─ Route selection:       1-10 μs
+     ├─ Load balancer:         0.1-5 μs (Maglev 0.1, RingHash 1-5)
+     ├─ Pool lookup:           1-2 μs
+     └─ Total:                 5-25 μs (excluding network/TLS)
+
+
+================================================================================
+KEY PATTERNS FOR RAUTA IMPLEMENTATION
+================================================================================
+
+1. Use immutable route trees (no locks in hot path)
+2. Hierarchical model: domain → path → backend
+3. Per-route statistics (critical for debugging)
+4. Maglev for consistent hashing (if needed)
+5. Atomic updates with versioning
+6. Thread-local route caching (per worker)
+7. Pre-compiled regex (fail fast at config time)
+8. Header mutations batched by specificity
+
+================================================================================

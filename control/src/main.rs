@@ -1,71 +1,49 @@
-use anyhow::{Context, Result};
-use aya::{
-    include_bytes_aligned,
-    maps::{HashMap, PerCpuArray},
-    programs::{Xdp, XdpFlags},
-    Ebpf,
-};
-use common::{fnv1a_hash, Backend, BackendList, CompactMaglevTable, HttpMethod, Metrics, RouteKey};
-use std::net::Ipv4Addr;
+use anyhow::Result;
+// Stage 1: Pure Rust userspace proxy (no eBPF)
+// Stage 2+: Uncomment Aya for eBPF observability
+// use aya::{...};
 use tokio::signal;
-use tracing::{info, warn};
+use tracing::info;
 
 mod error;
 mod routes;
+mod proxy;
 
-use error::RautaError;
-
-/// RAUTA Control Plane
+/// RAUTA Control Plane - Stage 1
+///
+/// Pure Rust userspace HTTP proxy (no eBPF yet)
 ///
 /// Responsibilities:
-/// 1. Load XDP program onto network interface
-/// 2. Manage BPF maps (routes, flow cache, metrics)
-/// 3. Watch Kubernetes Ingress resources
-/// 4. Provide API for route configuration
+/// 1. HTTP proxy server (tokio + hyper) - Week 1-2
+/// 2. K8s Ingress watcher (kube-rs) - Week 3-4
+/// 3. Load balancing (Maglev) - Week 5-6
+/// 4. Observability (metrics + UI) - Week 7-8
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt::init();
 
-    info!("RAUTA Control Plane starting...");
+    info!("RAUTA Stage 1: Pure Rust Ingress Controller");
+    info!("Starting HTTP proxy server...");
 
-    // Parse command-line arguments
-    let interface = std::env::var("RAUTA_INTERFACE").unwrap_or_else(|_| "eth0".to_string());
-    let xdp_mode = std::env::var("RAUTA_XDP_MODE").unwrap_or_else(|_| "skb".to_string());
-
-    info!(
-        interface = %interface,
-        xdp_mode = %xdp_mode,
-        "Configuration loaded"
-    );
-
-    // Load eBPF program
-    let mut control = RautaControl::load(&interface, &xdp_mode)
-        .await
-        .context("Failed to load RAUTA control plane")?;
-
-    info!("XDP program loaded successfully");
-
-    // Add example route for testing
-    control
-        .add_test_route()
-        .context("Failed to add test route")?;
-
-    info!("Test route added: GET /api/users -> 10.0.1.1:8080");
-
-    // TODO: Re-enable metrics reporting (needs lifetime refactor)
-    // Start metrics reporting task would go here
+    // TODO Week 1-2: Start HTTP proxy server
+    // TODO Week 3-4: Start K8s Ingress watcher
+    // TODO Week 5-6: Add health checks
+    // TODO Week 7-8: Start metrics server + UI
 
     // Wait for shutdown signal
-    info!("Control plane running. Press Ctrl-C to exit.");
+    info!("Press Ctrl-C to exit.");
     signal::ctrl_c().await?;
 
-    info!("Shutdown signal received, cleaning up...");
-    info!("RAUTA Control Plane stopped");
+    info!("Shutdown signal received");
     Ok(())
 }
 
-/// Main control structure
+// ============================================================================
+// Stage 2+: eBPF code (commented out for Stage 1)
+// ============================================================================
+// Will uncomment when we add eBPF observability in Stage 2 (Week 9-16)
+/*
 pub struct RautaControl {
     bpf: Ebpf,
 }
@@ -252,3 +230,4 @@ async fn metrics_reporter(mut metrics: PerCpuArray<&mut aya::maps::MapData, Metr
         }
     }
 }
+*/
