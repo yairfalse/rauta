@@ -77,17 +77,19 @@ async fn handle_request(
                 backend.port
             );
 
-            Ok(Response::builder()
+            Response::builder()
                 .status(StatusCode::OK)
                 .body(Full::new(Bytes::from(body)))
-                .unwrap())
+                .map_err(|e| format!("Failed to build response: {}", e))
+        }
         }
         None => {
             // No route matched - 404
-            Ok(Response::builder()
+            Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Full::new(Bytes::from("Not Found")))
-                .unwrap())
+                .map_err(|e| format!("Failed to build response: {}", e))
+        }
         }
     }
 }
