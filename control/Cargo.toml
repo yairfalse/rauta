@@ -31,6 +31,9 @@ hyper = { version = "1.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 
+# Routing
+matchit = "0.8"
+
 # Networking
 libc = "0.2"
 
