@@ -47,14 +47,12 @@ jobs:
       - name: Unit tests
         run: cd common && cargo test --all-features
 
-  # Build BPF - only if BPF or common code changed
+  # Build BPF - DISABLED (no eBPF code yet - Stage 4)
+  # Will re-enable when we add eBPF observability layer
   build-bpf:
     name: Build BPF Program
     runs-on: ubuntu-latest
-    if: |
-      contains(github.event.pull_request.title, '[bpf]') ||
-      contains(github.event.commits[0].message, 'bpf') ||
-      github.event_name == 'push'
+    if: false  # Disabled - no eBPF code yet
     steps:
       - uses: actions/checkout@v4
 
@@ -192,7 +190,7 @@ jobs:
   ci-success:
     name: CI Success
     if: always()
-    needs: [quick-checks, build-bpf, build-control, integration-tests, security]
+    needs: [quick-checks, build-control, security]  # Removed build-bpf and integration-tests
     runs-on: ubuntu-latest
     steps:
       - name: Check all jobs succeeded
@@ -209,14 +207,5 @@ jobs:
             echo "Security audit failed"
             exit 1
           fi
-          # BPF build is optional (only runs if BPF code changed)
-          if [[ "${{ needs.build-bpf.result }}" == "failure" ]]; then
-            echo "BPF build failed"
-            exit 1
-          fi
-          # Integration tests run only if BPF was built
-          if [[ "${{ needs.integration-tests.result }}" == "failure" ]]; then
-            echo "Integration tests failed"
-            exit 1
-          fi
           echo "✅ All CI checks passed!"
+          echo "Note: eBPF builds disabled - no eBPF code yet (Stage 4)"
