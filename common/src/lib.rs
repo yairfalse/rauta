@@ -5,16 +5,8 @@
 //! Shared data structures between eBPF and userspace components.
 //! All types are Pod-compatible (Plain Old Data) for BPF map usage.
 
-// For userspace: import aya::Pod trait
-#[cfg(feature = "aya")]
-use aya::Pod;
-
-// For eBPF: No Pod trait needed - types are automatically compatible if #[repr(C)]
-#[cfg(feature = "aya-ebpf")]
-pub unsafe trait Pod: Copy + 'static {}
-
-// For tests without aya/aya-ebpf: Dummy Pod trait
-#[cfg(not(any(feature = "aya", feature = "aya-ebpf")))]
+// Stage 1: Define local Pod trait (no eBPF yet)
+// Stage 4+: Will use aya::Pod when we add eBPF observability
 pub unsafe trait Pod: Copy + 'static {}
 
 /// Maximum path length for HTTP routing (99%+ coverage)
@@ -293,7 +285,6 @@ pub const fn fnv1a_hash(bytes: &[u8]) -> u64 {
 /// Based on Google's Maglev paper: https://research.google/pubs/pub44824/
 ///
 /// Maglev provides O(1) lookup with minimal disruption (~1/N) when backends change.
-
 #[cfg(not(target_arch = "bpf"))]
 extern crate alloc;
 #[cfg(not(target_arch = "bpf"))]
