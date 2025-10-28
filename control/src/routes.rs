@@ -38,6 +38,8 @@ fn default_weight() -> u16 {
 
 impl Route {
     /// Convert to BPF map entry (RouteKey, BackendList)
+    /// Stage 2+: Used for eBPF map population
+    #[allow(dead_code)]
     pub fn to_bpf_entry(&self) -> (RouteKey, BackendList) {
         // Compute path hash
         let path_hash = fnv1a_hash(self.path.as_bytes());
@@ -86,7 +88,7 @@ mod tests {
             ],
         };
 
-        let (key, backends) = route.to_bpf_entry();
+        let (_key, backends) = route.to_bpf_entry();
 
         assert_eq!(backends.count, 2);
         assert_eq!(backends.backends[0].port, 8080);

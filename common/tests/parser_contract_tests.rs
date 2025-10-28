@@ -34,7 +34,7 @@ fn test_parser_contract_method_with_length() {
     for (input, expected_method, expected_len) in test_cases {
         // Parse method
         let method = HttpMethod::from_bytes(input)
-            .expect(&format!("Should parse: {:?}", std::str::from_utf8(input)));
+            .unwrap_or_else(|| panic!("Should parse: {:?}", std::str::from_utf8(input)));
 
         // Verify method matches
         assert_eq!(method, expected_method);

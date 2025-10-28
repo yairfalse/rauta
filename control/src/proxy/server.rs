@@ -62,14 +62,14 @@ async fn handle_request(
     req: Request<hyper::body::Incoming>,
     router: Arc<Router>,
 ) -> Result<Response<Full<Bytes>>, String> {
-    let method = match req.method() {
-        &hyper::Method::GET => common::HttpMethod::GET,
-        &hyper::Method::POST => common::HttpMethod::POST,
-        &hyper::Method::PUT => common::HttpMethod::PUT,
-        &hyper::Method::DELETE => common::HttpMethod::DELETE,
-        &hyper::Method::HEAD => common::HttpMethod::HEAD,
-        &hyper::Method::OPTIONS => common::HttpMethod::OPTIONS,
-        &hyper::Method::PATCH => common::HttpMethod::PATCH,
+    let method = match *req.method() {
+        hyper::Method::GET => common::HttpMethod::GET,
+        hyper::Method::POST => common::HttpMethod::POST,
+        hyper::Method::PUT => common::HttpMethod::PUT,
+        hyper::Method::DELETE => common::HttpMethod::DELETE,
+        hyper::Method::HEAD => common::HttpMethod::HEAD,
+        hyper::Method::OPTIONS => common::HttpMethod::OPTIONS,
+        hyper::Method::PATCH => common::HttpMethod::PATCH,
         _ => common::HttpMethod::GET,
     };
 

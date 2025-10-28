@@ -7,6 +7,13 @@
 
 // Stage 1: Define local Pod trait (no eBPF yet)
 // Stage 4+: Will use aya::Pod when we add eBPF observability
+///
+/// # Safety
+///
+/// Types implementing Pod must be plain-old-data (POD):
+/// - No padding bytes (all bits initialized)
+/// - Safe to transmit via memcpy
+/// - Can be safely cast to/from byte slices
 pub unsafe trait Pod: Copy + 'static {}
 
 /// Maximum path length for HTTP routing (99%+ coverage)
@@ -100,6 +107,11 @@ impl HttpMethod {
             HttpMethod::OPTIONS => 7,
             HttpMethod::ALL => 0,
         }
+    }
+
+    /// Check if method is empty (always false for valid HTTP methods)
+    pub const fn is_empty(&self) -> bool {
+        false
     }
 }
 
@@ -261,6 +273,12 @@ impl Metrics {
             return 0.0;
         }
         self.packets_dropped as f64 / self.packets_total as f64
+    }
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

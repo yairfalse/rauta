@@ -1,6 +1,7 @@
 use thiserror::Error;
 
-/// RAUTA Control Plane Errors
+/// RAUTA Control Plane Errors (Stage 2+: eBPF errors)
+#[allow(dead_code)]
 #[derive(Error, Debug)]
 pub enum RautaError {
     #[error("BPF load error: {0}")]
