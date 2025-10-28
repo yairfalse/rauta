@@ -34,7 +34,7 @@ fn test_parser_contract_method_with_length() {
     for (input, expected_method, expected_len) in test_cases {
         // Parse method
         let method = HttpMethod::from_bytes(input)
-            .expect(&format!("Should parse: {:?}", std::str::from_utf8(input)));
+            .unwrap_or_else(|| panic!("Should parse: {:?}", std::str::from_utf8(input)));
 
         // Verify method matches
         assert_eq!(method, expected_method);
@@ -53,12 +53,12 @@ fn test_parser_contract_method_with_length() {
 #[test]
 fn test_parser_contract_rejects_invalid() {
     let invalid_inputs = vec![
-        b"get /api" as &[u8],    // lowercase
-        b"GTE /api",              // typo
-        b"123 /api",              // number
-        b"GET/api",               // no space
-        b"GE",                    // too short
-        b"",                      // empty
+        b"get /api" as &[u8], // lowercase
+        b"GTE /api",          // typo
+        b"123 /api",          // number
+        b"GET/api",           // no space
+        b"GE",                // too short
+        b"",                  // empty
     ];
 
     for input in invalid_inputs {

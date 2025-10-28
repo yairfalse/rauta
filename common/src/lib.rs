@@ -5,16 +5,15 @@
 //! Shared data structures between eBPF and userspace components.
 //! All types are Pod-compatible (Plain Old Data) for BPF map usage.
 
-// For userspace: import aya::Pod trait
-#[cfg(feature = "aya")]
-use aya::Pod;
-
-// For eBPF: No Pod trait needed - types are automatically compatible if #[repr(C)]
-#[cfg(feature = "aya-ebpf")]
-pub unsafe trait Pod: Copy + 'static {}
-
-// For tests without aya/aya-ebpf: Dummy Pod trait
-#[cfg(not(any(feature = "aya", feature = "aya-ebpf")))]
+// Stage 1: Define local Pod trait (no eBPF yet)
+// Stage 4+: Will use aya::Pod when we add eBPF observability
+///
+/// # Safety
+///
+/// Types implementing Pod must be plain-old-data (POD):
+/// - No padding bytes (all bits initialized)
+/// - Safe to transmit via memcpy
+/// - Can be safely cast to/from byte slices
 pub unsafe trait Pod: Copy + 'static {}
 
 /// Maximum path length for HTTP routing (99%+ coverage)
@@ -108,6 +107,11 @@ impl HttpMethod {
             HttpMethod::OPTIONS => 7,
             HttpMethod::ALL => 0,
         }
+    }
+
+    /// Check if method is empty (always false for valid HTTP methods)
+    pub const fn is_empty(&self) -> bool {
+        false
     }
 }
 
@@ -272,6 +276,12 @@ impl Metrics {
     }
 }
 
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// FNV-1a hash for path strings
 /// Used in both eBPF and userspace for consistent hashing
 pub const fn fnv1a_hash(bytes: &[u8]) -> u64 {
@@ -293,7 +303,6 @@ pub const fn fnv1a_hash(bytes: &[u8]) -> u64 {
 /// Based on Google's Maglev paper: https://research.google/pubs/pub44824/
 ///
 /// Maglev provides O(1) lookup with minimal disruption (~1/N) when backends change.
-
 #[cfg(not(target_arch = "bpf"))]
 extern crate alloc;
 #[cfg(not(target_arch = "bpf"))]

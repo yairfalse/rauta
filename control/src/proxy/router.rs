@@ -1,6 +1,6 @@
 //! HTTP Router - selects backends using Maglev consistent hashing
 //!
-//! TDD: Starting with tests, implementing minimal code to pass
+//! Supports both exact and prefix matching for K8s Ingress compatibility.
 
 use common::{fnv1a_hash, maglev_build_compact_table, maglev_lookup_compact, Backend, HttpMethod};
 use std::collections::HashMap;
@@ -20,8 +20,13 @@ struct RouteKey {
 }
 
 /// HTTP Router - selects backend for incoming requests
+///
+/// Uses hybrid matching strategy:
+/// - Exact match via hash map (O(1) for exact paths)
+/// - Prefix match via matchit radix tree (O(log n) for prefixes)
 pub struct Router {
     routes: Arc<RwLock<HashMap<RouteKey, Route>>>,
+    prefix_router: Arc<RwLock<matchit::Router<RouteKey>>>,
 }
 
 impl Router {
@@ -29,6 +34,7 @@ impl Router {
     pub fn new() -> Self {
         Self {
             routes: Arc::new(RwLock::new(HashMap::new())),
+            prefix_router: Arc::new(RwLock::new(matchit::Router::new())),
         }
     }
 
@@ -50,16 +56,36 @@ impl Router {
             maglev_table,
         };
 
+        // Add to hash map (exact match)
         let mut routes = self.routes.write().unwrap();
         routes.insert(key, route);
+
+        // Add to matchit for prefix matching
+        let mut prefix_router = self.prefix_router.write().unwrap();
+
+        // Add exact path
+        prefix_router
+            .insert(path.to_string(), key)
+            .map_err(|e| format!("Failed to add exact route: {}", e))?;
+
+        // Add prefix wildcard (matchit syntax: {*rest})
+        let prefix_pattern = if path == "/" {
+            "/{*rest}".to_string()
+        } else {
+            format!("{}/{{*rest}}", path.trim_end_matches('/'))
+        };
+
+        prefix_router
+            .insert(prefix_pattern, key)
+            .map_err(|e| format!("Failed to add prefix route: {}", e))?;
 
         Ok(())
     }
 
     /// Select backend for request
     ///
-    /// Uses Maglev consistent hashing with flow-based distribution.
-    /// Hash incorporates path + connection info (src_ip/port) for proper load balancing.
+    /// Tries exact match first (O(1)), then prefix match (O(log n)).
+    /// Uses Maglev consistent hashing for backend selection.
     pub fn select_backend(
         &self,
         method: HttpMethod,
@@ -70,11 +96,23 @@ impl Router {
         let path_hash = fnv1a_hash(path.as_bytes());
         let key = RouteKey { method, path_hash };
 
+        // Try exact match first, then prefix match
+        let route_key = {
+            let routes = self.routes.read().unwrap();
+            if routes.contains_key(&key) {
+                Some(key)
+            } else {
+                // Prefix match via matchit
+                let prefix_router = self.prefix_router.read().unwrap();
+                prefix_router.at(path).ok().map(|m| *m.value)
+            }
+        }?;
+
+        // Look up route
         let routes = self.routes.read().unwrap();
-        let route = routes.get(&key)?;
+        let route = routes.get(&route_key)?;
 
         // Use flow hash (path + src_ip + src_port) for Maglev lookup
-        // This ensures requests to same path are distributed across backends
         let flow_hash = self.compute_flow_hash(path_hash, src_ip, src_port);
         let backend_idx = maglev_lookup_compact(flow_hash, &route.maglev_table);
         route.backends.get(backend_idx as usize).copied()
@@ -141,6 +179,44 @@ mod tests {
         // No routes added - should return None
         let backend = router.select_backend(HttpMethod::GET, "/api/users", None, None);
         assert!(backend.is_none());
+    }
+
+    #[test]
+    fn test_router_prefix_matching() {
+        let router = Router::new();
+
+        // Add route: GET /api/users -> backend (Prefix match)
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+
+        router
+            .add_route(HttpMethod::GET, "/api/users", backends)
+            .unwrap();
+
+        // Exact match should work
+        let backend = router
+            .select_backend(HttpMethod::GET, "/api/users", None, None)
+            .expect("Exact match should work");
+        assert_eq!(Ipv4Addr::from(backend.ipv4), Ipv4Addr::new(10, 0, 1, 1));
+
+        // Prefix match should also work: /api/users/123 should match /api/users
+        let backend = router
+            .select_backend(HttpMethod::GET, "/api/users/123", None, None)
+            .expect("Prefix match should work");
+        assert_eq!(Ipv4Addr::from(backend.ipv4), Ipv4Addr::new(10, 0, 1, 1));
+
+        // Deeper paths should match too
+        let backend = router
+            .select_backend(HttpMethod::GET, "/api/users/123/posts", None, None)
+            .expect("Deep prefix match should work");
+        assert_eq!(Ipv4Addr::from(backend.ipv4), Ipv4Addr::new(10, 0, 1, 1));
+
+        // Non-matching path should NOT match
+        let backend = router.select_backend(HttpMethod::GET, "/api/posts", None, None);
+        assert!(backend.is_none(), "/api/posts should not match /api/users");
     }
 
     #[test]

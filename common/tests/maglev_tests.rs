@@ -182,25 +182,22 @@ fn test_maglev_minimal_disruption_on_backend_removal() {
         let before = maglev_lookup(flow_key, &table_before);
         let after = maglev_lookup(flow_key, &table_after);
 
-        match (before, after) {
-            (Some(b), Some(a)) => {
-                // Map old backend indices to new ones
-                // Backend 0 stays 0, backend 2 becomes 1
-                let expected = if b == 0 {
-                    0 // Backend 0 unchanged
-                } else if b == 2 {
-                    1 // Backend 2 -> index 1 in new list
-                } else {
-                    continue; // Was backend 1, will definitely change
-                };
+        if let (Some(b), Some(a)) = (before, after) {
+            // Map old backend indices to new ones
+            // Backend 0 stays 0, backend 2 becomes 1
+            let expected = if b == 0 {
+                0 // Backend 0 unchanged
+            } else if b == 2 {
+                1 // Backend 2 -> index 1 in new list
+            } else {
+                continue; // Was backend 1, will definitely change
+            };
 
-                if a == expected {
-                    unchanged += 1;
-                } else {
-                    changed += 1;
-                }
+            if a == expected {
+                unchanged += 1;
+            } else {
+                changed += 1;
             }
-            _ => {}
         }
     }
 
@@ -348,9 +345,8 @@ fn test_embedded_compact_table_size() {
 #[test]
 fn test_embedded_compact_table_fits_in_u8() {
     // With MAX_BACKENDS = 32, we can use u8 for backend indices
+    // Note: MAX_BACKENDS (32) fits in u8 by design - const checked in common/src/lib.rs
     use common::MAX_BACKENDS;
-
-    assert!(MAX_BACKENDS <= 256, "MAX_BACKENDS must fit in u8");
 
     let backends: Vec<Backend> = (0..MAX_BACKENDS)
         .map(|i| Backend::new(0x0a000100 + i as u32, 8080, 100))
@@ -402,13 +398,13 @@ fn is_prime(n: usize) -> bool {
     if n <= 3 {
         return true;
     }
-    if n % 2 == 0 || n % 3 == 0 {
+    if n.is_multiple_of(2) || n.is_multiple_of(3) {
         return false;
     }
 
     let mut i = 5;
     while i * i <= n {
-        if n % i == 0 || n % (i + 2) == 0 {
+        if n.is_multiple_of(i) || n.is_multiple_of(i + 2) {
             return false;
         }
         i += 6;

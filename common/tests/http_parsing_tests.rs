@@ -239,7 +239,10 @@ fn test_negative_path_missing_after_method() {
 fn test_negative_path_only_http_version() {
     // This has space but no path - method parses OK, path validation fails separately
     // Method parser is lenient, path parser would reject this
-    assert_eq!(HttpMethod::from_bytes(b"GET HTTP/1.1"), Some(HttpMethod::GET));
+    assert_eq!(
+        HttpMethod::from_bytes(b"GET HTTP/1.1"),
+        Some(HttpMethod::GET)
+    );
 
     // If we tried to parse path (simulated), it would find "HTTP/1.1" as the "path"
     // which is invalid but that's the path parser's job to reject
@@ -378,7 +381,12 @@ fn test_negative_random_bytes_batch() {
     for request in &malformed_requests {
         let result = HttpMethod::from_bytes(request);
         // All should be rejected (None)
-        assert_eq!(result, None, "Should reject: {:?}", std::str::from_utf8(request).unwrap_or("<binary>"));
+        assert_eq!(
+            result,
+            None,
+            "Should reject: {:?}",
+            std::str::from_utf8(request).unwrap_or("<binary>")
+        );
     }
 }
 
