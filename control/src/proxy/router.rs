@@ -57,16 +57,46 @@ impl Router {
     }
 
     /// Select backend for request
-    pub fn select_backend(&self, method: HttpMethod, path: &str) -> Option<Backend> {
+    ///
+    /// Uses Maglev consistent hashing with flow-based distribution.
+    /// Hash incorporates path + connection info (src_ip/port) for proper load balancing.
+    pub fn select_backend(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        src_ip: Option<u32>,
+        src_port: Option<u16>,
+    ) -> Option<Backend> {
         let path_hash = fnv1a_hash(path.as_bytes());
         let key = RouteKey { method, path_hash };
 
         let routes = self.routes.read().unwrap();
         let route = routes.get(&key)?;
 
-        // Use Maglev to select backend based on path hash
-        let backend_idx = maglev_lookup_compact(path_hash, &route.maglev_table);
+        // Use flow hash (path + src_ip + src_port) for Maglev lookup
+        // This ensures requests to same path are distributed across backends
+        let flow_hash = self.compute_flow_hash(path_hash, src_ip, src_port);
+        let backend_idx = maglev_lookup_compact(flow_hash, &route.maglev_table);
         route.backends.get(backend_idx as usize).copied()
+    }
+
+    /// Compute flow hash for load balancing
+    ///
+    /// Combines path hash with connection info (if available) to distribute
+    /// requests across backends. Falls back to path-only if no connection info.
+    fn compute_flow_hash(&self, path_hash: u64, src_ip: Option<u32>, src_port: Option<u16>) -> u64 {
+        match (src_ip, src_port) {
+            (Some(ip), Some(port)) => {
+                // Hash = path_hash XOR (ip << 16 | port)
+                // This mixes path and connection info for good distribution
+                path_hash ^ ((ip as u64) << 16 | port as u64)
+            }
+            _ => {
+                // No connection info - fall back to path-only
+                // (Useful for testing or non-network contexts)
+                path_hash
+            }
+        }
     }
 }
 
@@ -90,9 +120,9 @@ mod tests {
             .add_route(HttpMethod::GET, "/api/users", backends)
             .unwrap();
 
-        // Select backend for this request
+        // Select backend for this request (no connection info in test)
         let backend = router
-            .select_backend(HttpMethod::GET, "/api/users")
+            .select_backend(HttpMethod::GET, "/api/users", None, None)
             .expect("Should find backend");
 
         // Should select one of the two backends
@@ -109,7 +139,7 @@ mod tests {
         let router = Router::new();
 
         // No routes added - should return None
-        let backend = router.select_backend(HttpMethod::GET, "/api/users");
+        let backend = router.select_backend(HttpMethod::GET, "/api/users", None, None);
         assert!(backend.is_none());
     }
 
@@ -134,12 +164,17 @@ mod tests {
                 .unwrap();
         }
 
-        // Test distribution across different paths
+        // Test distribution across different paths with simulated connections
         let mut distribution = std::collections::HashMap::new();
         for i in 0..100 {
             let path = format!("/api/users/{}", i);
+
+            // Simulate different source IPs/ports for load distribution
+            let src_ip = 0x0a000001 + (i as u32); // 10.0.0.1 + i
+            let src_port = 50000 + (i as u16);
+
             let backend = router
-                .select_backend(HttpMethod::GET, &path)
+                .select_backend(HttpMethod::GET, &path, Some(src_ip), Some(src_port))
                 .expect("Should find backend");
 
             let ip = Ipv4Addr::from(backend.ipv4);
