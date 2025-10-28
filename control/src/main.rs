@@ -1,41 +1,80 @@
 use anyhow::Result;
-// Stage 1: Pure Rust userspace proxy (no eBPF)
-// Stage 2+: Uncomment Aya for eBPF observability
-// use aya::{...};
+use common::{Backend, HttpMethod};
+use proxy::router::Router;
+use proxy::server::ProxyServer;
+use std::net::Ipv4Addr;
 use tokio::signal;
 use tracing::info;
 
 mod error;
-mod routes;
 mod proxy;
+mod routes;
 
 /// RAUTA Control Plane - Stage 1
 ///
 /// Pure Rust userspace HTTP proxy (no eBPF yet)
-///
-/// Responsibilities:
-/// 1. HTTP proxy server (tokio + hyper) - Week 1-2
-/// 2. K8s Ingress watcher (kube-rs) - Week 3-4
-/// 3. Load balancing (Maglev) - Week 5-6
-/// 4. Observability (metrics + UI) - Week 7-8
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
     tracing_subscriber::fmt::init();
 
-    info!("RAUTA Stage 1: Pure Rust Ingress Controller");
-    info!("Starting HTTP proxy server...");
+    info!("🦀 RAUTA Stage 1: Pure Rust Ingress Controller");
 
-    // TODO Week 1-2: Start HTTP proxy server
-    // TODO Week 3-4: Start K8s Ingress watcher
-    // TODO Week 5-6: Add health checks
-    // TODO Week 7-8: Start metrics server + UI
+    // Create router and add example routes
+    let router = Router::new();
+    add_example_routes(&router)?;
 
-    // Wait for shutdown signal
+    // Start HTTP proxy server
+    let server = ProxyServer::new("127.0.0.1:8080".to_string(), router)
+        .map_err(|e| anyhow::anyhow!("Failed to create server: {}", e))?;
+
+    info!("🚀 HTTP proxy server listening on 127.0.0.1:8080");
+    info!("📋 Routes configured:");
+    info!("   GET /api/users   -> user-service (2 backends)");
+    info!("   GET /api/posts   -> post-service (1 backend)");
+    info!("   GET /health      -> health-service");
+    info!("");
     info!("Press Ctrl-C to exit.");
-    signal::ctrl_c().await?;
 
-    info!("Shutdown signal received");
+    // Run server with graceful shutdown
+    tokio::select! {
+        result = server.serve() => {
+            if let Err(e) = result {
+                tracing::error!("Server error: {}", e);
+            }
+        }
+        _ = signal::ctrl_c() => {
+            info!("Shutdown signal received");
+        }
+    }
+
+    Ok(())
+}
+
+/// Add example routes for testing
+///
+/// Week 4-5: Replace with K8s Ingress watcher
+fn add_example_routes(router: &Router) -> Result<()> {
+    // Route 1: GET /api/users -> user-service (2 backends for load balancing)
+    let user_backends = vec![
+        Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 1)), 8080, 100),
+        Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 2)), 8080, 100),
+    ];
+    router
+        .add_route(HttpMethod::GET, "/api/users", user_backends)
+        .map_err(|e| anyhow::anyhow!("Failed to add route: {}", e))?;
+
+    // Route 2: GET /api/posts -> post-service (single backend)
+    let post_backends = vec![Backend::new(u32::from(Ipv4Addr::new(10, 0, 2, 1)), 8080, 100)];
+    router
+        .add_route(HttpMethod::GET, "/api/posts", post_backends)
+        .map_err(|e| anyhow::anyhow!("Failed to add route: {}", e))?;
+
+    // Route 3: GET /health -> health endpoint
+    let health_backends = vec![Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 8080, 100)];
+    router
+        .add_route(HttpMethod::GET, "/health", health_backends)
+        .map_err(|e| anyhow::anyhow!("Failed to add route: {}", e))?;
+
     Ok(())
 }
 
