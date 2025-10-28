@@ -64,13 +64,21 @@ fn add_example_routes(router: &Router) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to add route: {}", e))?;
 
     // Route 2: GET /api/posts -> post-service (single backend)
-    let post_backends = vec![Backend::new(u32::from(Ipv4Addr::new(10, 0, 2, 1)), 8080, 100)];
+    let post_backends = vec![Backend::new(
+        u32::from(Ipv4Addr::new(10, 0, 2, 1)),
+        8080,
+        100,
+    )];
     router
         .add_route(HttpMethod::GET, "/api/posts", post_backends)
         .map_err(|e| anyhow::anyhow!("Failed to add route: {}", e))?;
 
     // Route 3: GET /health -> health endpoint
-    let health_backends = vec![Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 8080, 100)];
+    let health_backends = vec![Backend::new(
+        u32::from(Ipv4Addr::new(127, 0, 0, 1)),
+        8080,
+        100,
+    )];
     router
         .add_route(HttpMethod::GET, "/health", health_backends)
         .map_err(|e| anyhow::anyhow!("Failed to add route: {}", e))?;

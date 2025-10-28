@@ -110,7 +110,9 @@ mod tests {
             9999,
             100,
         )];
-        router.add_route(HttpMethod::GET, "/test", backends).unwrap();
+        router
+            .add_route(HttpMethod::GET, "/test", backends)
+            .unwrap();
 
         let server = ProxyServer::new("127.0.0.1:8080".to_string(), router);
         assert!(server.is_ok());
@@ -126,7 +128,9 @@ mod tests {
             8080,
             100,
         )];
-        router.add_route(HttpMethod::GET, "/api/users", backends).unwrap();
+        router
+            .add_route(HttpMethod::GET, "/api/users", backends)
+            .unwrap();
 
         // Bind to a specific available port
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -144,8 +148,9 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Make HTTP request
-        let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build_http::<Full<Bytes>>();
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build_http::<Full<Bytes>>();
 
         let uri = format!("http://{}/api/users", bind_addr).parse().unwrap();
         let response = client.get(uri).await.expect("Request should succeed");
@@ -169,7 +174,9 @@ mod tests {
             8080,
             100,
         )];
-        router.add_route(HttpMethod::GET, "/api/users", backends).unwrap();
+        router
+            .add_route(HttpMethod::GET, "/api/users", backends)
+            .unwrap();
 
         // Bind to a specific available port
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -186,8 +193,9 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Make request to non-existent route
-        let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build_http::<Full<Bytes>>();
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build_http::<Full<Bytes>>();
 
         let uri = format!("http://{}/api/posts", bind_addr).parse().unwrap();
         let response = client.get(uri).await.expect("Request should succeed");

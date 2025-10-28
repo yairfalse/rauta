@@ -53,12 +53,12 @@ fn test_parser_contract_method_with_length() {
 #[test]
 fn test_parser_contract_rejects_invalid() {
     let invalid_inputs = vec![
-        b"get /api" as &[u8],    // lowercase
-        b"GTE /api",              // typo
-        b"123 /api",              // number
-        b"GET/api",               // no space
-        b"GE",                    // too short
-        b"",                      // empty
+        b"get /api" as &[u8], // lowercase
+        b"GTE /api",          // typo
+        b"123 /api",          // number
+        b"GET/api",           // no space
+        b"GE",                // too short
+        b"",                  // empty
     ];
 
     for input in invalid_inputs {

@@ -64,7 +64,9 @@ impl Router {
         let mut prefix_router = self.prefix_router.write().unwrap();
 
         // Add exact path
-        prefix_router.insert(path.to_string(), key).map_err(|e| format!("Failed to add exact route: {}", e))?;
+        prefix_router
+            .insert(path.to_string(), key)
+            .map_err(|e| format!("Failed to add exact route: {}", e))?;
 
         // Add prefix wildcard (matchit syntax: {*rest})
         let prefix_pattern = if path == "/" {
@@ -73,7 +75,9 @@ impl Router {
             format!("{}/{{*rest}}", path.trim_end_matches('/'))
         };
 
-        prefix_router.insert(prefix_pattern, key).map_err(|e| format!("Failed to add prefix route: {}", e))?;
+        prefix_router
+            .insert(prefix_pattern, key)
+            .map_err(|e| format!("Failed to add prefix route: {}", e))?;
 
         Ok(())
     }
@@ -182,9 +186,11 @@ mod tests {
         let router = Router::new();
 
         // Add route: GET /api/users -> backend (Prefix match)
-        let backends = vec![
-            Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 1)), 8080, 100),
-        ];
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
 
         router
             .add_route(HttpMethod::GET, "/api/users", backends)
