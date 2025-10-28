@@ -5,14 +5,14 @@ edition = "2021"
 
 [dependencies]
 # Core
-common = { path = "../common" }
+common = { path = "../common", default-features = false, features = ["serde"] }
 tokio = { version = "1.41", features = ["full"] }
 anyhow = "1.0"
 thiserror = "1.0"
 
-# eBPF (Aya framework) - Using stable 0.13.1 for macOS compatibility
-aya = "0.13"
-aya-log = "0.2"
+# eBPF (Aya framework) - Stage 2 only (disabled for Stage 1 pure Rust)
+# aya = "0.13"
+# aya-log = "0.2"
 
 # Kubernetes
 kube = { version = "0.95", features = ["runtime", "derive"] }
