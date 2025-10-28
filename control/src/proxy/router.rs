@@ -112,4 +112,51 @@ mod tests {
         let backend = router.select_backend(HttpMethod::GET, "/api/users");
         assert!(backend.is_none());
     }
+
+    #[test]
+    fn test_router_maglev_distribution() {
+        // REFACTOR: Verify Maglev provides good distribution across paths
+        let router = Router::new();
+
+        // Add route with 3 backends (shared by multiple paths)
+        let backends = vec![
+            Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 1)), 8080, 100),
+            Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 2)), 8080, 100),
+            Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 3)), 8080, 100),
+        ];
+
+        // Add 100 different paths with same backends
+        // This simulates a prefix match scenario (all /api/users/* routes)
+        for i in 0..100 {
+            let path = format!("/api/users/{}", i);
+            router
+                .add_route(HttpMethod::GET, &path, backends.clone())
+                .unwrap();
+        }
+
+        // Test distribution across different paths
+        let mut distribution = std::collections::HashMap::new();
+        for i in 0..100 {
+            let path = format!("/api/users/{}", i);
+            let backend = router
+                .select_backend(HttpMethod::GET, &path)
+                .expect("Should find backend");
+
+            let ip = Ipv4Addr::from(backend.ipv4);
+            *distribution.entry(ip).or_insert(0) += 1;
+        }
+
+        // Each backend should get ~33 requests (within 50% variance for small sample)
+        // Note: 100 samples is small, so we allow higher variance
+        assert_eq!(distribution.len(), 3, "Should use all 3 backends");
+        for (ip, count) in distribution.iter() {
+            let percentage = (*count as f64) / 100.0;
+            assert!(
+                percentage > 0.10 && percentage < 0.60,
+                "Backend {} got {}% (expected 10-60% for small sample)",
+                ip,
+                percentage * 100.0
+            );
+        }
+    }
 }
