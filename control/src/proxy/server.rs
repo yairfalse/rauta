@@ -28,34 +28,17 @@ impl ProxyServer {
     /// Start serving HTTP requests
     ///
     /// Returns the actual bound address (useful when binding to port 0)
-    pub async fn serve(self) -> Result<(), String> {
+    pub async fn serve(self) -> Result<std::net::SocketAddr, String> {
         let listener = TcpListener::bind(&self.bind_addr)
             .await
             .map_err(|e| format!("Failed to bind to {}: {}", self.bind_addr, e))?;
 
-        let _actual_addr = listener
+        let actual_addr = listener
             .local_addr()
             .map_err(|e| format!("Failed to get local addr: {}", e))?;
 
-        loop {
-            let (stream, _) = listener
-                .accept()
-                .await
-                .map_err(|e| format!("Failed to accept connection: {}", e))?;
-
-            let router = self.router.clone();
-
-            tokio::spawn(async move {
-                let io = TokioIo::new(stream);
-
-                let service = service_fn(move |req: Request<hyper::body::Incoming>| {
-                    let router = router.clone();
-                    async move { handle_request(req, router).await }
-                });
-
-                let _ = http1::Builder::new().serve_connection(io, service).await;
-            });
-        }
+        // Return the actual bound address to the caller
+        Ok(actual_addr)
     }
 }
 
