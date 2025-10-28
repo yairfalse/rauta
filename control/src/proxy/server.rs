@@ -23,9 +23,9 @@ impl ProxyServer {
     }
 
     /// Handle incoming HTTP request
-    pub async fn handle_request<B>(
+    pub async fn handle_request(
         &self,
-        _req: Request<B>,
+        _req: Request<hyper::body::Body>,
     ) -> Result<Response<Full<Bytes>>, String> {
         // GREEN: Minimal implementation - just return 200 OK
         let response = Response::builder()
