@@ -83,7 +83,7 @@ EOF
 4. Logs requests for debugging
 5. Exports metrics to Prometheus
 
-Pure Rust userspace proxy. Simple and straightforward.
+Pure Rust userspace proxy. Simple.
 
 ---
 
@@ -157,7 +157,7 @@ spec:
               number: 8080
 ```
 
-No special configuration needed. Just standard K8s.
+
 
 ---
 
@@ -226,41 +226,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 - Learn Rust and K8s together
 - Build something useful for small teams
 
-**What this is:**
-- Experimental project
-- Learning in public
-- Community effort
-- Free and open source
-
 ---
-
-## Roadmap
-
-### Phase 1: MVP (Weeks 1-8) - Current
-
-- Basic HTTP proxy
-- K8s Ingress sync
-- Load balancing
-- Request logging
-
-### Phase 2: Improvements (Weeks 9-12)
-
-- TLS support
-- HTTP/2
-- Better UI
-- More features
-
-### Phase 3: Community
-
-- Documentation
-- Examples
-- Tutorials
-- Help users
-
-**Timeline is flexible.** We're learning and building at our own pace.
-
----
-
 ## Why Rust?
 
 We chose Rust because:
@@ -268,8 +234,6 @@ We chose Rust because:
 - Fast (good performance)
 - Good ecosystem (tokio, hyper, kube-rs)
 - Fun to learn
-
-We're still learning Rust. This project helps us practice.
 
 ---
 
@@ -286,7 +250,3 @@ Named after the element that Rust prevents. Part of our Finnish naming theme.
 Apache 2.0 - Free and open source.
 
 ---
-
-**RAUTA: Trying to make K8s ingress simple.** 🦀
-
-We're doing our best. Feedback welcome!
