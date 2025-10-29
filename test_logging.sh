@@ -28,8 +28,19 @@ echo ""
 RUST_LOG=info cargo run --release &
 PROXY_PID=$!
 
-# Wait for proxy to start
-sleep 2
+# Wait for proxy to start (poll until port 8080 is accepting connections, up to 10s)
+for i in {1..50}; do
+    if curl -s http://127.0.0.1:8080/ > /dev/null; then
+        break
+    fi
+    sleep 0.2
+done
+if ! curl -s http://127.0.0.1:8080/ > /dev/null; then
+    echo "❌ Proxy did not start within 10 seconds."
+    kill $PROXY_PID 2>/dev/null || true
+    kill $BACKEND_PID 2>/dev/null || true
+    exit 1
+fi
 
 echo ""
 echo "4. Sending test requests to see logging..."
