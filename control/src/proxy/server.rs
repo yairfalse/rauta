@@ -31,16 +31,22 @@ lazy_static! {
         .buckets(vec![
             0.001, 0.005, 0.010, 0.025, 0.050, 0.075, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000,
         ]);
-        let histogram = HistogramVec::new(opts, &["method", "path", "status"]).unwrap();
-        METRICS_REGISTRY.register(Box::new(histogram.clone())).unwrap();
+        let histogram = HistogramVec::new(opts, &["method", "path", "status"])
+            .expect("Failed to create HTTP request duration histogram");
+        METRICS_REGISTRY
+            .register(Box::new(histogram.clone()))
+            .expect("Failed to register HTTP request duration histogram with metrics registry");
         histogram
     };
 
     /// HTTP request counter
     static ref HTTP_REQUESTS_TOTAL: IntCounterVec = {
         let opts = Opts::new("http_requests_total", "Total number of HTTP requests");
-        let counter = IntCounterVec::new(opts, &["method", "path", "status"]).unwrap();
-        METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+        let counter = IntCounterVec::new(opts, &["method", "path", "status"])
+            .expect("Failed to create HTTP request counter");
+        METRICS_REGISTRY
+            .register(Box::new(counter.clone()))
+            .expect("Failed to register HTTP request counter with metrics registry");
         counter
     };
 }
@@ -284,7 +290,19 @@ async fn handle_request(
         let mut buffer = vec![];
         let encoder = TextEncoder::new();
         let metric_families = METRICS_REGISTRY.gather();
-        encoder.encode(&metric_families, &mut buffer).unwrap();
+
+        // Handle encoding failure gracefully
+        if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
+            error!("Failed to encode metrics: {}", e);
+            return Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("Content-Type", "text/plain")
+                .body(Full::new(Bytes::from(format!(
+                    "Failed to encode metrics: {}",
+                    e
+                ))))
+                .unwrap());
+        }
 
         return Ok(Response::builder()
             .status(StatusCode::OK)
@@ -350,13 +368,13 @@ async fn handle_request(
         None => {
             let duration = start.elapsed();
 
-            // Record 404 metrics (zero-allocation with static strings)
+            // Record 404 metrics (use constant to prevent cardinality explosion)
             let method_str = method_to_str(&method);
             HTTP_REQUESTS_TOTAL
-                .with_label_values(&[method_str, &path, "404"])
+                .with_label_values(&[method_str, "not_found", "404"])
                 .inc();
             HTTP_REQUEST_DURATION
-                .with_label_values(&[method_str, &path, "404"])
+                .with_label_values(&[method_str, "not_found", "404"])
                 .observe(duration.as_secs_f64());
 
             warn!(

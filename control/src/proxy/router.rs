@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 
 /// Route configuration for a path
 struct Route {
-    pattern: String, // Original route pattern for metrics (e.g., "/api/users")
+    pattern: Arc<str>, // Original route pattern for metrics (Arc for cheap cloning)
     backends: Vec<Backend>,
     maglev_table: Vec<u8>,
 }
@@ -16,7 +16,7 @@ struct Route {
 /// Route match result (backend + pattern for metrics)
 pub struct RouteMatch {
     pub backend: Backend,
-    pub pattern: String,
+    pub pattern: Arc<str>, // Arc<str> for zero-cost clone on hot path
 }
 
 /// Route lookup key
@@ -59,7 +59,7 @@ impl Router {
         let maglev_table = maglev_build_compact_table(&backends);
 
         let route = Route {
-            pattern: path.to_string(),
+            pattern: Arc::from(path), // Convert to Arc<str> once during route setup
             backends,
             maglev_table,
         };
@@ -128,7 +128,7 @@ impl Router {
 
         Some(RouteMatch {
             backend,
-            pattern: route.pattern.clone(),
+            pattern: Arc::clone(&route.pattern), // Cheap ref count bump (no allocation)
         })
     }
 
@@ -183,7 +183,7 @@ mod tests {
             backend_ip == Ipv4Addr::new(10, 0, 1, 1) || backend_ip == Ipv4Addr::new(10, 0, 1, 2)
         );
         assert_eq!(route_match.backend.port, 8080);
-        assert_eq!(route_match.pattern, "/api/users");
+        assert_eq!(route_match.pattern.as_ref(), "/api/users");
     }
 
     #[test]
@@ -219,7 +219,7 @@ mod tests {
             Ipv4Addr::from(route_match.backend.ipv4),
             Ipv4Addr::new(10, 0, 1, 1)
         );
-        assert_eq!(route_match.pattern, "/api/users");
+        assert_eq!(route_match.pattern.as_ref(), "/api/users");
 
         // Prefix match should also work: /api/users/123 should match /api/users
         let route_match = router
@@ -230,7 +230,8 @@ mod tests {
             Ipv4Addr::new(10, 0, 1, 1)
         );
         assert_eq!(
-            route_match.pattern, "/api/users",
+            route_match.pattern.as_ref(),
+            "/api/users",
             "Prefix match should return original pattern"
         );
 
@@ -243,7 +244,8 @@ mod tests {
             Ipv4Addr::new(10, 0, 1, 1)
         );
         assert_eq!(
-            route_match.pattern, "/api/users",
+            route_match.pattern.as_ref(),
+            "/api/users",
             "Deep prefix match should return original pattern"
         );
 
