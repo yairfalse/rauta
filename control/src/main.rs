@@ -6,6 +6,8 @@ use std::net::Ipv4Addr;
 use tokio::signal;
 use tracing::info;
 
+mod apis;
+mod config;
 mod error;
 mod proxy;
 mod routes;
