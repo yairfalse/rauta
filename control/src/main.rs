@@ -29,9 +29,7 @@ async fn main() -> Result<()> {
 
     info!("🚀 HTTP proxy server listening on 127.0.0.1:8080");
     info!("📋 Routes configured:");
-    info!("   GET /api/users   -> user-service (2 backends)");
-    info!("   GET /api/posts   -> post-service (1 backend)");
-    info!("   GET /health      -> health-service");
+    info!("   GET /api/*       -> 127.0.0.1:9090 (Python backend)");
     info!("");
     info!("Press Ctrl-C to exit.");
 
@@ -54,33 +52,15 @@ async fn main() -> Result<()> {
 ///
 /// Week 4-5: Replace with K8s Ingress watcher
 fn add_example_routes(router: &Router) -> Result<()> {
-    // Route 1: GET /api/users -> user-service (2 backends for load balancing)
-    let user_backends = vec![
-        Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 1)), 8080, 100),
-        Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 2)), 8080, 100),
-    ];
-    router
-        .add_route(HttpMethod::GET, "/api/users", user_backends)
-        .map_err(|e| anyhow::anyhow!("Failed to add route: {}", e))?;
-
-    // Route 2: GET /api/posts -> post-service (single backend)
-    let post_backends = vec![Backend::new(
-        u32::from(Ipv4Addr::new(10, 0, 2, 1)),
-        8080,
-        100,
-    )];
-    router
-        .add_route(HttpMethod::GET, "/api/posts", post_backends)
-        .map_err(|e| anyhow::anyhow!("Failed to add route: {}", e))?;
-
-    // Route 3: GET /health -> health endpoint
-    let health_backends = vec![Backend::new(
+    // Route all paths to Python backend on 127.0.0.1:9090
+    let backends = vec![Backend::new(
         u32::from(Ipv4Addr::new(127, 0, 0, 1)),
-        8080,
+        9090,
         100,
     )];
+
     router
-        .add_route(HttpMethod::GET, "/health", health_backends)
+        .add_route(HttpMethod::GET, "/", backends)
         .map_err(|e| anyhow::anyhow!("Failed to add route: {}", e))?;
 
     Ok(())
