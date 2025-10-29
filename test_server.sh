@@ -5,8 +5,13 @@ echo "Starting RAUTA server..."
 ./target/debug/control &
 SERVER_PID=$!
 
-# Wait for server to start
-sleep 2
+# Wait for server to start by polling the endpoint (max 10s)
+for i in {1..20}; do
+    if curl -s http://127.0.0.1:8080/api/users >/dev/null; then
+        break
+    fi
+    sleep 0.5
+done
 
 echo ""
 echo "Testing routes..."
