@@ -80,7 +80,9 @@ Client Request: GET /api/users/123
 | Tests | ✅ | 68 tests passing |
 | Pre-commit Hook | ✅ | fmt + clippy + tests |
 
-**Try it NOW:**
+
+
+Pure Rust userspace proxy. Simple.
 
 ```bash
 # Clone and build
@@ -99,7 +101,6 @@ curl http://127.0.0.1:8080/api/users/123
 # → Route matched! Backend: 10.0.1.2:8080 (prefix match!)
 ```
 
----
 
 ## Performance Goals
 
@@ -175,16 +176,8 @@ curl http://127.0.0.1:8080/api/users/123
 - **aya** - eBPF framework (Stage 2)
 
 **Kernel (eBPF):**
-- **XDP** - eXpress Data Path (pre-TCP packet processing)
 - **Aya BPF** - Rust eBPF programs (Stage 2)
 - **BPF maps** - Shared state (routes, backends, flow cache)
-
-**Why Rust + eBPF?**
-- **Memory safety** - No segfaults, no UAF bugs
-- **Zero-copy XDP** - Packets processed before TCP stack
-- **Strong typing** - BPF maps are type-safe (Aya)
-- **TDD-friendly** - Easy to test userspace logic
-
 ---
 
 ## Development
@@ -266,27 +259,6 @@ Because your traffic isn't evenly distributed. 99% of requests hit the same 100 
 
 ---
 
-## false-systems Ecosystem
-
-**Finnish Tool Naming Theme:**
-
-| Tool | Finnish | Meaning | Purpose |
-|------|---------|---------|---------|
-| **TAPIO** | 🌲 Tapio | Forest spirit | K8s observer (eBPF + Go) |
-| **RAUTA** | ⚙️ Rauta | Iron | Ingress controller (Rust + eBPF) |
-| **AHTI** | 🌊 Ahti | Water spirit | Correlation engine (Go) |
-| **URPO** | 🔍 Urpo | Explorer | Trace explorer (Rust) |
-| **ELAVA** | 💚 Elävä | Living | AWS scanner (Go) |
-
-**Integration:**
-- RAUTA → NATS → TAPIO (correlate ingress with pod metrics)
-- RAUTA → OTLP → URPO (trace visualization)
-- RAUTA → NATS → AHTI (service graph)
-
-All projects are **experimental** and **learning in public**.
-
----
-
 ## Contributing
 
 **This is a learning project!** We're figuring things out as we go.
@@ -312,6 +284,8 @@ All projects are **experimental** and **learning in public**.
 ---
 
 ## Benchmarks (Coming Soon)
+---
+## Why Rust?
 
 We'll test with real traffic patterns to see:
 - How fast is matchit routing in practice?
@@ -319,9 +293,6 @@ We'll test with real traffic patterns to see:
 - How much faster is eBPF for hot routes?
 - Where are the bottlenecks?
 
-Numbers coming once we have K8s integration working!
-
----
 
 ## Why "Iron"?
 
@@ -355,3 +326,4 @@ Built with ❤️ and 🦀 by the false-systems team.
 **RAUTA: Iron-clad routing at wire speed** ⚙️🦀
 
 *Experimental. Learning in public. Join us!*
+
