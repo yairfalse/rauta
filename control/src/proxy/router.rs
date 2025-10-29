@@ -8,8 +8,15 @@ use std::sync::{Arc, RwLock};
 
 /// Route configuration for a path
 struct Route {
+    pattern: String, // Original route pattern for metrics (e.g., "/api/users")
     backends: Vec<Backend>,
     maglev_table: Vec<u8>,
+}
+
+/// Route match result (backend + pattern for metrics)
+pub struct RouteMatch {
+    pub backend: Backend,
+    pub pattern: String,
 }
 
 /// Route lookup key
@@ -52,6 +59,7 @@ impl Router {
         let maglev_table = maglev_build_compact_table(&backends);
 
         let route = Route {
+            pattern: path.to_string(),
             backends,
             maglev_table,
         };
@@ -86,13 +94,14 @@ impl Router {
     ///
     /// Tries exact match first (O(1)), then prefix match (O(log n)).
     /// Uses Maglev consistent hashing for backend selection.
+    /// Returns backend + matched route pattern for metrics.
     pub fn select_backend(
         &self,
         method: HttpMethod,
         path: &str,
         src_ip: Option<u32>,
         src_port: Option<u16>,
-    ) -> Option<Backend> {
+    ) -> Option<RouteMatch> {
         let path_hash = fnv1a_hash(path.as_bytes());
         let key = RouteKey { method, path_hash };
 
@@ -115,7 +124,12 @@ impl Router {
         // Use flow hash (path + src_ip + src_port) for Maglev lookup
         let flow_hash = self.compute_flow_hash(path_hash, src_ip, src_port);
         let backend_idx = maglev_lookup_compact(flow_hash, &route.maglev_table);
-        route.backends.get(backend_idx as usize).copied()
+        let backend = route.backends.get(backend_idx as usize).copied()?;
+
+        Some(RouteMatch {
+            backend,
+            pattern: route.pattern.clone(),
+        })
     }
 
     /// Compute flow hash for load balancing
@@ -159,16 +173,17 @@ mod tests {
             .unwrap();
 
         // Select backend for this request (no connection info in test)
-        let backend = router
+        let route_match = router
             .select_backend(HttpMethod::GET, "/api/users", None, None)
             .expect("Should find backend");
 
         // Should select one of the two backends
-        let backend_ip = Ipv4Addr::from(backend.ipv4);
+        let backend_ip = Ipv4Addr::from(route_match.backend.ipv4);
         assert!(
             backend_ip == Ipv4Addr::new(10, 0, 1, 1) || backend_ip == Ipv4Addr::new(10, 0, 1, 2)
         );
-        assert_eq!(backend.port, 8080);
+        assert_eq!(route_match.backend.port, 8080);
+        assert_eq!(route_match.pattern, "/api/users");
     }
 
     #[test]
@@ -177,8 +192,8 @@ mod tests {
         let router = Router::new();
 
         // No routes added - should return None
-        let backend = router.select_backend(HttpMethod::GET, "/api/users", None, None);
-        assert!(backend.is_none());
+        let route_match = router.select_backend(HttpMethod::GET, "/api/users", None, None);
+        assert!(route_match.is_none());
     }
 
     #[test]
@@ -197,26 +212,47 @@ mod tests {
             .unwrap();
 
         // Exact match should work
-        let backend = router
+        let route_match = router
             .select_backend(HttpMethod::GET, "/api/users", None, None)
             .expect("Exact match should work");
-        assert_eq!(Ipv4Addr::from(backend.ipv4), Ipv4Addr::new(10, 0, 1, 1));
+        assert_eq!(
+            Ipv4Addr::from(route_match.backend.ipv4),
+            Ipv4Addr::new(10, 0, 1, 1)
+        );
+        assert_eq!(route_match.pattern, "/api/users");
 
         // Prefix match should also work: /api/users/123 should match /api/users
-        let backend = router
+        let route_match = router
             .select_backend(HttpMethod::GET, "/api/users/123", None, None)
             .expect("Prefix match should work");
-        assert_eq!(Ipv4Addr::from(backend.ipv4), Ipv4Addr::new(10, 0, 1, 1));
+        assert_eq!(
+            Ipv4Addr::from(route_match.backend.ipv4),
+            Ipv4Addr::new(10, 0, 1, 1)
+        );
+        assert_eq!(
+            route_match.pattern, "/api/users",
+            "Prefix match should return original pattern"
+        );
 
         // Deeper paths should match too
-        let backend = router
+        let route_match = router
             .select_backend(HttpMethod::GET, "/api/users/123/posts", None, None)
             .expect("Deep prefix match should work");
-        assert_eq!(Ipv4Addr::from(backend.ipv4), Ipv4Addr::new(10, 0, 1, 1));
+        assert_eq!(
+            Ipv4Addr::from(route_match.backend.ipv4),
+            Ipv4Addr::new(10, 0, 1, 1)
+        );
+        assert_eq!(
+            route_match.pattern, "/api/users",
+            "Deep prefix match should return original pattern"
+        );
 
         // Non-matching path should NOT match
-        let backend = router.select_backend(HttpMethod::GET, "/api/posts", None, None);
-        assert!(backend.is_none(), "/api/posts should not match /api/users");
+        let route_match = router.select_backend(HttpMethod::GET, "/api/posts", None, None);
+        assert!(
+            route_match.is_none(),
+            "/api/posts should not match /api/users"
+        );
     }
 
     #[test]
@@ -249,11 +285,11 @@ mod tests {
             let src_ip = 0x0a000001 + (i as u32); // 10.0.0.1 + i
             let src_port = 50000 + (i as u16);
 
-            let backend = router
+            let route_match = router
                 .select_backend(HttpMethod::GET, &path, Some(src_ip), Some(src_port))
                 .expect("Should find backend");
 
-            let ip = Ipv4Addr::from(backend.ipv4);
+            let ip = Ipv4Addr::from(route_match.backend.ipv4);
             *distribution.entry(ip).or_insert(0) += 1;
         }
 

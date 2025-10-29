@@ -9,10 +9,41 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
+use lazy_static::lazy_static;
+use prometheus::{
+    Encoder, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
+};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
+
+lazy_static! {
+    /// Global metrics registry
+    static ref METRICS_REGISTRY: Registry = Registry::new();
+
+    /// HTTP request duration histogram (in seconds)
+    static ref HTTP_REQUEST_DURATION: HistogramVec = {
+        let opts = HistogramOpts::new(
+            "http_request_duration_seconds",
+            "HTTP request latencies in seconds",
+        )
+        .buckets(vec![
+            0.001, 0.005, 0.010, 0.025, 0.050, 0.075, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000,
+        ]);
+        let histogram = HistogramVec::new(opts, &["method", "path", "status"]).unwrap();
+        METRICS_REGISTRY.register(Box::new(histogram.clone())).unwrap();
+        histogram
+    };
+
+    /// HTTP request counter
+    static ref HTTP_REQUESTS_TOTAL: IntCounterVec = {
+        let opts = Opts::new("http_requests_total", "Total number of HTTP requests");
+        let counter = IntCounterVec::new(opts, &["method", "path", "status"]).unwrap();
+        METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+}
 
 /// HTTP Proxy Server
 pub struct ProxyServer {
@@ -201,12 +232,68 @@ async fn forward_to_backend(
     Ok(Response::from_parts(parts, Full::new(body_bytes)))
 }
 
+/// Convert HttpMethod to static string (zero allocations)
+fn method_to_str(method: &common::HttpMethod) -> &'static str {
+    match method {
+        common::HttpMethod::GET => "GET",
+        common::HttpMethod::POST => "POST",
+        common::HttpMethod::PUT => "PUT",
+        common::HttpMethod::DELETE => "DELETE",
+        common::HttpMethod::HEAD => "HEAD",
+        common::HttpMethod::OPTIONS => "OPTIONS",
+        common::HttpMethod::PATCH => "PATCH",
+        common::HttpMethod::ALL => "ALL",
+    }
+}
+
+/// Convert status code to static string (zero allocations for common codes)
+fn status_to_str(status: u16) -> &'static str {
+    match status {
+        200 => "200",
+        201 => "201",
+        204 => "204",
+        301 => "301",
+        302 => "302",
+        304 => "304",
+        400 => "400",
+        401 => "401",
+        403 => "403",
+        404 => "404",
+        500 => "500",
+        502 => "502",
+        503 => "503",
+        504 => "504",
+        _ => "other",
+    }
+}
+
 /// Handle incoming HTTP request
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
     router: Arc<Router>,
     client: Client<HttpConnector, Full<Bytes>>,
 ) -> Result<Response<Full<Bytes>>, String> {
+    let path = req.uri().path().to_string();
+
+    // Handle /metrics endpoint (early return, don't record metrics for this)
+    if path == "/metrics" && *req.method() == hyper::Method::GET {
+        // Force initialization of lazy_static metrics
+        let _ = &*HTTP_REQUEST_DURATION;
+        let _ = &*HTTP_REQUESTS_TOTAL;
+
+        let mut buffer = vec![];
+        let encoder = TextEncoder::new();
+        let metric_families = METRICS_REGISTRY.gather();
+        encoder.encode(&metric_families, &mut buffer).unwrap();
+
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", encoder.format_type())
+            .body(Full::new(Bytes::from(buffer)))
+            .unwrap());
+    }
+
+    // Start timing after /metrics check
     let start = Instant::now();
 
     let method = match *req.method() {
@@ -220,39 +307,36 @@ async fn handle_request(
         _ => common::HttpMethod::GET,
     };
 
-    let path = req.uri().path().to_string();
-
-    // Log incoming request
-    info!(
-        http.request.method = ?method,
-        url.path = %path,
-        "Request received"
-    );
-
     // Select backend using routing rules
-    let backend = router.select_backend(method, &path, None, None);
+    let route_match = router.select_backend(method, &path, None, None);
 
-    match backend {
-        Some(backend) => {
-            // Log backend selection
-            info!(
-                network.peer.address = %ipv4_to_string(backend.ipv4),
-                network.peer.port = backend.port,
-                "Backend selected"
-            );
-
-            let result = forward_to_backend(req, backend, client).await;
+    match route_match {
+        Some(route_match) => {
+            let result = forward_to_backend(req, route_match.backend, client).await;
             let duration = start.elapsed();
 
+            // Record metrics (zero-allocation with static strings)
+            // Use route pattern (not actual path) to prevent cardinality explosion
+            let method_str = method_to_str(&method);
+            let route_pattern = &route_match.pattern;
             match &result {
                 Ok(resp) => {
-                    info!(
-                        http.response.status_code = resp.status().as_u16(),
-                        duration_us = duration.as_micros() as u64,
-                        "Request completed"
-                    );
+                    let status_str = status_to_str(resp.status().as_u16());
+                    HTTP_REQUESTS_TOTAL
+                        .with_label_values(&[method_str, route_pattern, status_str])
+                        .inc();
+                    HTTP_REQUEST_DURATION
+                        .with_label_values(&[method_str, route_pattern, status_str])
+                        .observe(duration.as_secs_f64());
                 }
                 Err(e) => {
+                    HTTP_REQUESTS_TOTAL
+                        .with_label_values(&[method_str, route_pattern, "500"])
+                        .inc();
+                    HTTP_REQUEST_DURATION
+                        .with_label_values(&[method_str, route_pattern, "500"])
+                        .observe(duration.as_secs_f64());
+
                     error!(
                         error.message = %e,
                         duration_us = duration.as_micros() as u64,
@@ -265,6 +349,16 @@ async fn handle_request(
         }
         None => {
             let duration = start.elapsed();
+
+            // Record 404 metrics (zero-allocation with static strings)
+            let method_str = method_to_str(&method);
+            HTTP_REQUESTS_TOTAL
+                .with_label_values(&[method_str, &path, "404"])
+                .inc();
+            HTTP_REQUEST_DURATION
+                .with_label_values(&[method_str, &path, "404"])
+                .observe(duration.as_secs_f64());
+
             warn!(
                 http.request.method = ?method,
                 url.path = %path,
@@ -923,6 +1017,115 @@ mod tests {
         assert!(
             response.headers().get("x-custom").is_some(),
             "Custom header should be forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_returns_prometheus_format() {
+        use crate::proxy::router::Router;
+        use hyper::body::Bytes;
+        use hyper_util::rt::TokioIo;
+        use tokio::net::TcpListener;
+
+        // Start mock backend
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = backend_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+
+            let service = hyper::service::service_fn(|_req| async {
+                Ok::<_, std::convert::Infallible>(
+                    hyper::Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from("OK")))
+                        .unwrap(),
+                )
+            });
+
+            let _ = http1::Builder::new().serve_connection(io, service).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Create router
+        let router = Router::new();
+        let backend_ip = match backend_addr.ip() {
+            std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
+            _ => panic!("Expected IPv4 address"),
+        };
+        let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
+        router
+            .add_route(HttpMethod::GET, "/api/test", backends)
+            .unwrap();
+
+        // Start proxy
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), router).unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Make some requests to generate metrics
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build_http::<Full<Bytes>>();
+
+        for _ in 0..5 {
+            let uri: hyper::Uri = format!("http://{}/api/test", proxy_addr).parse().unwrap();
+            let _ = client.get(uri).await;
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Request metrics endpoint
+        let uri: hyper::Uri = format!("http://{}/metrics", proxy_addr).parse().unwrap();
+        let response = client
+            .get(uri)
+            .await
+            .expect("Metrics request should succeed");
+
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+
+        // Collect response body
+        let body_bytes = response.collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body_bytes);
+
+        // Verify Prometheus format
+        assert!(
+            body.contains("# HELP"),
+            "Response should contain Prometheus HELP comments"
+        );
+        assert!(
+            body.contains("# TYPE"),
+            "Response should contain Prometheus TYPE comments"
+        );
+
+        // Verify request counter exists
+        assert!(
+            body.contains("http_requests_total"),
+            "Response should contain request counter metric"
+        );
+
+        // Verify latency histogram exists
+        assert!(
+            body.contains("http_request_duration_seconds"),
+            "Response should contain latency histogram metric"
+        );
+        assert!(
+            body.contains("_bucket{"),
+            "Histogram should contain bucket metrics"
+        );
+        assert!(body.contains("_sum"), "Histogram should contain sum metric");
+        assert!(
+            body.contains("_count"),
+            "Histogram should contain count metric"
         );
     }
 }
