@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
-> **Status**: 🚧 Stage 1 Complete - Pure Rust HTTP proxy with advanced routing
+> **Status**: 🚧 Stage 1 Core Complete - Pure Rust HTTP proxy with advanced routing. Additional Stage 1 features (K8s Integration, Observability) in progress.
 
 ---
 
