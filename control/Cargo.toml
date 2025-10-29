@@ -35,7 +35,7 @@ http-body-util = "0.1"
 matchit = "0.8"
 
 # Metrics (Week 2)
-prometheus = { version = "0.13", features = ["process"] }
+prometheus = { version = "0.14", features = ["process"] }
 lazy_static = "1.4"
 
 # Networking
