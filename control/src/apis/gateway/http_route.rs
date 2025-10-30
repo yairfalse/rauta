@@ -2,6 +2,7 @@
 //!
 //! Watches HTTPRoute resources and updates routing rules.
 
+use crate::apis::metrics::record_httproute_reconciliation;
 use crate::proxy::router::Router;
 use common::{Backend, HttpMethod};
 use futures::StreamExt;
@@ -12,7 +13,7 @@ use kube::runtime::watcher::Config as WatcherConfig;
 use kube::{Client, ResourceExt};
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 /// HTTPRoute reconciler
@@ -46,6 +47,7 @@ impl HTTPRouteReconciler {
 
     /// Reconcile a single HTTPRoute
     async fn reconcile(route: Arc<HTTPRoute>, ctx: Arc<Self>) -> Result<Action, kube::Error> {
+        let start = Instant::now();
         let namespace = route.namespace().unwrap_or_else(|| "default".to_string());
         let name = route.name_any();
 
@@ -141,6 +143,14 @@ impl HTTPRouteReconciler {
         // Update HTTPRoute status
         ctx.set_route_status(&namespace, &name, routes_added > 0)
             .await?;
+
+        // Record metrics
+        record_httproute_reconciliation(
+            &name,
+            &namespace,
+            start.elapsed().as_secs_f64(),
+            "success",
+        );
 
         // Requeue after 5 minutes for periodic reconciliation
         Ok(Action::requeue(Duration::from_secs(300)))
@@ -296,6 +306,34 @@ mod tests {
 
         // For now, just verify router was created
         assert!(Arc::strong_count(&router) == 1);
+    }
+
+    #[test]
+    fn test_httproute_metrics_recorded() {
+        // RED: Test that HTTPRoute reconciliation records metrics
+        // This test will FAIL until we implement metrics
+
+        use crate::apis::metrics::gather_controller_metrics;
+
+        // Record a fake reconciliation
+        crate::apis::metrics::record_httproute_reconciliation(
+            "test-route",
+            "default",
+            0.123,
+            "success",
+        );
+
+        // Gather metrics and verify they contain the expected data
+        let metrics = gather_controller_metrics().expect("Should gather metrics");
+
+        assert!(
+            metrics.contains("httproute_reconciliation_duration_seconds"),
+            "Should contain duration metric"
+        );
+        assert!(
+            metrics.contains("httproute_reconciliations_total"),
+            "Should contain counter metric"
+        );
     }
 }
 

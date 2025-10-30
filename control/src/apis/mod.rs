@@ -6,3 +6,4 @@
 
 pub mod gateway;
 pub mod ingress;
+pub mod metrics;
