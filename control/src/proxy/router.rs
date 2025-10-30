@@ -80,37 +80,44 @@ impl Router {
             maglev_table,
         };
 
-        // Update routes HashMap
-        let mut routes = self.routes.write().unwrap();
-        routes.insert(key, route);
+        // Update routes HashMap (minimize write lock duration)
+        {
+            let mut routes = self.routes.write().unwrap();
+            routes.insert(key, route);
+        } // Drop write lock immediately - allows concurrent lookups during rebuild
 
         // Rebuild matchit router from scratch (since matchit doesn't support updates)
-        // This is acceptable for small route counts (<1000s)
+        // Hold read lock during rebuild to allow concurrent route lookups
+        // This is O(n) but acceptable for typical K8s Ingress scale (<1000 routes)
         let mut new_prefix_router = matchit::Router::new();
+        {
+            let routes = self.routes.read().unwrap();
+            for (route_key, route) in routes.iter() {
+                let path_str = route.pattern.as_ref();
 
-        for (route_key, route) in routes.iter() {
-            let path_str = route.pattern.as_ref();
+                // Add exact path
+                new_prefix_router
+                    .insert(path_str.to_string(), *route_key)
+                    .map_err(|e| format!("Failed to add exact route {}: {}", path_str, e))?;
 
-            // Add exact path
-            new_prefix_router
-                .insert(path_str.to_string(), *route_key)
-                .map_err(|e| format!("Failed to add exact route {}: {}", path_str, e))?;
+                // Add prefix wildcard (matchit syntax: {*rest})
+                let prefix_pattern = if path_str == "/" {
+                    "/{*rest}".to_string()
+                } else {
+                    format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
+                };
 
-            // Add prefix wildcard (matchit syntax: {*rest})
-            let prefix_pattern = if path_str == "/" {
-                "/{*rest}".to_string()
-            } else {
-                format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
-            };
+                new_prefix_router
+                    .insert(prefix_pattern, *route_key)
+                    .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
+            }
+        } // Drop read lock
 
-            new_prefix_router
-                .insert(prefix_pattern, *route_key)
-                .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
+        // Swap in new prefix router atomically (brief write lock)
+        {
+            let mut prefix_router = self.prefix_router.write().unwrap();
+            *prefix_router = new_prefix_router;
         }
-
-        // Swap in new prefix router atomically
-        let mut prefix_router = self.prefix_router.write().unwrap();
-        *prefix_router = new_prefix_router;
 
         Ok(())
     }
