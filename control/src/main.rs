@@ -2,13 +2,21 @@ use anyhow::Result;
 use common::{Backend, HttpMethod};
 use proxy::router::Router;
 use proxy::server::ProxyServer;
+use std::env;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use tokio::signal;
-use tracing::info;
+use tracing::{info, warn};
 
+mod apis;
+mod config;
 mod error;
 mod proxy;
 mod routes;
+
+use apis::gateway::gateway::GatewayReconciler;
+use apis::gateway::gateway_class::GatewayClassReconciler;
+use apis::gateway::http_route::HTTPRouteReconciler;
 
 /// RAUTA Control Plane - Stage 1
 ///
@@ -19,17 +27,83 @@ async fn main() -> Result<()> {
 
     info!("🦀 RAUTA Stage 1: Pure Rust Ingress Controller");
 
-    // Create router and add example routes
-    let router = Router::new();
-    add_example_routes(&router)?;
+    // Check if running in Kubernetes mode
+    let k8s_mode = env::var("RAUTA_K8S_MODE")
+        .unwrap_or_else(|_| "false".to_string())
+        .parse::<bool>()
+        .unwrap_or(false);
 
-    // Start HTTP proxy server
-    let server = ProxyServer::new("127.0.0.1:8080".to_string(), router)
+    // Create shared router (Arc for sharing with controllers)
+    let router = Arc::new(Router::new());
+
+    // Kubernetes Gateway API controllers (optional)
+    let mut controller_handles = vec![];
+
+    if k8s_mode {
+        info!("🌐 Kubernetes mode enabled - starting Gateway API controllers");
+
+        match kube::Client::try_default().await {
+            Ok(client) => {
+                let gateway_class_name =
+                    env::var("RAUTA_GATEWAY_CLASS").unwrap_or_else(|_| "rauta".to_string());
+                let gateway_name =
+                    env::var("RAUTA_GATEWAY_NAME").unwrap_or_else(|_| "rauta-gateway".to_string());
+
+                info!("   GatewayClass: {}", gateway_class_name);
+                info!("   Gateway: {}", gateway_name);
+
+                // Spawn GatewayClass controller
+                let gc_client = client.clone();
+                let gc_reconciler = GatewayClassReconciler::new(gc_client);
+                controller_handles.push(tokio::spawn(async move {
+                    if let Err(e) = gc_reconciler.run().await {
+                        tracing::error!("GatewayClass controller error: {}", e);
+                    }
+                }));
+
+                // Spawn Gateway controller
+                let gw_client = client.clone();
+                let gw_name = gateway_class_name.clone();
+                let gw_reconciler = GatewayReconciler::new(gw_client, gw_name);
+                controller_handles.push(tokio::spawn(async move {
+                    if let Err(e) = gw_reconciler.run().await {
+                        tracing::error!("Gateway controller error: {}", e);
+                    }
+                }));
+
+                // Spawn HTTPRoute controller (with Router integration)
+                let hr_client = client.clone();
+                let hr_router = router.clone();
+                let hr_reconciler = HTTPRouteReconciler::new(hr_client, hr_router, gateway_name);
+                controller_handles.push(tokio::spawn(async move {
+                    if let Err(e) = hr_reconciler.run().await {
+                        tracing::error!("HTTPRoute controller error: {}", e);
+                    }
+                }));
+
+                info!("✅ Gateway API controllers started");
+            }
+            Err(e) => {
+                warn!("Failed to create Kubernetes client: {}", e);
+                warn!("Running in standalone mode with example routes");
+                add_example_routes(&router)?;
+            }
+        }
+    } else {
+        info!("📝 Standalone mode - using example routes");
+        add_example_routes(&router)?;
+    }
+
+    // Determine bind address from environment variable or default
+    let bind_addr = env::var("RAUTA_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+    let server = ProxyServer::new(bind_addr.clone(), router)
         .map_err(|e| anyhow::anyhow!("Failed to create server: {}", e))?;
 
-    info!("🚀 HTTP proxy server listening on 127.0.0.1:8080");
-    info!("📋 Routes configured:");
-    info!("   GET /api/*       -> 127.0.0.1:9090 (Python backend)");
+    info!("🚀 HTTP proxy server listening on {}", bind_addr);
+    if !k8s_mode {
+        info!("📋 Routes configured:");
+        info!("   GET /api/*       -> 127.0.0.1:9090 (Python backend)");
+    }
     info!("");
     info!("Press Ctrl-C to exit.");
 
@@ -45,13 +119,18 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Cleanup: abort controller tasks
+    for handle in controller_handles {
+        handle.abort();
+    }
+
     Ok(())
 }
 
 /// Add example routes for testing
 ///
 /// Week 4-5: Replace with K8s Ingress watcher
-fn add_example_routes(router: &Router) -> Result<()> {
+fn add_example_routes(router: &Arc<Router>) -> Result<()> {
     // Route all paths to Python backend on 127.0.0.1:9090
     let backends = vec![Backend::new(
         u32::from(Ipv4Addr::new(127, 0, 0, 1)),

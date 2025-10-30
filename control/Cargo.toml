@@ -15,8 +15,12 @@ thiserror = "1.0"
 # aya-log = "0.2"
 
 # Kubernetes
-kube = { version = "0.95", features = ["runtime", "derive"] }
-k8s-openapi = { version = "0.23", features = ["v1_30"] }
+kube = { version = ">=1.0, <2.0", features = ["runtime", "derive"] }  # Updated to match k8s-openapi 0.25
+k8s-openapi = { version = "0.25", features = ["v1_31"] }  # Updated to match gateway-api
+kube-runtime = "1"  # Updated with kube
+
+# Gateway API (official Rust bindings from kube-rs)
+gateway-api = "0.16"  # Latest version with Gateway API v1.x support
 
 # Logging
 tracing = "0.1"
@@ -25,6 +29,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# Async utilities
+futures = "0.3"
+
+# Time handling (for Gateway API condition timestamps)
+chrono = "0.4"
 
 # HTTP Server (Week 1-2)
 hyper = { version = "1.0", features = ["server", "http1"] }
