@@ -30,6 +30,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+# Async utilities
+futures = "0.3"
+
+# Time handling (for Gateway API condition timestamps)
+chrono = "0.4"
+
 # HTTP Server (Week 1-2)
 hyper = { version = "1.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
