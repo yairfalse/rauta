@@ -15,7 +15,7 @@ thiserror = "1.0"
 # aya-log = "0.2"
 
 # Kubernetes
-kube = { version = "1", features = ["runtime", "derive"] }  # Updated to match k8s-openapi 0.25
+kube = { version = ">=1.0, <2.0", features = ["runtime", "derive"] }  # Updated to match k8s-openapi 0.25
 k8s-openapi = { version = "0.25", features = ["v1_31"] }  # Updated to match gateway-api
 kube-runtime = "1"  # Updated with kube
 
