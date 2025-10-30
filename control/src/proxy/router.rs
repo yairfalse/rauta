@@ -45,7 +45,11 @@ impl Router {
         }
     }
 
-    /// Add route with backends
+    /// Add or update route with backends (idempotent)
+    ///
+    /// If the route already exists with the same backends, this is a no-op.
+    /// If the route exists with different backends, it's updated.
+    /// If the route doesn't exist, it's created.
     pub fn add_route(
         &self,
         method: HttpMethod,
@@ -54,6 +58,18 @@ impl Router {
     ) -> Result<(), String> {
         let path_hash = fnv1a_hash(path.as_bytes());
         let key = RouteKey { method, path_hash };
+
+        // Check if route already exists with same backends (idempotent fast path)
+        {
+            let routes = self.routes.read().unwrap();
+            if let Some(existing) = routes.get(&key) {
+                // Compare backends by content (O(n) Vec comparison; can be expensive for large backend lists)
+                if existing.backends.len() == backends.len() && existing.backends == backends {
+                    // Route already exists with same backends - no-op
+                    return Ok(());
+                }
+            }
+        }
 
         // Build Maglev table for this route
         let maglev_table = maglev_build_compact_table(&backends);
@@ -64,28 +80,44 @@ impl Router {
             maglev_table,
         };
 
-        // Add to hash map (exact match)
-        let mut routes = self.routes.write().unwrap();
-        routes.insert(key, route);
+        // Update routes HashMap (minimize write lock duration)
+        {
+            let mut routes = self.routes.write().unwrap();
+            routes.insert(key, route);
+        } // Drop write lock immediately - allows concurrent lookups during rebuild
 
-        // Add to matchit for prefix matching
-        let mut prefix_router = self.prefix_router.write().unwrap();
+        // Rebuild matchit router from scratch (since matchit doesn't support updates)
+        // Hold read lock during rebuild to allow concurrent route lookups
+        // This is O(n) but acceptable for typical K8s Ingress scale (<1000 routes)
+        let mut new_prefix_router = matchit::Router::new();
+        {
+            let routes = self.routes.read().unwrap();
+            for (route_key, route) in routes.iter() {
+                let path_str = route.pattern.as_ref();
 
-        // Add exact path
-        prefix_router
-            .insert(path.to_string(), key)
-            .map_err(|e| format!("Failed to add exact route: {}", e))?;
+                // Add exact path
+                new_prefix_router
+                    .insert(path_str.to_string(), *route_key)
+                    .map_err(|e| format!("Failed to add exact route {}: {}", path_str, e))?;
 
-        // Add prefix wildcard (matchit syntax: {*rest})
-        let prefix_pattern = if path == "/" {
-            "/{*rest}".to_string()
-        } else {
-            format!("{}/{{*rest}}", path.trim_end_matches('/'))
-        };
+                // Add prefix wildcard (matchit syntax: {*rest})
+                let prefix_pattern = if path_str == "/" {
+                    "/{*rest}".to_string()
+                } else {
+                    format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
+                };
 
-        prefix_router
-            .insert(prefix_pattern, key)
-            .map_err(|e| format!("Failed to add prefix route: {}", e))?;
+                new_prefix_router
+                    .insert(prefix_pattern, *route_key)
+                    .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
+            }
+        } // Drop read lock
+
+        // Swap in new prefix router atomically (brief write lock)
+        {
+            let mut prefix_router = self.prefix_router.write().unwrap();
+            *prefix_router = new_prefix_router;
+        }
 
         Ok(())
     }
@@ -307,5 +339,72 @@ mod tests {
                 percentage * 100.0
             );
         }
+    }
+
+    #[test]
+    fn test_router_idempotent_add_route() {
+        // Verify Router is idempotent - adding same route twice should succeed
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+
+        // Add route first time
+        router
+            .add_route(HttpMethod::GET, "/api/test", backends.clone())
+            .expect("First add should succeed");
+
+        // Add same route again (idempotent - should succeed)
+        router
+            .add_route(HttpMethod::GET, "/api/test", backends.clone())
+            .expect("Second add should succeed (idempotent)");
+
+        // Verify route still works
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/api/test", None, None)
+            .expect("Should find backend after duplicate add");
+        assert_eq!(
+            Ipv4Addr::from(route_match.backend.ipv4),
+            Ipv4Addr::new(10, 0, 1, 1)
+        );
+    }
+
+    #[test]
+    fn test_router_update_route_backends() {
+        // Verify Router allows updating backends for existing route
+        let router = Router::new();
+
+        // Add route with first backend
+        let backends_v1 = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+        router
+            .add_route(HttpMethod::GET, "/api/test", backends_v1)
+            .expect("First add should succeed");
+
+        // Update route with different backend
+        let backends_v2 = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 2)),
+            8080,
+            100,
+        )];
+        router
+            .add_route(HttpMethod::GET, "/api/test", backends_v2)
+            .expect("Update should succeed");
+
+        // Verify new backend is used
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/api/test", None, None)
+            .expect("Should find backend after update");
+        assert_eq!(
+            Ipv4Addr::from(route_match.backend.ipv4),
+            Ipv4Addr::new(10, 0, 1, 2),
+            "Should use updated backend"
+        );
     }
 }

@@ -144,7 +144,7 @@ impl RouteKey {
 
 /// Backend server (IP + port)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Backend {
     /// IPv4 address in network byte order
     pub ipv4: u32,
