@@ -63,8 +63,8 @@ impl Router {
         {
             let routes = self.routes.read().unwrap();
             if let Some(existing) = routes.get(&key) {
-                // Compare backends by content (cheap Vec comparison)
-                if existing.backends == backends {
+                // Compare backends by content (O(n) Vec comparison; can be expensive for large backend lists)
+                if existing.backends.len() == backends.len() && existing.backends == backends {
                     // Route already exists with same backends - no-op
                     return Ok(());
                 }
