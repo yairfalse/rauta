@@ -342,4 +342,30 @@ mod tests {
         // Should NOT match our GatewayClass
         assert_ne!(gateway.spec.gateway_class_name, "rauta");
     }
+
+    #[test]
+    fn test_gateway_metrics_recorded() {
+        // RED: Test that Gateway reconciliation records metrics
+        use crate::apis::metrics::gather_controller_metrics;
+
+        // Record a fake reconciliation
+        crate::apis::metrics::record_gateway_reconciliation(
+            "test-gateway",
+            "default",
+            0.045,
+            "success",
+        );
+
+        // Gather metrics and verify
+        let metrics = gather_controller_metrics().expect("Should gather metrics");
+
+        assert!(
+            metrics.contains("gateway_reconciliation_duration_seconds"),
+            "Should contain duration metric"
+        );
+        assert!(
+            metrics.contains("gateway_reconciliations_total"),
+            "Should contain counter metric"
+        );
+    }
 }

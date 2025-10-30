@@ -38,6 +38,34 @@ lazy_static! {
             .expect("Failed to register counter");
         counter
     };
+
+    /// Gateway reconciliation duration
+    static ref GATEWAY_RECONCILIATION_DURATION: HistogramVec = {
+        let opts = HistogramOpts::new(
+            "gateway_reconciliation_duration_seconds",
+            "Gateway reconciliation duration in seconds",
+        );
+        let histogram = HistogramVec::new(opts, &["gateway", "namespace"])
+            .expect("Failed to create histogram");
+        CONTROLLER_METRICS_REGISTRY
+            .register(Box::new(histogram.clone()))
+            .expect("Failed to register histogram");
+        histogram
+    };
+
+    /// Gateway reconciliations total
+    static ref GATEWAY_RECONCILIATIONS_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "gateway_reconciliations_total",
+            "Total number of gateway reconciliations",
+        );
+        let counter = IntCounterVec::new(opts, &["gateway", "namespace", "result"])
+            .expect("Failed to create counter");
+        CONTROLLER_METRICS_REGISTRY
+            .register(Box::new(counter.clone()))
+            .expect("Failed to register counter");
+        counter
+    };
 }
 
 /// Record HTTPRoute reconciliation
@@ -53,6 +81,23 @@ pub fn record_httproute_reconciliation(
 
     HTTPROUTE_RECONCILIATIONS_TOTAL
         .with_label_values(&[httproute, namespace, result])
+        .inc();
+}
+
+/// Record Gateway reconciliation
+#[allow(dead_code)] // Used in tests, will be used in Gateway reconcile
+pub fn record_gateway_reconciliation(
+    gateway: &str,
+    namespace: &str,
+    duration_secs: f64,
+    result: &str,
+) {
+    GATEWAY_RECONCILIATION_DURATION
+        .with_label_values(&[gateway, namespace])
+        .observe(duration_secs);
+
+    GATEWAY_RECONCILIATIONS_TOTAL
+        .with_label_values(&[gateway, namespace, result])
         .inc();
 }
 
