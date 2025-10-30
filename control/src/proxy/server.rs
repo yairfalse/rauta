@@ -1,5 +1,6 @@
 //! HTTP Server - proxies requests to backends
 
+use crate::apis::metrics::CONTROLLER_METRICS_REGISTRY;
 use crate::proxy::router::Router;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
@@ -289,7 +290,11 @@ async fn handle_request(
 
         let mut buffer = vec![];
         let encoder = TextEncoder::new();
-        let metric_families = METRICS_REGISTRY.gather();
+
+        // Gather metrics from both registries (proxy + controller)
+        let mut metric_families = METRICS_REGISTRY.gather();
+        let controller_metrics = CONTROLLER_METRICS_REGISTRY.gather();
+        metric_families.extend(controller_metrics);
 
         // Handle encoding failure gracefully
         if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
