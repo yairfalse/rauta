@@ -93,7 +93,7 @@ impl HTTPRouteReconciler {
                             // For now, use a placeholder IP based on service name hash
                             let port = backend_ref.port.unwrap_or(80);
                             let ip =
-                                format!("10.0.{}.{}", (backend_ref.name.len() % 255), (port % 255));
+                                format!("10.0.{}.{}", (backend_ref.name.len() % 255), ((port % 254) + 1));
 
                             info!(
                                 "  - Backend: {} (resolved to {}:{})",
