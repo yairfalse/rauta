@@ -60,13 +60,13 @@ pub struct ProxyServer {
 
 impl ProxyServer {
     /// Create new proxy server
-    pub fn new(bind_addr: String, router: Router) -> Result<Self, String> {
+    pub fn new(bind_addr: String, router: Arc<Router>) -> Result<Self, String> {
         // Create HTTP client with connection pooling
         let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
 
         Ok(Self {
             bind_addr,
-            router: Arc::new(router),
+            router,
             client,
         })
     }
@@ -412,7 +412,7 @@ mod tests {
             .add_route(HttpMethod::GET, "/test", backends)
             .unwrap();
 
-        let server = ProxyServer::new("127.0.0.1:8080".to_string(), router);
+        let server = ProxyServer::new("127.0.0.1:8080".to_string(), Arc::new(router));
         assert!(server.is_ok());
     }
 
@@ -435,7 +435,7 @@ mod tests {
         let bind_addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let server = ProxyServer::new(bind_addr.to_string(), router).unwrap();
+        let server = ProxyServer::new(bind_addr.to_string(), Arc::new(router)).unwrap();
 
         // Start server in background
         tokio::spawn(async move {
@@ -498,7 +498,7 @@ mod tests {
         let proxy_addr = proxy_listener.local_addr().unwrap();
         drop(proxy_listener);
 
-        let server = ProxyServer::new(proxy_addr.to_string(), router).unwrap();
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
         tokio::spawn(async move {
             let _ = server.serve().await;
         });
@@ -567,7 +567,7 @@ mod tests {
         let proxy_addr = proxy_listener.local_addr().unwrap();
         drop(proxy_listener);
 
-        let server = ProxyServer::new(proxy_addr.to_string(), router).unwrap();
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
         tokio::spawn(async move {
             let _ = server.serve().await;
         });
@@ -637,7 +637,7 @@ mod tests {
         let proxy_addr = proxy_listener.local_addr().unwrap();
         drop(proxy_listener);
 
-        let server = ProxyServer::new(proxy_addr.to_string(), router).unwrap();
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
         tokio::spawn(async move {
             let _ = server.serve().await;
         });
@@ -732,7 +732,7 @@ mod tests {
         let proxy_addr = proxy_listener.local_addr().unwrap();
         drop(proxy_listener);
 
-        let server = ProxyServer::new(proxy_addr.to_string(), router).unwrap();
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
         tokio::spawn(async move {
             let _ = server.serve().await;
         });
@@ -818,7 +818,7 @@ mod tests {
         let proxy_addr = proxy_listener.local_addr().unwrap();
         drop(proxy_listener);
 
-        let server = ProxyServer::new(proxy_addr.to_string(), router).unwrap();
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
         tokio::spawn(async move {
             let _ = server.serve().await;
         });
@@ -905,7 +905,7 @@ mod tests {
         let proxy_addr = proxy_listener.local_addr().unwrap();
         drop(proxy_listener);
 
-        let server = ProxyServer::new(proxy_addr.to_string(), router).unwrap();
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
         tokio::spawn(async move {
             let _ = server.serve().await;
         });
@@ -992,7 +992,7 @@ mod tests {
         let proxy_addr = proxy_listener.local_addr().unwrap();
         drop(proxy_listener);
 
-        let server = ProxyServer::new(proxy_addr.to_string(), router).unwrap();
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
         tokio::spawn(async move {
             let _ = server.serve().await;
         });
@@ -1083,7 +1083,7 @@ mod tests {
         let proxy_addr = proxy_listener.local_addr().unwrap();
         drop(proxy_listener);
 
-        let server = ProxyServer::new(proxy_addr.to_string(), router).unwrap();
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
         tokio::spawn(async move {
             let _ = server.serve().await;
         });
