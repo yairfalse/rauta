@@ -94,11 +94,12 @@ async fn main() -> Result<()> {
         add_example_routes(&router)?;
     }
 
-    // Start HTTP proxy server
-    let server = ProxyServer::new("127.0.0.1:8080".to_string(), router)
+    // Determine bind address from environment variable or default
+    let bind_addr = env::var("RAUTA_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+    let server = ProxyServer::new(bind_addr.clone(), router)
         .map_err(|e| anyhow::anyhow!("Failed to create server: {}", e))?;
 
-    info!("🚀 HTTP proxy server listening on 127.0.0.1:8080");
+    info!("🚀 HTTP proxy server listening on {}", bind_addr);
     if !k8s_mode {
         info!("📋 Routes configured:");
         info!("   GET /api/*       -> 127.0.0.1:9090 (Python backend)");
