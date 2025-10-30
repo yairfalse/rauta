@@ -2,6 +2,7 @@
 //!
 //! Watches GatewayClass resources and accepts those with our controllerName.
 
+use crate::apis::metrics::record_gatewayclass_reconciliation;
 use futures::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use kube::api::{Api, Patch, PatchParams};
@@ -10,7 +11,7 @@ use kube::runtime::watcher::Config as WatcherConfig;
 use kube::{Client, ResourceExt};
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info};
 
 /// Controller name for RAUTA Gateway API implementation
@@ -36,6 +37,7 @@ impl GatewayClassReconciler {
         gateway_class: Arc<GatewayClass>,
         ctx: Arc<Self>,
     ) -> Result<Action, kube::Error> {
+        let start = Instant::now();
         let name = gateway_class.name_any();
         let controller_name = &gateway_class.spec.controller_name;
 
@@ -45,6 +47,9 @@ impl GatewayClassReconciler {
         if ctx.should_accept(controller_name) {
             info!("GatewayClass {} has our controllerName, accepting", name);
             ctx.set_accepted_status(&name, true).await?;
+
+            // Record metrics for accepted GatewayClass
+            record_gatewayclass_reconciliation(&name, start.elapsed().as_secs_f64(), "success");
         } else {
             debug!(
                 "GatewayClass {} has controllerName '{}', ignoring",
