@@ -186,4 +186,21 @@ mod tests {
         // Should NOT match our controller name
         assert_ne!(gateway_class.spec.controller_name, RAUTA_CONTROLLER_NAME);
     }
+
+    #[test]
+    fn test_gatewayclass_metrics_recorded() {
+        // RED: Test that GatewayClass reconciliation records metrics
+        use crate::apis::metrics::gather_controller_metrics;
+
+        // Record a fake reconciliation
+        crate::apis::metrics::record_gatewayclass_reconciliation("rauta", 0.021, "success");
+
+        // Gather metrics and verify
+        let metrics = gather_controller_metrics().expect("Should gather metrics");
+
+        assert!(
+            metrics.contains("gatewayclass_reconciliations_total"),
+            "Should contain counter metric"
+        );
+    }
 }

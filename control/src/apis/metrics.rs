@@ -66,6 +66,20 @@ lazy_static! {
             .expect("Failed to register counter");
         counter
     };
+
+    /// GatewayClass reconciliations total
+    static ref GATEWAYCLASS_RECONCILIATIONS_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "gatewayclass_reconciliations_total",
+            "Total number of gatewayclass reconciliations",
+        );
+        let counter = IntCounterVec::new(opts, &["gatewayclass", "result"])
+            .expect("Failed to create counter");
+        CONTROLLER_METRICS_REGISTRY
+            .register(Box::new(counter.clone()))
+            .expect("Failed to register counter");
+        counter
+    };
 }
 
 /// Record HTTPRoute reconciliation
@@ -98,6 +112,14 @@ pub fn record_gateway_reconciliation(
 
     GATEWAY_RECONCILIATIONS_TOTAL
         .with_label_values(&[gateway, namespace, result])
+        .inc();
+}
+
+/// Record GatewayClass reconciliation
+#[allow(dead_code)] // Used in tests, will be used in GatewayClass reconcile
+pub fn record_gatewayclass_reconciliation(gatewayclass: &str, _duration_secs: f64, result: &str) {
+    GATEWAYCLASS_RECONCILIATIONS_TOTAL
+        .with_label_values(&[gatewayclass, result])
         .inc();
 }
 
