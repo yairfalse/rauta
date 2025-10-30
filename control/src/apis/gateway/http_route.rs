@@ -89,13 +89,17 @@ impl HTTPRouteReconciler {
                     let backends: Vec<Backend> = backend_refs
                         .iter()
                         .map(|backend_ref| {
-                            // In a real implementation, we would resolve the Service to endpoints
-                            // For now, use a placeholder IP based on service name hash
+                            // TODO: This is TEMPORARY placeholder logic
+                            // Real implementation will resolve Service -> Endpoints -> Pod IPs
+                            // via K8s API (EndpointSlice watcher)
                             let port = backend_ref.port.unwrap_or(80);
+
+                            // Generate valid placeholder IP: 10.0.1-254.1-254
+                            // Avoid 10.0.0.x by using % 254 + 1
                             let ip = format!(
                                 "10.0.{}.{}",
-                                (backend_ref.name.len() % 255),
-                                ((port % 254) + 1)
+                                ((backend_ref.name.len() % 254) + 1), // 1-254
+                                ((port % 254) + 1)                    // 1-254
                             );
 
                             info!(
