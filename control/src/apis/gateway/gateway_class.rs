@@ -14,16 +14,13 @@ use std::time::Duration;
 use tracing::{debug, error, info};
 
 /// Controller name for RAUTA Gateway API implementation
-#[allow(dead_code)]
 pub const RAUTA_CONTROLLER_NAME: &str = "rauta.io/gateway-controller";
 
 /// GatewayClass reconciler
-#[allow(dead_code)]
 pub struct GatewayClassReconciler {
     client: Client,
 }
 
-#[allow(dead_code)]
 impl GatewayClassReconciler {
     pub fn new(client: Client) -> Self {
         Self { client }

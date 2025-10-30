@@ -14,14 +14,12 @@ use std::time::Duration;
 use tracing::{debug, error, info};
 
 /// Gateway reconciler
-#[allow(dead_code)]
 pub struct GatewayReconciler {
     client: Client,
     /// GatewayClass name to watch for
     gateway_class_name: String,
 }
 
-#[allow(dead_code)]
 impl GatewayReconciler {
     pub fn new(client: Client, gateway_class_name: String) -> Self {
         Self {

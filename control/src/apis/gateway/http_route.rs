@@ -16,7 +16,6 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 /// HTTPRoute reconciler
-#[allow(dead_code)]
 pub struct HTTPRouteReconciler {
     client: Client,
     router: Arc<Router>,
@@ -24,7 +23,6 @@ pub struct HTTPRouteReconciler {
     gateway_name: String,
 }
 
-#[allow(dead_code)]
 impl HTTPRouteReconciler {
     pub fn new(client: Client, router: Arc<Router>, gateway_name: String) -> Self {
         Self {
