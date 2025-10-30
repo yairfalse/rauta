@@ -1151,4 +1151,82 @@ mod tests {
             "Histogram should contain count metric"
         );
     }
+
+    #[tokio::test]
+    async fn test_controller_metrics_in_endpoint() {
+        // Record some controller metrics first
+        use crate::apis::metrics::{
+            record_gateway_reconciliation, record_gatewayclass_reconciliation,
+            record_httproute_reconciliation,
+        };
+
+        record_httproute_reconciliation("test-route", "default", 0.123, "success");
+        record_gateway_reconciliation("test-gateway", "default", 0.045, "success");
+        record_gatewayclass_reconciliation("rauta", 0.021, "success");
+
+        // Start proxy server
+        let router = Arc::new(Router::new());
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), router).unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Request metrics endpoint
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build_http::<Full<Bytes>>();
+        let uri: hyper::Uri = format!("http://{}/metrics", proxy_addr).parse().unwrap();
+        let response = client
+            .get(uri)
+            .await
+            .expect("Metrics request should succeed");
+
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+
+        // Collect response body
+        let body_bytes = response.collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body_bytes);
+
+        // Verify controller metrics are present
+        assert!(
+            body.contains("httproute_reconciliation_duration_seconds"),
+            "Should contain HTTPRoute duration metric"
+        );
+        assert!(
+            body.contains("httproute_reconciliations_total"),
+            "Should contain HTTPRoute counter metric"
+        );
+        assert!(
+            body.contains("gateway_reconciliation_duration_seconds"),
+            "Should contain Gateway duration metric"
+        );
+        assert!(
+            body.contains("gateway_reconciliations_total"),
+            "Should contain Gateway counter metric"
+        );
+        assert!(
+            body.contains("gatewayclass_reconciliations_total"),
+            "Should contain GatewayClass counter metric"
+        );
+
+        // Verify metric values contain our test data
+        assert!(
+            body.contains(r#"httproute="test-route""#),
+            "Should contain test HTTPRoute name"
+        );
+        assert!(
+            body.contains(r#"gateway="test-gateway""#),
+            "Should contain test Gateway name"
+        );
+        assert!(
+            body.contains(r#"gatewayclass="rauta""#),
+            "Should contain test GatewayClass name"
+        );
+    }
 }
