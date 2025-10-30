@@ -93,21 +93,17 @@ impl HTTPRouteReconciler {
                             // Real implementation will resolve Service -> Endpoints -> Pod IPs
                             // via K8s API (EndpointSlice watcher)
                             let port = backend_ref.port.unwrap_or(80);
-
-                            // Generate valid placeholder IP: 10.0.1-254.1-254
-                            // Avoid 10.0.0.x by using % 254 + 1
-                            let ip = format!(
-                                "10.0.{}.{}",
-                                ((backend_ref.name.len() % 254) + 1), // 1-254
-                                ((port % 254) + 1)                    // 1-254
-                            );
+                            let ip =
+                                format!("10.0.{}.{}", (backend_ref.name.len() % 255), ((port % 254) + 1));
 
                             info!(
                                 "  - Backend: {} (resolved to {}:{})",
                                 backend_ref.name, ip, port
                             );
 
-                            let ipv4: std::net::Ipv4Addr = ip.parse().unwrap();
+                            let ipv4: std::net::Ipv4Addr = ip
+                                .parse()
+                                .expect(&format!("Failed to parse generated IP address: {}", ip));
                             Backend {
                                 ipv4: u32::from(ipv4),
                                 port: port as u16,

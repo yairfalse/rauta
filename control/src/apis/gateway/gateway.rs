@@ -64,8 +64,8 @@ impl GatewayReconciler {
 
         for listener in &gateway.spec.listeners {
             info!(
-                "  - Listener '{}': {}:{} ({})",
-                listener.name, listener.protocol, listener.port, listener.protocol
+                "  - Listener '{}': {}:{}",
+                listener.name, listener.protocol, listener.port
             );
         }
 
