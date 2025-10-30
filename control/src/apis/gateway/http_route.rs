@@ -100,7 +100,9 @@ impl HTTPRouteReconciler {
                                 backend_ref.name, ip, port
                             );
 
-                            let ipv4: std::net::Ipv4Addr = ip.parse().unwrap();
+                            let ipv4: std::net::Ipv4Addr = ip
+                                .parse()
+                                .expect(&format!("Failed to parse generated IP address: {}", ip));
                             Backend {
                                 ipv4: u32::from(ipv4),
                                 port: port as u16,
