@@ -112,7 +112,7 @@ The only cost is:
 
 ### No data in Grafana
 
-1. Check Prometheus is scraping: http://localhost:9090/targets
+1. Check Prometheus is scraping: http://localhost:9091/targets
 2. Should see "rauta-gateway" target as UP
 3. Generate traffic: `curl http://localhost:8080/api`
 4. Refresh Grafana dashboard
