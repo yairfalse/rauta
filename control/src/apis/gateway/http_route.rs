@@ -150,23 +150,28 @@ impl HTTPRouteReconciler {
 
                 // Extract backends
                 if let Some(backend_refs) = &rule.backend_refs {
-                    let mut backends: Vec<Backend> = Vec::new();
+                    let backends: Vec<Backend> = backend_refs
+                        .iter()
+                        .map(|backend_ref| {
+                            // TODO: This is TEMPORARY placeholder logic
+                            // Real implementation will resolve Service -> Endpoints -> Pod IPs
+                            // via K8s API (EndpointSlice watcher)
+                            let port = backend_ref.port.unwrap_or(80);
+                            let ip =
+                                format!("10.0.{}.{}", (backend_ref.name.len() % 255), ((port % 254) + 1));
 
-                    for backend_ref in backend_refs {
-                        let port = backend_ref.port.unwrap_or(80) as u32;
+                            info!(
+                                "  - Backend: {} (resolved to {}:{})",
+                                backend_ref.name, ip, port
+                            );
 
-                        // Resolve Service -> Pod IPs via Kubernetes Endpoints API
-                        match ctx
-                            .resolve_service_endpoints(&backend_ref.name, &namespace, port)
-                            .await
-                        {
-                            Ok(pod_backends) => {
-                                info!(
-                                    "  - Backend: {} resolved to {} pod(s)",
-                                    backend_ref.name,
-                                    pod_backends.len()
-                                );
-                                backends.extend(pod_backends);
+                            let ipv4: std::net::Ipv4Addr = ip
+                                .parse()
+                                .expect(&format!("Failed to parse generated IP address: {}", ip));
+                            Backend {
+                                ipv4: u32::from(ipv4),
+                                port: port as u16,
+                                weight: 100, // Default weight
                             }
                             Err(e) => {
                                 warn!("  - Backend: {} resolution failed: {}", backend_ref.name, e);
