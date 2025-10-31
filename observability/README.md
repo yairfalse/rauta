@@ -108,7 +108,7 @@ The only cost is:
 **Fix**:
 1. Make sure RAUTA is running: `cargo run --release`
 2. Check RAUTA is on port 8080: `curl http://localhost:8080/metrics`
-3. If on Linux, change `prometheus.yml` to use `host.docker.internal` or `172.17.0.1`
+3. If on Linux, change the Prometheus scrape target in `prometheus.yml` FROM `host.docker.internal` TO `172.17.0.1` (since `host.docker.internal` is only available on Docker Desktop for macOS/Windows).
 
 ### No data in Grafana
 
