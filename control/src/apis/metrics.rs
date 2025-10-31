@@ -67,6 +67,20 @@ lazy_static! {
         counter
     };
 
+    /// GatewayClass reconciliation duration
+    static ref GATEWAYCLASS_RECONCILIATION_DURATION: HistogramVec = {
+        let opts = HistogramOpts::new(
+            "gatewayclass_reconciliation_duration_seconds",
+            "GatewayClass reconciliation duration in seconds",
+        );
+        let histogram = HistogramVec::new(opts, &["gatewayclass"])
+            .expect("Failed to create histogram");
+        CONTROLLER_METRICS_REGISTRY
+            .register(Box::new(histogram.clone()))
+            .expect("Failed to register histogram");
+        histogram
+    };
+
     /// GatewayClass reconciliations total
     static ref GATEWAYCLASS_RECONCILIATIONS_TOTAL: IntCounterVec = {
         let opts = Opts::new(
@@ -117,7 +131,11 @@ pub fn record_gateway_reconciliation(
 
 /// Record GatewayClass reconciliation
 #[allow(dead_code)] // Used in tests, will be used in GatewayClass reconcile
-pub fn record_gatewayclass_reconciliation(gatewayclass: &str, _duration_secs: f64, result: &str) {
+pub fn record_gatewayclass_reconciliation(gatewayclass: &str, duration_secs: f64, result: &str) {
+    GATEWAYCLASS_RECONCILIATION_DURATION
+        .with_label_values(&[gatewayclass])
+        .observe(duration_secs);
+
     GATEWAYCLASS_RECONCILIATIONS_TOTAL
         .with_label_values(&[gatewayclass, result])
         .inc();
