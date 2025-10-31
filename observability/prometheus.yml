@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  external_labels:
+    cluster: 'rauta-dev'
+    environment: 'local'
+
+scrape_configs:
+  # RAUTA Gateway Metrics
+  - job_name: 'rauta-gateway'
+    static_configs:
+      - targets: ['host.docker.internal:8080']
+        labels:
+          component: 'gateway'
+          service: 'rauta'
+    metrics_path: '/metrics'
+    scrape_interval: 5s
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
