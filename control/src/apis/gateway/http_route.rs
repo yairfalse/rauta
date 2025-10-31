@@ -45,6 +45,68 @@ impl HTTPRouteReconciler {
         }
     }
 
+    /// Resolve Service name to Pod IPs via Kubernetes Endpoints API
+    async fn resolve_service_endpoints(
+        &self,
+        service_name: &str,
+        namespace: &str,
+        _service_port: u32,
+    ) -> Result<Vec<Backend>, kube::Error> {
+        use k8s_openapi::api::core::v1::Endpoints;
+
+        let endpoints_api: Api<Endpoints> = Api::namespaced(self.client.clone(), namespace);
+
+        match endpoints_api.get(service_name).await {
+            Ok(endpoints) => {
+                let mut backends = Vec::new();
+
+                if let Some(subsets) = endpoints.subsets {
+                    for subset in subsets {
+                        // Get the actual Pod port from the Endpoints (not the Service port)
+                        let pod_port = if let Some(ports) = &subset.ports {
+                            ports.first().map(|p| p.port as u16).unwrap_or(80)
+                        } else {
+                            80 // Default to port 80 if not specified
+                        };
+
+                        if let Some(addresses) = subset.addresses {
+                            for address in addresses {
+                                match address.ip.parse::<std::net::Ipv4Addr>() {
+                                    Ok(ipv4) => {
+                                        backends.push(Backend {
+                                            ipv4: u32::from(ipv4),
+                                            port: pod_port,
+                                            weight: 100,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to parse IP address {}: {}", address.ip, e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if backends.is_empty() {
+                    warn!(
+                        "Service {}/{} has no ready endpoints",
+                        namespace, service_name
+                    );
+                }
+
+                Ok(backends)
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to get endpoints for service {}/{}: {}",
+                    namespace, service_name, e
+                );
+                Err(e)
+            }
+        }
+    }
+
     /// Reconcile a single HTTPRoute
     async fn reconcile(route: Arc<HTTPRoute>, ctx: Arc<Self>) -> Result<Action, kube::Error> {
         let start = Instant::now();
@@ -88,35 +150,30 @@ impl HTTPRouteReconciler {
 
                 // Extract backends
                 if let Some(backend_refs) = &rule.backend_refs {
-                    let backends: Vec<Backend> = backend_refs
-                        .iter()
-                        .map(|backend_ref| {
-                            // TODO: This is TEMPORARY placeholder logic
-                            // Real implementation will resolve Service -> Endpoints -> Pod IPs
-                            // via K8s API (EndpointSlice watcher)
-                            let port = backend_ref.port.unwrap_or(80);
+                    let mut backends: Vec<Backend> = Vec::new();
 
-                            // Generate valid placeholder IP: 10.0.1-254.1-254
-                            // Avoid 10.0.0.x by using % 254 + 1
-                            let ip = format!(
-                                "10.0.{}.{}",
-                                ((backend_ref.name.len() % 254) + 1), // 1-254
-                                ((port % 254) + 1)                    // 1-254
-                            );
+                    for backend_ref in backend_refs {
+                        let port = backend_ref.port.unwrap_or(80) as u32;
 
-                            info!(
-                                "  - Backend: {} (resolved to {}:{})",
-                                backend_ref.name, ip, port
-                            );
-
-                            let ipv4: std::net::Ipv4Addr = ip.parse().unwrap();
-                            Backend {
-                                ipv4: u32::from(ipv4),
-                                port: port as u16,
-                                weight: 100, // Default weight
+                        // Resolve Service -> Pod IPs via Kubernetes Endpoints API
+                        match ctx
+                            .resolve_service_endpoints(&backend_ref.name, &namespace, port)
+                            .await
+                        {
+                            Ok(pod_backends) => {
+                                info!(
+                                    "  - Backend: {} resolved to {} pod(s)",
+                                    backend_ref.name,
+                                    pod_backends.len()
+                                );
+                                backends.extend(pod_backends);
                             }
-                        })
-                        .collect();
+                            Err(e) => {
+                                warn!("  - Backend: {} resolution failed: {}", backend_ref.name, e);
+                                // Skip this backend if resolution fails
+                            }
+                        }
+                    }
 
                     if !backends.is_empty() {
                         // Add route to router (using GET as default method)
