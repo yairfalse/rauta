@@ -2,6 +2,7 @@
 //!
 //! Watches HTTPRoute resources and updates routing rules.
 
+use crate::apis::metrics::record_httproute_reconciliation;
 use crate::proxy::router::Router;
 use common::{Backend, HttpMethod};
 use futures::StreamExt;
@@ -12,7 +13,7 @@ use kube::runtime::watcher::Config as WatcherConfig;
 use kube::{Client, ResourceExt};
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 /// HTTPRoute reconciler
@@ -44,8 +45,71 @@ impl HTTPRouteReconciler {
         }
     }
 
+    /// Resolve Service name to Pod IPs via Kubernetes Endpoints API
+    async fn resolve_service_endpoints(
+        &self,
+        service_name: &str,
+        namespace: &str,
+        _service_port: u32,
+    ) -> Result<Vec<Backend>, kube::Error> {
+        use k8s_openapi::api::core::v1::Endpoints;
+
+        let endpoints_api: Api<Endpoints> = Api::namespaced(self.client.clone(), namespace);
+
+        match endpoints_api.get(service_name).await {
+            Ok(endpoints) => {
+                let mut backends = Vec::new();
+
+                if let Some(subsets) = endpoints.subsets {
+                    for subset in subsets {
+                        // Get the actual Pod port from the Endpoints (not the Service port)
+                        let pod_port = if let Some(ports) = &subset.ports {
+                            ports.first().map(|p| p.port as u16).unwrap_or(80)
+                        } else {
+                            80 // Default to port 80 if not specified
+                        };
+
+                        if let Some(addresses) = subset.addresses {
+                            for address in addresses {
+                                match address.ip.parse::<std::net::Ipv4Addr>() {
+                                    Ok(ipv4) => {
+                                        backends.push(Backend {
+                                            ipv4: u32::from(ipv4),
+                                            port: pod_port,
+                                            weight: 100,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to parse IP address {}: {}", address.ip, e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if backends.is_empty() {
+                    warn!(
+                        "Service {}/{} has no ready endpoints",
+                        namespace, service_name
+                    );
+                }
+
+                Ok(backends)
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to get endpoints for service {}/{}: {}",
+                    namespace, service_name, e
+                );
+                Err(e)
+            }
+        }
+    }
+
     /// Reconcile a single HTTPRoute
     async fn reconcile(route: Arc<HTTPRoute>, ctx: Arc<Self>) -> Result<Action, kube::Error> {
+        let start = Instant::now();
         let namespace = route.namespace().unwrap_or_else(|| "default".to_string());
         let name = route.name_any();
 
@@ -109,8 +173,12 @@ impl HTTPRouteReconciler {
                                 port: port as u16,
                                 weight: 100, // Default weight
                             }
-                        })
-                        .collect();
+                            Err(e) => {
+                                warn!("  - Backend: {} resolution failed: {}", backend_ref.name, e);
+                                // Skip this backend if resolution fails
+                            }
+                        }
+                    }
 
                     if !backends.is_empty() {
                         // Add route to router (using GET as default method)
@@ -137,6 +205,14 @@ impl HTTPRouteReconciler {
         // Update HTTPRoute status
         ctx.set_route_status(&namespace, &name, routes_added > 0)
             .await?;
+
+        // Record metrics
+        record_httproute_reconciliation(
+            &name,
+            &namespace,
+            start.elapsed().as_secs_f64(),
+            "success",
+        );
 
         // Requeue after 5 minutes for periodic reconciliation
         Ok(Action::requeue(Duration::from_secs(300)))
@@ -292,6 +368,34 @@ mod tests {
 
         // For now, just verify router was created
         assert!(Arc::strong_count(&router) == 1);
+    }
+
+    #[test]
+    fn test_httproute_metrics_recorded() {
+        // RED: Test that HTTPRoute reconciliation records metrics
+        // This test will FAIL until we implement metrics
+
+        use crate::apis::metrics::gather_controller_metrics;
+
+        // Record a fake reconciliation
+        crate::apis::metrics::record_httproute_reconciliation(
+            "test-route",
+            "default",
+            0.123,
+            "success",
+        );
+
+        // Gather metrics and verify they contain the expected data
+        let metrics = gather_controller_metrics().expect("Should gather metrics");
+
+        assert!(
+            metrics.contains("httproute_reconciliation_duration_seconds"),
+            "Should contain duration metric"
+        );
+        assert!(
+            metrics.contains("httproute_reconciliations_total"),
+            "Should contain counter metric"
+        );
     }
 }
 

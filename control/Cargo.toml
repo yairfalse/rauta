@@ -48,6 +48,9 @@ matchit = "0.8"
 prometheus = { version = "0.14", features = ["process"] }
 lazy_static = "1.4"
 
+# Request tracing and IDs
+uuid = { version = "1.0", features = ["v4", "fast-rng"] }
+
 # Networking
 libc = "0.2"
 

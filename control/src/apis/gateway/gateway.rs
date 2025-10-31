@@ -2,6 +2,7 @@
 //!
 //! Watches Gateway resources and configures listeners (HTTP, HTTPS, TCP).
 
+use crate::apis::metrics::record_gateway_reconciliation;
 use futures::StreamExt;
 use gateway_api::apis::standard::gateways::Gateway;
 use kube::api::{Api, Patch, PatchParams};
@@ -10,7 +11,7 @@ use kube::runtime::watcher::Config as WatcherConfig;
 use kube::{Client, ResourceExt};
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info};
 
 /// Gateway reconciler
@@ -35,6 +36,7 @@ impl GatewayReconciler {
 
     /// Reconcile a single Gateway
     async fn reconcile(gateway: Arc<Gateway>, ctx: Arc<Self>) -> Result<Action, kube::Error> {
+        let start = Instant::now();
         let namespace = gateway.namespace().unwrap_or_else(|| "default".to_string());
         let name = gateway.name_any();
         let gateway_class = &gateway.spec.gateway_class_name;
@@ -72,6 +74,9 @@ impl GatewayReconciler {
         // Update Gateway status
         ctx.set_gateway_status(&namespace, &name, true, listener_count)
             .await?;
+
+        // Record metrics
+        record_gateway_reconciliation(&name, &namespace, start.elapsed().as_secs_f64(), "success");
 
         // Requeue after 5 minutes for periodic reconciliation
         Ok(Action::requeue(Duration::from_secs(300)))
@@ -341,5 +346,31 @@ mod tests {
 
         // Should NOT match our GatewayClass
         assert_ne!(gateway.spec.gateway_class_name, "rauta");
+    }
+
+    #[test]
+    fn test_gateway_metrics_recorded() {
+        // RED: Test that Gateway reconciliation records metrics
+        use crate::apis::metrics::gather_controller_metrics;
+
+        // Record a fake reconciliation
+        crate::apis::metrics::record_gateway_reconciliation(
+            "test-gateway",
+            "default",
+            0.045,
+            "success",
+        );
+
+        // Gather metrics and verify
+        let metrics = gather_controller_metrics().expect("Should gather metrics");
+
+        assert!(
+            metrics.contains("gateway_reconciliation_duration_seconds"),
+            "Should contain duration metric"
+        );
+        assert!(
+            metrics.contains("gateway_reconciliations_total"),
+            "Should contain counter metric"
+        );
     }
 }

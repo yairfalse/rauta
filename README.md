@@ -1,88 +1,76 @@
 # RAUTA ⚙️
 
-**Iron-clad routing at wire speed** - Experimental Rust + eBPF Ingress Controller
+**A Kubernetes Gateway API implementation in Rust** - Experimental, learning in public.
 
 [![CI](https://github.com/yairfalse/rauta/actions/workflows/ci.yml/badge.svg)](https://github.com/yairfalse/rauta/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
-> **Status**: 🚧 Stage 1 Core Complete - Pure Rust HTTP proxy with advanced routing. Additional Stage 1 features (K8s Integration, Observability) in progress.
+---
+
+
+This is a **week-old project**. We're learning Rust, eBPF, and Kubernetes networking as we go.
 
 ---
 
 ## What is RAUTA?
 
-A Kubernetes Ingress Controller that's **fast** and **simple**.
+A Kubernetes ingress controller built in Rust. We're exploring:
+- Modern Kubernetes Gateway API (v1)
+- Consistent hashing for load balancing (Maglev)
+- eBPF for observability (future work)
 
-**The Idea:**
-Most of your traffic hits the same 100 routes. Those should be **really fast**. The long tail of routes? Those can be a bit slower but need to handle complex logic.
-
-So we built two layers:
-1. **Hot cache in eBPF** - Handles your top routes at kernel speed
-2. **Full router in Rust** - Handles everything else with rich features
-
-Think of it like CPU caching: L1 cache (eBPF) for hot data, RAM (Rust) for everything else.
-
----
-
-## How It Works
-
-```
-Client Request: GET /api/users/123
-        │
-        ▼
-┌─────────────────────────────────────────────┐
-│  eBPF Layer (Stage 2 - Coming Soon)        │
-│                                             │
-│  Hash("/api/users")                         │
-│  → Check hot routes map                     │
-│  → Found! Route to 10.0.1.5:8080           │
-│  → Done in <10 microseconds                 │
-│                                             │
-│  If NOT in cache ↓                          │
-└─────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────┐
-│  Rust Layer (Stage 1 - ✅ Working Now)      │
-│                                             │
-│  1. Match route: /api/users → user-service  │
-│     (supports prefix matching, wildcards)   │
-│                                             │
-│  2. Pick backend with Maglev hashing:       │
-│     Flow(path, src_ip, port) → backend #2   │
-│                                             │
-│  3. Forward request to 10.0.1.2:8080       │
-│     Done in <100 microseconds               │
-│                                             │
-│  4. Update hot routes if this gets popular  │
-└─────────────────────────────────────────────┘
-```
-
-**Why this design?**
-- 99% of your traffic hits the same routes → eBPF makes them blazing fast
-- 1% of traffic needs complex routing → Rust handles that
-- Best of both worlds: speed + features
+**Why another ingress controller?**
+- **Learning project** - We wanted to understand how ingress controllers work
+- **Modern APIs** - Gateway API is newer than Ingress, wanted to try it
+- **Rust** - Memory-safe systems programming
+- **eBPF exploration** - Eventually use eBPF for deep HTTP observability
 
 ---
 
-## Current Status: Stage 1 ✅
+## What's Working Now?
 
-**What's Working NOW:**
+✅ **Stage 1: Gateway API Controller** (Complete as of Week 1)
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| HTTP/1.1 Router | ✅ | matchit radix tree |
-| Prefix Matching | ✅ | K8s PathType: Prefix |
-| Exact Matching | ✅ | K8s PathType: Exact |
-| Load Balancing | ✅ | Maglev consistent hashing |
-| Flow Distribution | ✅ | path + src_ip + src_port |
-| Tests | ✅ | 68 tests passing |
-| Pre-commit Hook | ✅ | fmt + clippy + tests |
+| GatewayClass reconciliation | ✅ | Watches GatewayClass resources |
+| Gateway reconciliation | ✅ | Updates status, manages listeners |
+| HTTPRoute reconciliation | ✅ | Path matching, backend resolution |
+| Service → Pod IP resolution | ✅ | Via Kubernetes Endpoints API |
+| Maglev load balancing | ✅ | Consistent hashing for backends |
+| Prefix matching | ✅ | `/api/users` matches `/api/users/123` |
+| Tests | ✅ | 92 tests passing |
+| Metrics | ✅ | Prometheus /metrics endpoint |
 
+**Tested in**: `kind` cluster with sample HTTPRoutes
 
+---
 
-Pure Rust userspace proxy. Simple.
+## How It Works (Current)
+
+```
+1. Watch Kubernetes resources (Gateway API v1)
+   ├─ GatewayClass: rauta.io/gateway-controller
+   ├─ Gateway: Listeners (HTTP on port 80)
+   └─ HTTPRoute: Routes with backend refs
+
+2. Resolve Services → Pod IPs
+   └─ Kubernetes Endpoints API
+
+3. Route requests using Maglev consistent hashing
+   ├─ Hash(path, src_ip, src_port) → backend
+   └─ Sticky connections (same flow → same backend)
+
+4. Update Kubernetes status
+   └─ Accepted, ResolvedRefs conditions
+```
+
+That's it. Simple L7 HTTP routing in Rust userspace.
+
+---
+
+## Quick Start
 
 ```bash
 # Clone and build
@@ -90,219 +78,365 @@ git clone https://github.com/yairfalse/rauta
 cd rauta
 cargo build --release
 
-# Run HTTP proxy (Stage 1)
+# Run tests
+cargo test
+
+# Run controller (requires KUBECONFIG)
 ./target/release/control
 
-# Test routing
-curl http://127.0.0.1:8080/api/users
-# → Route matched! Backend: 10.0.1.1:8080
-
-curl http://127.0.0.1:8080/api/users/123
-# → Route matched! Backend: 10.0.1.2:8080 (prefix match!)
+# Deploy in Kubernetes
+kubectl apply -f manifests/
 ```
 
-
-## Performance Goals
-
-**Right Now (Stage 1):**
-- Routing: <100 microseconds per request
-- Throughput: 100K+ requests/second
-- Algorithm: O(log n) route lookup + O(1) backend selection
-
-**Coming Soon (Stage 2 with eBPF):**
-- Hot routes: <10 microseconds (in kernel, no context switch)
-- Cache hit rate: 99% of traffic
-- Everything else falls back to Stage 1
-
-**How?**
-- Your top 100 routes get cached in kernel memory
-- eBPF decides which backend without leaving kernel space
-- No malloc, no TCP stack overhead for hot paths
-- It's basically free routing for popular endpoints
+**Requirements:**
+- Rust 1.75+
+- Kubernetes cluster (kind/minikube OK)
+- KUBECONFIG configured
 
 ---
 
-## Roadmap
+## Architecture (Current)
 
-### ✅ Stage 1: Pure Rust Proxy (Week 1-8) - COMPLETE
+```
+┌─────────────────────────────────────────────┐
+│   Kubernetes API Server                     │
+│   - GatewayClass                            │
+│   - Gateway                                 │
+│   - HTTPRoute                               │
+└──────────────────┬──────────────────────────┘
+                   │ Watch events
+                   ▼
+┌─────────────────────────────────────────────┐
+│   RAUTA Controller (Rust)                   │
+│   - kube-rs watchers                        │
+│   - Reconcile loop                          │
+│   - Router (matchit + Maglev)               │
+│   - Prometheus metrics                      │
+└──────────────────┬──────────────────────────┘
+                   │ Update routes
+                   ▼
+┌─────────────────────────────────────────────┐
+│   Router (in-memory)                        │
+│   - matchit radix tree (prefix match)       │
+│   - Maglev hash table (per route)           │
+│   - Backend selection: O(1)                 │
+└─────────────────────────────────────────────┘
+```
 
-- [x] HTTP server (hyper 1.0)
-- [x] matchit router (prefix + exact matching)
-- [x] Maglev load balancing
-- [x] Flow-based hashing
-- [x] TDD workflow (RED → GREEN → REFACTOR)
-- [x] Pre-commit hook (fmt + clippy + tests)
+**No eBPF yet.** Pure Rust userspace. Simple.
 
-### 🔄 Stage 1 Continued: K8s Integration (Week 3-4)
+---
 
-- [ ] Ingress watcher (kube-rs)
-- [ ] EndpointSlice watcher
-- [ ] Service discovery
-- [ ] Dynamic route updates
+## 🔍 eBPF Observability (The Vision)
 
-### 🔄 Stage 1 Continued: Observability (Week 5-8)
+**Status: Designed, not implemented.** This is our research direction for Stage 2.
 
-- [ ] Per-route metrics (requests, latency, errors)
-- [ ] Prometheus /metrics endpoint
-- [ ] Health checks
-- [ ] Simple web UI
+### The Approach
 
-### ⏳ Stage 2: eBPF Hot Cache (Week 9-16)
+Most ingress controllers give you request counts and latency histograms. RAUTA will add **kernel-level HTTP visibility** via eBPF XDP observation.
 
-- [ ] XDP program (Aya-rs)
-- [ ] BPF maps (routes, backends, flow cache)
-- [ ] HTTP parsing in XDP (method + path extraction)
-- [ ] Top-100 route identification
-- [ ] Userspace sync (hot → eBPF cache)
-- [ ] Metrics via ring buffer
+**Key Principle:** eBPF captures, userspace analyzes. XDP programs always return `XDP_PASS` (observation only, never routing).
 
-### ⏳ Stage 3: Production Features (Week 17+)
+### Technical Architecture
 
-- [ ] TLS termination (userspace)
-- [ ] HTTP/2 support
-- [ ] WebSocket support
-- [ ] Advanced routing (weighted, canary, A/B)
-- [ ] OTEL traces from XDP
+```
+┌─────────────────────────────────────────────┐
+│  XDP Program (eBPF)                         │
+│  - Parse: Ethernet → IP → TCP → HTTP       │
+│  - Extract: method, path, status, timing   │
+│  - Emit: Ring buffer event                  │
+│  - Return: XDP_PASS (always!)               │
+└──────────────────┬──────────────────────────┘
+                   │ bpf_ringbuf_output()
+                   ▼
+┌─────────────────────────────────────────────┐
+│  Rust Processors (Userspace)               │
+│  - Baseline learning (p50/p99 per route)   │
+│  - Anomaly detection (statistical)          │
+│  - Event emission (TAPIO format)            │
+└─────────────────────────────────────────────┘
+```
+
+**eBPF Program** (simplified):
+```c
+SEC("xdp")
+int rauta_observe(struct xdp_md *ctx) {
+    struct http_event evt = {
+        .timestamp_ns = bpf_ktime_get_ns(),
+        .method = parse_method(data, data_end),
+        .path_hash = hash_path(data, data_end),
+        .status = parse_status(data, data_end),
+    };
+
+    bpf_ringbuf_output(&EVENTS, &evt, sizeof(evt), 0);
+    return XDP_PASS;  // Never drop packets
+}
+```
+
+**Userspace Processor** (Rust):
+```rust
+struct SlowResponseProcessor {
+    baselines: HashMap<u64, LatencyBaseline>,  // path_hash → baseline
+}
+
+impl Processor for SlowResponseProcessor {
+    fn process(&mut self, evt: &HttpEvent) -> Option<ObserverEvent> {
+        let baseline = self.baselines.get(&evt.path_hash)?;
+        let latency_ms = evt.response_time_ns / 1_000_000;
+
+        // Detect: p99 > 2x baseline
+        if latency_ms > baseline.p99 * 2.0 {
+            Some(ObserverEvent {
+                type_: "slow_response",
+                route: evt.path,
+                latency_ms,
+                baseline_p99: baseline.p99,
+                backend_ip: evt.backend_ip,
+            })
+        } else {
+            None
+        }
+    }
+}
+```
+
+### What We'll Detect
+
+**1. Slow Response Detection**
+- Learn per-route latency baselines (p50, p95, p99)
+- Emit event when p99 > 2x baseline
+- Correlate to backend pod via IP
+
+**2. TCP Connection Failures**
+- Hook: `kprobe/tcp_set_state`
+- Detect: `SYN_SENT → CLOSE` (connection refused)
+- Emit before HTTP layer even tries
+
+**3. HTTP Error Spikes**
+- Track per-route error rate baseline
+- Detect: error_rate > baseline + 3σ (statistical)
+- Identify failing backend pod
+
+**4. Latency Breakdown**
+- Timestamp: XDP receive, socket send, socket recv, HTTP complete
+- Breakdown: network vs application time
+- Identify bottleneck layer
+
+### Integration: false-systems Ecosystem
+
+```
+RAUTA (HTTP layer)
+  │ Detects: /api/users slow (450ms, baseline 120ms)
+  │ Emits: ObserverEvent{type: "slow_response", pod: "user-svc-abc"}
+  ▼
+TAPIO (Pod layer)
+  │ Correlates: user-svc-abc pod
+  │ Finds: Memory 85%, 12 GC pauses/min
+  ▼
+AHTI (Correlation)
+  │ Links: HTTP latency ← Memory ← GC
+  │ Root cause: Memory leak in transaction processor
+  ▼
+URPO (UI)
+  │ Timeline visualization
+  │ Suggested fix: Scale or debug memory leak
+```
+
+**Zero-instrumentation observability across HTTP → Pod → Process.**
+
+### Technical Details
+
+**Why XDP Observation Mode?**
+- Compatible with any CNI (Cilium, Calico, Flannel)
+- Zero packet drops (always `XDP_PASS`)
+- 10-100μs overhead per packet (Cilium benchmarks)
+- Can be disabled at runtime (detach eBPF program)
+
+**HTTP Parsing Strategy:**
+- HTTP/1.1 only (text-based, eBPF verifier-friendly)
+- Single-packet requests (no TCP reassembly in XDP)
+- Fallback: Multi-packet requests visible via kprobe/tcp_recvmsg
+- Max path length: 256 bytes (99% of traffic)
+
+**Precedent:**
+- **Cilium**: L7 HTTP visibility with eBPF (production at scale)
+- **Cloudflare**: eBPF HTTP observability (Kentik blog 2023)
+- **Brendan Gregg**: BPF Performance Tools Ch10 (networking patterns)
+
+**Research Citations:**
+- ACM 2024: "QUIC is not Quick Enough" (HTTP/2 > HTTP/3)
+- Kernel Recipes 2024: io_uring zero-copy (+31-43% throughput)
+- Cilium May 2024: eBPF sockmap (30% latency reduction)
+
+Full design: [`docs/OBSERVABILITY_ARCHITECTURE.md`](docs/OBSERVABILITY_ARCHITECTURE.md)
+
+### Status: Not Built Yet
+
+**Current (Week 1):**
+- ❌ No eBPF programs
+- ✅ Architecture designed
+- ✅ Processor pattern defined (TAPIO-compatible)
+- ✅ Research complete
+
+**Timeline:** Month 2-3 prototype, Month 3-4 integration.
+
+**This is research.** Learning eBPF in public. Might change.
+
+---
+
+## What's Next? (No Promises)
+
+We're exploring:
+
+**Stage 2: eBPF Observability** (Maybe Month 2-3?)
+- XDP program to capture HTTP metadata (method, path, status, latency)
+- Ring buffer events to userspace
+- Detect slow responses, 5xx spikes, connection failures
+- **Not for routing** - just deep HTTP observability
+
+**Stage 3: Maybe Service Mesh?** (Who Knows?)
+- eBPF sockops for transparent proxying
+- No sidecars needed
+- This is research - might not happen
+
+---
+
+## Performance (Unknown)
+
+We haven't benchmarked seriously yet. It's week 1.
+
+**Theoretical:**
+- Routing algorithm: O(log n) route lookup (matchit) + O(1) backend selection (Maglev)
+- In-memory routing: Should be fast-ish
+- No buffering: Streaming proxy (when we implement HTTP forwarding)
+
+**Reality:** We don't know yet. Need to benchmark against real traffic.
 
 ---
 
 ## Technology Stack
 
-**Userspace (Rust):**
+**Userspace:**
 - **tokio** - Async runtime
-- **hyper 1.0** - HTTP server and client
-- **matchit** - Radix tree for prefix matching (used by axum)
 - **kube-rs** - Kubernetes API client
-- **aya** - eBPF framework (Stage 2)
+- **gateway-api** - Official Gateway API CRD types
+- **matchit** - Radix tree for path matching (used by axum)
+- **prometheus** - Metrics
 
-**Kernel (eBPF):**
-- **Aya BPF** - Rust eBPF programs (Stage 2)
-- **BPF maps** - Shared state (routes, backends, flow cache)
+**Future (eBPF):**
+- **aya** - Rust eBPF framework
+- **XDP** - Packet observation (not routing!)
+
 ---
 
 ## Development
 
-### Setup
+### Prerequisites
 
 ```bash
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Clone project
-git clone https://github.com/yairfalse/rauta
-cd rauta
-
-# Build
-cargo build
-cargo test
+# Install pre-commit dependencies
+cargo install cargo-fmt cargo-clippy
 ```
 
-### Pre-commit Hook (Automatic Quality Checks)
-
-The project uses a pre-commit hook that runs on every commit:
+### Build and Test
 
 ```bash
-# Already installed when you clone! Located at .git/hooks/pre-commit
-# Runs automatically on: git commit
+# Build
+cargo build
 
-# What it checks:
-✅ cargo fmt (format)
-✅ cargo clippy (lint)
-✅ cargo test (68 tests)
+# Run tests
+cargo test
+
+# Format
+cargo fmt
+
+# Lint
+cargo clippy -- -D warnings
+```
+
+### Pre-commit Hook
+
+The project enforces quality checks on every commit:
+
+```bash
+# Automatically runs on: git commit
+✅ cargo fmt --check
+✅ cargo clippy
+✅ cargo test
 ```
 
 **Commit fails if:**
-- Code is not formatted
+- Code isn't formatted
 - Clippy warnings exist
 - Tests fail
 
-No more nonsense commits! 🎉
+This keeps the codebase clean. See `.git/hooks/pre-commit`.
 
-### TDD Workflow (Strict RED → GREEN → REFACTOR)
+### TDD Workflow
 
-**All code follows Test-Driven Development:**
+**All features follow Test-Driven Development:**
 
-```bash
-# 1. RED: Write failing test
-cargo test test_router_prefix_matching
-# ❌ test_router_prefix_matching ... FAILED
+1. **RED**: Write failing test
+2. **GREEN**: Minimal implementation to pass
+3. **REFACTOR**: Improve code quality
+4. **COMMIT**: Small, focused commits
 
-# 2. GREEN: Minimal implementation to pass
-# (write just enough code)
-cargo test
-# ✅ test_router_prefix_matching ... ok
-
-# 3. REFACTOR: Improve code quality
-# (add edge cases, improve design)
-cargo test
-# ✅ All tests still pass
-
-# 4. COMMIT: Small, focused commits
-git add . && git commit -m "feat: Add prefix matching (TDD)"
-# Pre-commit hook runs automatically
-```
-
-**See `CLAUDE.md` for full TDD guidelines.**
+See `CLAUDE.md` for detailed TDD guidelines.
 
 ---
 
 ## Design Choices
 
-**Why matchit for routing?**
-Kubernetes Ingress needs prefix matching (`/api/users` should match `/api/users/123`). A HashMap won't work for that - you need a tree structure. matchit is a radix tree that does exactly this, and it's fast (200ns lookups).
+**Why Gateway API instead of Ingress?**
+
+Gateway API is the newer Kubernetes standard (v1 as of Oct 2023). It's more expressive and role-oriented than Ingress. We wanted to learn it.
 
 **Why Maglev for load balancing?**
-Consistent hashing keeps connections sticky to the same backend. When backends change, only ~1/N connections need to move. Maglev is just a clever way to do this in O(1) time with a lookup table. Google's been using it for years.
 
-**Why split eBPF + Rust?**
-Because your traffic isn't evenly distributed. 99% of requests hit the same 100 routes. Those can live in kernel memory and route instantly. The other 1% gets the full Rust router with all the features. You get speed where it matters and flexibility where you need it.
+Consistent hashing keeps connections sticky to the same backend. When backends change, only ~1/N connections get redistributed. Maglev is Google's algorithm for this - it's fast (O(1) lookup) and well-tested at scale.
+
+**Why matchit for routing?**
+
+Kubernetes needs prefix matching (`/api/users` → `/api/users/123`). Can't use a HashMap for that. matchit is a radix tree used by axum - it's fast and battle-tested.
+
+**Why Rust?**
+
+- Memory safety (no segfaults in production)
+- Strong type system (catch bugs at compile time)
+- Good ecosystem (tokio, kube-rs, aya)
+- Learning opportunity
 
 ---
 
 ## Contributing
 
-**This is a learning project!** We're figuring things out as we go.
+**This is a learning project.** We're figuring things out as we go.
 
 **How to help:**
-1. **Try RAUTA** - Run Stage 1 locally, give feedback
-2. **Review code** - Especially eBPF experts (for Stage 2)
-3. **Improve docs** - Help us explain better
-4. **Report bugs** - Issues welcome!
-5. **Suggest features** - What would make this useful?
+1. **Try it** - Run in a kind cluster, report bugs
+2. **Review code** - Suggest improvements
+3. **Improve docs** - Help explain better
+4. **Share ideas** - What features would be useful?
 
 **Before contributing:**
 - Read `CLAUDE.md` (project guidelines)
-- Follow TDD workflow (RED → GREEN → REFACTOR)
-- Pre-commit hook will enforce code quality
-
-**Code style:**
-- NO TODOs in code (complete features or document why)
-- NO stubs (finish what you start)
-- TDD mandatory (tests before code)
-- Small commits (<30 lines preferred)
+- Follow TDD workflow (tests before code)
+- Keep commits small (<30 lines preferred)
+- No TODOs in code (finish features or document why)
 
 ---
 
-## Benchmarks (Coming Soon)
----
-## Why Rust?
+## Naming
 
-We'll test with real traffic patterns to see:
-- How fast is matchit routing in practice?
-- What's the actual throughput we can handle?
-- How much faster is eBPF for hot routes?
-- Where are the bottlenecks?
+**Rauta** (Finnish: "iron") - Part of the Finnish tool naming theme:
+- **TAPIO**: Kubernetes observer 🌲
+- **AHTI**: Event correlation 🌊
+- **RAUTA**: Ingress controller ⚙️
 
-
-## Why "Iron"?
-
-**Rauta** (Finnish: "iron") - The element that Rust prevents.
-
-**Naming philosophy:**
-- RAUTA prevents memory bugs (like rust on iron)
-- Built with Rust (the language)
-- Iron-clad routing (reliable, strong)
-- Finnish naming theme (like TAPIO, AHTI)
+Built in Rust, the language that prevents memory bugs (like rust on iron).
 
 ---
 
@@ -310,20 +444,16 @@ We'll test with real traffic patterns to see:
 
 Apache 2.0 - Free and open source.
 
-Built with ❤️ and 🦀 by the false-systems team.
-
 ---
 
 ## Links
 
 - **GitHub**: https://github.com/yairfalse/rauta
 - **Issues**: https://github.com/yairfalse/rauta/issues
-- **CI**: https://github.com/yairfalse/rauta/actions
-- **Docs**: See `docs/` directory
+- **Docs**: See `docs/` and `documents/` directories
 
 ---
 
-**RAUTA: Iron-clad routing at wire speed** ⚙️🦀
+**Week 1 complete.** Learning in public. Join us! 🦀
 
-*Experimental. Learning in public. Join us!*
-
+*This is experimental software. Not production-ready. Use at your own risk.*

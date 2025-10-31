@@ -1,5 +1,6 @@
 //! HTTP Server - proxies requests to backends
 
+use crate::apis::metrics::CONTROLLER_METRICS_REGISTRY;
 use crate::proxy::router::Router;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
@@ -16,7 +17,8 @@ use prometheus::{
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
 lazy_static! {
     /// Global metrics registry
@@ -137,21 +139,36 @@ async fn forward_to_backend(
     req: Request<hyper::body::Incoming>,
     backend: common::Backend,
     client: Client<HttpConnector, Full<Bytes>>,
+    request_id: &str,
 ) -> Result<Response<Full<Bytes>>, String> {
+    let request_start = Instant::now();
+
     // Read the incoming request body
     let (parts, body) = req.into_parts();
+    let body_read_start = Instant::now();
     let body_bytes = body
         .collect()
         .await
         .map_err(|e| {
             error!(
+                request_id = %request_id,
                 error.message = %e,
                 error.type = "request_body_read",
+                elapsed_us = body_read_start.elapsed().as_micros() as u64,
                 "Failed to read request body"
             );
             format!("Failed to read request body: {}", e)
         })?
         .to_bytes();
+
+    let body_read_duration = body_read_start.elapsed();
+    info!(
+        request_id = %request_id,
+        stage = "request_body_read",
+        body_size_bytes = body_bytes.len(),
+        elapsed_us = body_read_duration.as_micros() as u64,
+        "Request body read complete"
+    );
 
     // Build backend URI with path and query parameters
     let path_and_query = parts
@@ -166,6 +183,9 @@ async fn forward_to_backend(
         backend.port,
         path_and_query
     );
+
+    // Save method for logging before we move parts.method
+    let method_str = parts.method.to_string();
 
     // Build request to backend (preserves method, headers, and body)
     let mut backend_req_builder = Request::builder().method(parts.method).uri(&backend_uri);
@@ -186,6 +206,7 @@ async fn forward_to_backend(
         .body(Full::new(body_bytes))
         .map_err(|e| {
             error!(
+                request_id = %request_id,
                 error.message = %e,
                 error.type = "backend_request_build",
                 backend_uri = %backend_uri,
@@ -194,34 +215,72 @@ async fn forward_to_backend(
             format!("Failed to build backend request: {}", e)
         })?;
 
+    info!(
+        request_id = %request_id,
+        stage = "backend_request_built",
+        network.peer.address = %ipv4_to_string(backend.ipv4),
+        network.peer.port = backend.port,
+        url.full = %backend_uri,
+        http.request.method = %method_str,
+        "Sending request to backend"
+    );
+
     // Send request to backend
+    let backend_connect_start = Instant::now();
     let backend_resp = client.request(backend_req).await.map_err(|e| {
         error!(
+            request_id = %request_id,
             error.message = %e,
             error.type = "backend_connection",
             network.peer.address = %ipv4_to_string(backend.ipv4),
             network.peer.port = backend.port,
+            elapsed_us = backend_connect_start.elapsed().as_micros() as u64,
             "Backend connection failed"
         );
         format!("Backend connection failed: {}", e)
     })?;
 
+    let backend_connect_duration = backend_connect_start.elapsed();
+    let response_status = backend_resp.status().as_u16();
+
+    info!(
+        request_id = %request_id,
+        stage = "backend_response_received",
+        http.response.status_code = response_status,
+        network.peer.address = %ipv4_to_string(backend.ipv4),
+        network.peer.port = backend.port,
+        elapsed_us = backend_connect_duration.as_micros() as u64,
+        "Backend responded"
+    );
+
     // Stream response body from backend
     let (mut parts, body) = backend_resp.into_parts();
+    let response_read_start = Instant::now();
     let body_bytes = body
         .collect()
         .await
         .map_err(|e| {
             error!(
+                request_id = %request_id,
                 error.message = %e,
                 error.type = "backend_response_read",
                 network.peer.address = %ipv4_to_string(backend.ipv4),
                 network.peer.port = backend.port,
+                elapsed_us = response_read_start.elapsed().as_micros() as u64,
                 "Failed to read backend response"
             );
             format!("Failed to read backend response: {}", e)
         })?
         .to_bytes();
+
+    let response_read_duration = response_read_start.elapsed();
+    info!(
+        request_id = %request_id,
+        stage = "backend_response_body_read",
+        body_size_bytes = body_bytes.len(),
+        elapsed_us = response_read_duration.as_micros() as u64,
+        "Response body read complete"
+    );
 
     // Filter out hop-by-hop headers from backend response (RFC 2616 Section 13.5.1)
     let headers_to_remove: Vec<_> = parts
@@ -234,6 +293,20 @@ async fn forward_to_backend(
     for header_name in headers_to_remove {
         parts.headers.remove(header_name);
     }
+
+    let total_duration = request_start.elapsed();
+    info!(
+        request_id = %request_id,
+        stage = "request_complete",
+        http.response.status_code = response_status,
+        network.peer.address = %ipv4_to_string(backend.ipv4),
+        network.peer.port = backend.port,
+        timing.total_us = total_duration.as_micros() as u64,
+        timing.body_read_us = body_read_duration.as_micros() as u64,
+        timing.backend_us = backend_connect_duration.as_micros() as u64,
+        timing.response_read_us = response_read_duration.as_micros() as u64,
+        "Request forwarded successfully"
+    );
 
     Ok(Response::from_parts(parts, Full::new(body_bytes)))
 }
@@ -279,7 +352,24 @@ async fn handle_request(
     router: Arc<Router>,
     client: Client<HttpConnector, Full<Bytes>>,
 ) -> Result<Response<Full<Bytes>>, String> {
+    // Generate or extract request ID
+    let request_id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
     let path = req.uri().path().to_string();
+    let method_name = req.method().as_str();
+
+    info!(
+        request_id = %request_id,
+        stage = "request_received",
+        http.request.method = %method_name,
+        url.path = %path,
+        "Incoming HTTP request"
+    );
 
     // Handle /metrics endpoint (early return, don't record metrics for this)
     if path == "/metrics" && *req.method() == hyper::Method::GET {
@@ -289,7 +379,11 @@ async fn handle_request(
 
         let mut buffer = vec![];
         let encoder = TextEncoder::new();
-        let metric_families = METRICS_REGISTRY.gather();
+
+        // Gather metrics from both registries (proxy + controller)
+        let mut metric_families = METRICS_REGISTRY.gather();
+        let controller_metrics = CONTROLLER_METRICS_REGISTRY.gather();
+        metric_families.extend(controller_metrics);
 
         // Handle encoding failure gracefully
         if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
@@ -330,7 +424,16 @@ async fn handle_request(
 
     match route_match {
         Some(route_match) => {
-            let result = forward_to_backend(req, route_match.backend, client).await;
+            info!(
+                request_id = %request_id,
+                stage = "route_matched",
+                route.pattern = %route_match.pattern,
+                network.peer.address = %ipv4_to_string(route_match.backend.ipv4),
+                network.peer.port = route_match.backend.port,
+                "Route matched, forwarding to backend"
+            );
+
+            let result = forward_to_backend(req, route_match.backend, client, &request_id).await;
             let duration = start.elapsed();
 
             // Record metrics (zero-allocation with static strings)
@@ -356,7 +459,11 @@ async fn handle_request(
                         .observe(duration.as_secs_f64());
 
                     error!(
+                        request_id = %request_id,
                         error.message = %e,
+                        http.request.method = %method_str,
+                        url.path = %path,
+                        route.pattern = %route_pattern,
                         duration_us = duration.as_micros() as u64,
                         "Backend error"
                     );
@@ -378,6 +485,8 @@ async fn handle_request(
                 .observe(duration.as_secs_f64());
 
             warn!(
+                request_id = %request_id,
+                stage = "route_not_found",
                 http.request.method = ?method,
                 url.path = %path,
                 duration_us = duration.as_micros() as u64,
@@ -386,6 +495,7 @@ async fn handle_request(
 
             Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
+                .header("X-Request-ID", request_id)
                 .body(Full::new(Bytes::from("Not Found")))
                 .unwrap())
         }
@@ -1144,6 +1254,84 @@ mod tests {
         assert!(
             body.contains("_count"),
             "Histogram should contain count metric"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_controller_metrics_in_endpoint() {
+        // Record some controller metrics first
+        use crate::apis::metrics::{
+            record_gateway_reconciliation, record_gatewayclass_reconciliation,
+            record_httproute_reconciliation,
+        };
+
+        record_httproute_reconciliation("test-route", "default", 0.123, "success");
+        record_gateway_reconciliation("test-gateway", "default", 0.045, "success");
+        record_gatewayclass_reconciliation("rauta", 0.021, "success");
+
+        // Start proxy server
+        let router = Arc::new(Router::new());
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), router).unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Request metrics endpoint
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build_http::<Full<Bytes>>();
+        let uri: hyper::Uri = format!("http://{}/metrics", proxy_addr).parse().unwrap();
+        let response = client
+            .get(uri)
+            .await
+            .expect("Metrics request should succeed");
+
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+
+        // Collect response body
+        let body_bytes = response.collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body_bytes);
+
+        // Verify controller metrics are present
+        assert!(
+            body.contains("httproute_reconciliation_duration_seconds"),
+            "Should contain HTTPRoute duration metric"
+        );
+        assert!(
+            body.contains("httproute_reconciliations_total"),
+            "Should contain HTTPRoute counter metric"
+        );
+        assert!(
+            body.contains("gateway_reconciliation_duration_seconds"),
+            "Should contain Gateway duration metric"
+        );
+        assert!(
+            body.contains("gateway_reconciliations_total"),
+            "Should contain Gateway counter metric"
+        );
+        assert!(
+            body.contains("gatewayclass_reconciliations_total"),
+            "Should contain GatewayClass counter metric"
+        );
+
+        // Verify metric values contain our test data
+        assert!(
+            body.contains(r#"httproute="test-route""#),
+            "Should contain test HTTPRoute name"
+        );
+        assert!(
+            body.contains(r#"gateway="test-gateway""#),
+            "Should contain test Gateway name"
+        );
+        assert!(
+            body.contains(r#"gatewayclass="rauta""#),
+            "Should contain test GatewayClass name"
         );
     }
 }
