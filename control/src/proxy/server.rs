@@ -4,7 +4,7 @@ use crate::apis::metrics::CONTROLLER_METRICS_REGISTRY;
 use crate::proxy::router::Router;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use hyper::server::conn::http1;
+use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
@@ -102,6 +102,45 @@ impl ProxyServer {
                 });
 
                 let _ = http1::Builder::new().serve_connection(io, service).await;
+            });
+        }
+    }
+
+    /// Start serving HTTP/2 requests
+    #[allow(dead_code)]
+    pub async fn serve_http2(self) -> Result<(), String> {
+        let listener = TcpListener::bind(&self.bind_addr)
+            .await
+            .map_err(|e| format!("Failed to bind to {}: {}", self.bind_addr, e))?;
+
+        let _actual_addr = listener
+            .local_addr()
+            .map_err(|e| format!("Failed to get local addr: {}", e))?;
+
+        info!("HTTP/2 proxy server listening on {}", self.bind_addr);
+
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .map_err(|e| format!("Failed to accept connection: {}", e))?;
+
+            let router = self.router.clone();
+            let client = self.client.clone();
+
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+
+                let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let router = router.clone();
+                    let client = client.clone();
+                    async move { handle_request(req, router, client).await }
+                });
+
+                // Use HTTP/2 connection builder
+                let _ = http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, service)
+                    .await;
             });
         }
     }
@@ -1333,5 +1372,135 @@ mod tests {
             body.contains(r#"gatewayclass="rauta""#),
             "Should contain test GatewayClass name"
         );
+    }
+
+    #[tokio::test]
+    async fn test_http2_server_support() {
+        // This test verifies that the proxy server:
+        // 1. Accepts HTTP/2 connections from clients
+        // 2. Returns 404 for non-existent routes via HTTP/2
+
+        // Create router with no routes
+        let router = crate::proxy::router::Router::new();
+
+        // Start HTTP/2 proxy server
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
+
+        tokio::spawn(async move {
+            let _ = server.serve_http2().await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Make HTTP/2 client request
+        let stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let io = TokioIo::new(stream);
+
+        let (mut request_sender, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+                .await
+                .unwrap();
+
+        // Spawn connection driver
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        // Send HTTP/2 request to non-existent route
+        let req = Request::builder()
+            .uri("/api/test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let response = request_sender.send_request(req).await.unwrap();
+
+        // Should get 404 (no routes configured)
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_http2_forwards_to_http1_backend() {
+        // REFACTOR: Test HTTP/2 client → HTTP/2 proxy → HTTP/1.1 backend
+        // This is the realistic production scenario
+
+        // Start mock HTTP/1.1 backend
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = backend_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+
+            let service = service_fn(|_req: Request<hyper::body::Incoming>| async move {
+                Ok::<_, hyper::Error>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from("Hello from HTTP/1.1 backend")))
+                        .unwrap(),
+                )
+            });
+
+            let _ = http1::Builder::new().serve_connection(io, service).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Create router pointing to HTTP/1.1 backend
+        let router = crate::proxy::router::Router::new();
+        let backend_ip = match backend_addr.ip() {
+            std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
+            _ => panic!("Expected IPv4 address"),
+        };
+        let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
+        router
+            .add_route(HttpMethod::GET, "/api/test", backends)
+            .unwrap();
+
+        // Start HTTP/2 proxy server
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
+
+        tokio::spawn(async move {
+            let _ = server.serve_http2().await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Make HTTP/2 client request
+        let stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let io = TokioIo::new(stream);
+
+        let (mut request_sender, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+                .await
+                .unwrap();
+
+        // Spawn connection driver
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        // Send HTTP/2 request
+        let req = Request::builder()
+            .uri("/api/test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let response = request_sender.send_request(req).await.unwrap();
+
+        // Verify response
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        assert_eq!(body, "Hello from HTTP/1.1 backend");
     }
 }
