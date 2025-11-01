@@ -59,6 +59,7 @@ impl Default for ControllerConfig {
 impl ControllerConfig {
     /// Load configuration from environment variables
     /// TODO: Integrate `from_env()` into main configuration loading flow when environment-based config is required.
+    #[allow(dead_code)]
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
         let mut config = Self::default();
 
