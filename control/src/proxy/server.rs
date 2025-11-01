@@ -55,7 +55,7 @@ lazy_static! {
     };
 }
 
-use crate::proxy::backend_pool::{BackendConnectionPools, PoolError};
+use crate::proxy::backend_pool::{gather_pool_metrics, BackendConnectionPools, PoolError};
 
 /// Production-grade HTTP/2 backend connection pools
 /// NOTE: Arc<Mutex> is temporary until Stage 2 per-core workers
@@ -515,12 +515,12 @@ async fn handle_request(
         let mut buffer = vec![];
         let encoder = TextEncoder::new();
 
-        // Gather metrics from both registries (proxy + controller)
+        // Gather metrics from all registries (proxy + controller + HTTP/2 pool)
         let mut metric_families = METRICS_REGISTRY.gather();
         let controller_metrics = CONTROLLER_METRICS_REGISTRY.gather();
         metric_families.extend(controller_metrics);
 
-        // Handle encoding failure gracefully
+        // Encode proxy + controller metrics
         if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
             error!("Failed to encode metrics: {}", e);
             return Ok(Response::builder()
@@ -531,6 +531,13 @@ async fn handle_request(
                     e
                 ))))
                 .unwrap());
+        }
+
+        // Append HTTP/2 pool metrics
+        if let Ok(pool_metrics_text) = gather_pool_metrics() {
+            buffer.extend_from_slice(pool_metrics_text.as_bytes());
+        } else {
+            warn!("Failed to gather HTTP/2 pool metrics");
         }
 
         return Ok(Response::builder()
