@@ -39,12 +39,20 @@ pub struct Router {
 impl Router {
     /// Create new router
     pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for Router {
+    fn default() -> Self {
         Self {
             routes: Arc::new(RwLock::new(HashMap::new())),
             prefix_router: Arc::new(RwLock::new(matchit::Router::new())),
         }
     }
+}
 
+impl Router {
     /// Add or update route with backends (idempotent)
     ///
     /// If the route already exists with the same backends, this is a no-op.

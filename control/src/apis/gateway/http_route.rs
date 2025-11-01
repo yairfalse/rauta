@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 /// HTTPRoute reconciler
+#[allow(dead_code)] // Used in K8s mode
 pub struct HTTPRouteReconciler {
     client: Client,
     router: Arc<Router>,
@@ -24,6 +25,7 @@ pub struct HTTPRouteReconciler {
     gateway_name: String,
 }
 
+#[allow(dead_code)] // Used in K8s mode
 impl HTTPRouteReconciler {
     pub fn new(client: Client, router: Arc<Router>, gateway_name: String) -> Self {
         Self {
@@ -314,6 +316,7 @@ impl HTTPRouteReconciler {
 }
 
 /// Parse EndpointSlice into Backend structs
+#[allow(dead_code)] // Used in K8s mode
 fn parse_endpointslice_to_backends(
     endpoint_slice: &k8s_openapi::api::discovery::v1::EndpointSlice,
     target_port: u16,
