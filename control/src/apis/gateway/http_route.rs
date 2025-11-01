@@ -45,47 +45,31 @@ impl HTTPRouteReconciler {
         }
     }
 
-    /// Resolve Service name to Pod IPs via Kubernetes Endpoints API
+    /// Resolve Service name to Pod IPs via Kubernetes EndpointSlice API
     async fn resolve_service_endpoints(
         &self,
         service_name: &str,
         namespace: &str,
         _service_port: u32,
     ) -> Result<Vec<Backend>, kube::Error> {
-        use k8s_openapi::api::core::v1::Endpoints;
+        use k8s_openapi::api::discovery::v1::EndpointSlice;
+        use kube::api::ListParams;
 
-        let endpoints_api: Api<Endpoints> = Api::namespaced(self.client.clone(), namespace);
+        let endpointslice_api: Api<EndpointSlice> = Api::namespaced(self.client.clone(), namespace);
 
-        match endpoints_api.get(service_name).await {
-            Ok(endpoints) => {
+        // List all EndpointSlices for this Service
+        // EndpointSlices are labeled with kubernetes.io/service-name
+        let list_params =
+            ListParams::default().labels(&format!("kubernetes.io/service-name={}", service_name));
+
+        match endpointslice_api.list(&list_params).await {
+            Ok(endpointslice_list) => {
                 let mut backends = Vec::new();
 
-                if let Some(subsets) = endpoints.subsets {
-                    for subset in subsets {
-                        // Get the actual Pod port from the Endpoints (not the Service port)
-                        let pod_port = if let Some(ports) = &subset.ports {
-                            ports.first().map(|p| p.port as u16).unwrap_or(80)
-                        } else {
-                            80 // Default to port 80 if not specified
-                        };
-
-                        if let Some(addresses) = subset.addresses {
-                            for address in addresses {
-                                match address.ip.parse::<std::net::Ipv4Addr>() {
-                                    Ok(ipv4) => {
-                                        backends.push(Backend {
-                                            ipv4: u32::from(ipv4),
-                                            port: pod_port,
-                                            weight: 100,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to parse IP address {}: {}", address.ip, e);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                // Merge backends from all EndpointSlices
+                for endpointslice in endpointslice_list.items {
+                    let slice_backends = parse_endpointslice_to_backends(&endpointslice);
+                    backends.extend(slice_backends);
                 }
 
                 if backends.is_empty() {
@@ -95,11 +79,18 @@ impl HTTPRouteReconciler {
                     );
                 }
 
+                info!(
+                    "Resolved service {}/{} to {} backends",
+                    namespace,
+                    service_name,
+                    backends.len()
+                );
+
                 Ok(backends)
             }
             Err(e) => {
                 warn!(
-                    "Failed to get endpoints for service {}/{}: {}",
+                    "Failed to get endpointslices for service {}/{}: {}",
                     namespace, service_name, e
                 );
                 Err(e)
@@ -150,44 +141,48 @@ impl HTTPRouteReconciler {
 
                 // Extract backends
                 if let Some(backend_refs) = &rule.backend_refs {
-                    let backends: Vec<Backend> = backend_refs
-                        .iter()
-                        .map(|backend_ref| {
-                            // TODO: This is TEMPORARY placeholder logic
-                            // Real implementation will resolve Service -> Endpoints -> Pod IPs
-                            // via K8s API (EndpointSlice watcher)
-                            let port = backend_ref.port.unwrap_or(80);
-                            let ip =
-                                format!("10.0.{}.{}", (backend_ref.name.len() % 255), ((port % 254) + 1));
+                    let mut backends = Vec::new();
 
-                            info!(
-                                "  - Backend: {} (resolved to {}:{})",
-                                backend_ref.name, ip, port
-                            );
+                    // Resolve each backend Service to Pod IPs via EndpointSlice
+                    for backend_ref in backend_refs {
+                        let service_name = &backend_ref.name;
+                        let port = backend_ref.port.unwrap_or(80) as u32;
 
-                            let ipv4: std::net::Ipv4Addr = ip
-                                .parse()
-                                .expect(&format!("Failed to parse generated IP address: {}", ip));
-                            Backend {
-                                ipv4: u32::from(ipv4),
-                                port: port as u16,
-                                weight: 100, // Default weight
+                        info!(
+                            "  - Resolving backend Service: {}/{}:{}",
+                            namespace, service_name, port
+                        );
+
+                        // Resolve Service to Pod IPs
+                        match ctx
+                            .resolve_service_endpoints(service_name, &namespace, port)
+                            .await
+                        {
+                            Ok(service_backends) => {
+                                info!("    -> Resolved to {} Pod IPs", service_backends.len());
+                                backends.extend(service_backends);
                             }
                             Err(e) => {
-                                warn!("  - Backend: {} resolution failed: {}", backend_ref.name, e);
-                                // Skip this backend if resolution fails
+                                warn!(
+                                    "Failed to resolve service {}/{}: {}",
+                                    namespace, service_name, e
+                                );
+                                // Continue with other backends even if this one fails
                             }
                         }
                     }
 
                     if !backends.is_empty() {
                         // Add route to router (using GET as default method)
-                        match ctx.router.add_route(HttpMethod::GET, path, backends) {
+                        match ctx
+                            .router
+                            .add_route(HttpMethod::GET, path, backends.clone())
+                        {
                             Ok(_) => {
                                 info!(
-                                    "  - Added route: {} -> {} backends",
+                                    "  - Added route: {} -> {} total backends",
                                     path,
-                                    rule.backend_refs.as_ref().unwrap().len()
+                                    backends.len()
                                 );
                                 routes_added += 1;
                             }
@@ -195,6 +190,11 @@ impl HTTPRouteReconciler {
                                 warn!("Failed to add route {}: {}", path, e);
                             }
                         }
+                    } else {
+                        warn!(
+                            "No backends found for route {} (all services failed to resolve)",
+                            path
+                        );
                     }
                 } else {
                     debug!("Rule {} has no backend refs", rule_idx);
@@ -315,6 +315,52 @@ impl HTTPRouteReconciler {
     }
 }
 
+/// Parse EndpointSlice into Backend structs
+fn parse_endpointslice_to_backends(
+    endpoint_slice: &k8s_openapi::api::discovery::v1::EndpointSlice,
+) -> Vec<Backend> {
+    let mut backends = Vec::new();
+
+    // Get port from EndpointSlice (default to 80 if not specified)
+    let port = if let Some(ports) = &endpoint_slice.ports {
+        ports.first().and_then(|p| p.port).unwrap_or(80) as u16
+    } else {
+        80
+    };
+
+    // Iterate through endpoints
+    for endpoint in &endpoint_slice.endpoints {
+        // Check if endpoint is ready (only use ready endpoints)
+        let is_ready = if let Some(conditions) = &endpoint.conditions {
+            conditions.ready.unwrap_or(false)
+        } else {
+            true // Default to ready if no conditions
+        };
+
+        if !is_ready {
+            continue; // Skip non-ready endpoints
+        }
+
+        // Parse IP addresses
+        for address in &endpoint.addresses {
+            match address.parse::<std::net::Ipv4Addr>() {
+                Ok(ipv4) => {
+                    backends.push(Backend {
+                        ipv4: u32::from(ipv4),
+                        port,
+                        weight: 100, // Default weight
+                    });
+                }
+                Err(e) => {
+                    warn!("Failed to parse IP address {}: {}", address, e);
+                }
+            }
+        }
+    }
+
+    backends
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +442,206 @@ mod tests {
             metrics.contains("httproute_reconciliations_total"),
             "Should contain counter metric"
         );
+    }
+
+    #[test]
+    fn test_endpointslice_to_backends() {
+        // Test parsing EndpointSlice with ready endpoints
+        use k8s_openapi::api::discovery::v1::{Endpoint, EndpointPort, EndpointSlice};
+
+        // Create a mock EndpointSlice with 3 endpoints
+        let endpoint_slice = EndpointSlice {
+            address_type: "IPv4".to_string(),
+            endpoints: vec![
+                Endpoint {
+                    addresses: vec!["10.0.1.1".to_string()],
+                    conditions: None,
+                    deprecated_topology: None,
+                    hints: None,
+                    hostname: None,
+                    node_name: None,
+                    target_ref: None,
+                    zone: None,
+                },
+                Endpoint {
+                    addresses: vec!["10.0.1.2".to_string()],
+                    conditions: None,
+                    deprecated_topology: None,
+                    hints: None,
+                    hostname: None,
+                    node_name: None,
+                    target_ref: None,
+                    zone: None,
+                },
+                Endpoint {
+                    addresses: vec!["10.0.1.3".to_string()],
+                    conditions: None,
+                    deprecated_topology: None,
+                    hints: None,
+                    hostname: None,
+                    node_name: None,
+                    target_ref: None,
+                    zone: None,
+                },
+            ],
+            metadata: Default::default(),
+            ports: Some(vec![EndpointPort {
+                app_protocol: None,
+                name: Some("http".to_string()),
+                port: Some(8080),
+                protocol: Some("TCP".to_string()),
+            }]),
+        };
+
+        // Parse into backends
+        let backends = parse_endpointslice_to_backends(&endpoint_slice);
+
+        // Verify we got 3 backends
+        assert_eq!(backends.len(), 3, "Should have 3 backends");
+
+        // Verify first backend
+        assert_eq!(
+            std::net::Ipv4Addr::from(backends[0].ipv4),
+            "10.0.1.1".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+        assert_eq!(backends[0].port, 8080);
+        assert_eq!(backends[0].weight, 100);
+
+        // Verify second backend
+        assert_eq!(
+            std::net::Ipv4Addr::from(backends[1].ipv4),
+            "10.0.1.2".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+
+        // Verify third backend
+        assert_eq!(
+            std::net::Ipv4Addr::from(backends[2].ipv4),
+            "10.0.1.3".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_endpointslice_filters_not_ready() {
+        // Test that non-ready endpoints are filtered out
+        use k8s_openapi::api::discovery::v1::{
+            Endpoint, EndpointConditions, EndpointPort, EndpointSlice,
+        };
+
+        let endpoint_slice = EndpointSlice {
+            address_type: "IPv4".to_string(),
+            endpoints: vec![
+                Endpoint {
+                    addresses: vec!["10.0.1.1".to_string()],
+                    conditions: Some(EndpointConditions {
+                        ready: Some(true),
+                        serving: Some(true),
+                        terminating: Some(false),
+                    }),
+                    deprecated_topology: None,
+                    hints: None,
+                    hostname: None,
+                    node_name: None,
+                    target_ref: None,
+                    zone: None,
+                },
+                Endpoint {
+                    addresses: vec!["10.0.1.2".to_string()],
+                    conditions: Some(EndpointConditions {
+                        ready: Some(false),
+                        serving: Some(false),
+                        terminating: Some(true),
+                    }),
+                    deprecated_topology: None,
+                    hints: None,
+                    hostname: None,
+                    node_name: None,
+                    target_ref: None,
+                    zone: None,
+                },
+                Endpoint {
+                    addresses: vec!["10.0.1.3".to_string()],
+                    conditions: Some(EndpointConditions {
+                        ready: Some(true),
+                        serving: Some(true),
+                        terminating: Some(false),
+                    }),
+                    deprecated_topology: None,
+                    hints: None,
+                    hostname: None,
+                    node_name: None,
+                    target_ref: None,
+                    zone: None,
+                },
+            ],
+            metadata: Default::default(),
+            ports: Some(vec![EndpointPort {
+                app_protocol: None,
+                name: Some("http".to_string()),
+                port: Some(8080),
+                protocol: Some("TCP".to_string()),
+            }]),
+        };
+
+        let backends = parse_endpointslice_to_backends(&endpoint_slice);
+
+        // Should only get 2 backends (the ready ones)
+        assert_eq!(backends.len(), 2, "Should have 2 ready backends");
+
+        // Verify we got the right IPs (not the not-ready one)
+        let ips: Vec<String> = backends
+            .iter()
+            .map(|b| std::net::Ipv4Addr::from(b.ipv4).to_string())
+            .collect();
+        assert!(ips.contains(&"10.0.1.1".to_string()));
+        assert!(!ips.contains(&"10.0.1.2".to_string())); // Not ready
+        assert!(ips.contains(&"10.0.1.3".to_string()));
+    }
+
+    #[test]
+    fn test_endpointslice_empty() {
+        // Test EndpointSlice with no endpoints
+        use k8s_openapi::api::discovery::v1::{EndpointPort, EndpointSlice};
+
+        let endpoint_slice = EndpointSlice {
+            address_type: "IPv4".to_string(),
+            endpoints: vec![],
+            metadata: Default::default(),
+            ports: Some(vec![EndpointPort {
+                app_protocol: None,
+                name: Some("http".to_string()),
+                port: Some(8080),
+                protocol: Some("TCP".to_string()),
+            }]),
+        };
+
+        let backends = parse_endpointslice_to_backends(&endpoint_slice);
+        assert_eq!(backends.len(), 0, "Should have 0 backends");
+    }
+
+    #[test]
+    fn test_endpointslice_default_port() {
+        // Test EndpointSlice with no port specified
+        use k8s_openapi::api::discovery::v1::{Endpoint, EndpointSlice};
+
+        let endpoint_slice = EndpointSlice {
+            address_type: "IPv4".to_string(),
+            endpoints: vec![Endpoint {
+                addresses: vec!["10.0.1.1".to_string()],
+                conditions: None,
+                deprecated_topology: None,
+                hints: None,
+                hostname: None,
+                node_name: None,
+                target_ref: None,
+                zone: None,
+            }],
+            metadata: Default::default(),
+            ports: None, // No port specified
+        };
+
+        let backends = parse_endpointslice_to_backends(&endpoint_slice);
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].port, 80, "Should default to port 80");
     }
 }
 
