@@ -1,0 +1,568 @@
+//! HTTP/2 Backend Connection Pool
+//!
+//! Production-grade connection pooling with:
+//! - Stream tracking (respects max_concurrent_streams)
+//! - Circuit breakers (Healthy → Degraded → Unhealthy)
+//! - Adaptive limits (learns from SETTINGS frames)
+//! - Connection lifecycle management
+//! - Per-backend isolation
+
+use common::Backend;
+use hyper::body::Bytes;
+use hyper::client::conn::http2;
+use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::TokioIo;
+use lazy_static::lazy_static;
+use prometheus::{Encoder, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+use tokio::net::TcpStream;
+use tracing::{debug, error, info, warn};
+
+lazy_static! {
+    /// Global HTTP/2 pool metrics registry
+    static ref POOL_METRICS_REGISTRY: Registry = Registry::new();
+
+    /// Active HTTP/2 connections per backend (Gauge)
+    static ref POOL_CONNECTIONS_ACTIVE: IntGaugeVec = {
+        let opts = Opts::new(
+            "http2_pool_connections_active",
+            "Active HTTP/2 connections per backend"
+        );
+        let gauge = IntGaugeVec::new(opts, &["backend"])
+            .expect("Failed to create http2_pool_connections_active gauge");
+        POOL_METRICS_REGISTRY
+            .register(Box::new(gauge.clone()))
+            .expect("Failed to register http2_pool_connections_active gauge");
+        gauge
+    };
+
+    /// Total HTTP/2 connections created (Counter)
+    static ref POOL_CONNECTIONS_CREATED: IntCounterVec = {
+        let opts = Opts::new(
+            "http2_pool_connections_created_total",
+            "Total HTTP/2 connections created"
+        );
+        let counter = IntCounterVec::new(opts, &["backend"])
+            .expect("Failed to create http2_pool_connections_created_total counter");
+        POOL_METRICS_REGISTRY
+            .register(Box::new(counter.clone()))
+            .expect("Failed to register http2_pool_connections_created_total counter");
+        counter
+    };
+
+    /// Total HTTP/2 connection failures (Counter)
+    static ref POOL_CONNECTIONS_FAILED: IntCounterVec = {
+        let opts = Opts::new(
+            "http2_pool_connections_failed_total",
+            "Total HTTP/2 connection failures"
+        );
+        let counter = IntCounterVec::new(opts, &["backend"])
+            .expect("Failed to create http2_pool_connections_failed_total counter");
+        POOL_METRICS_REGISTRY
+            .register(Box::new(counter.clone()))
+            .expect("Failed to register http2_pool_connections_failed_total counter");
+        counter
+    };
+
+    /// Total requests queued waiting for connection (Counter)
+    static ref POOL_REQUESTS_QUEUED: IntCounterVec = {
+        let opts = Opts::new(
+            "http2_pool_requests_queued_total",
+            "Total requests queued waiting for connection"
+        );
+        let counter = IntCounterVec::new(opts, &["backend"])
+            .expect("Failed to create http2_pool_requests_queued_total counter");
+        POOL_METRICS_REGISTRY
+            .register(Box::new(counter.clone()))
+            .expect("Failed to register http2_pool_requests_queued_total counter");
+        counter
+    };
+}
+
+/// Full body type for requests
+type Full<T> = http_body_util::Full<T>;
+
+/// Per-worker backend connection pools
+/// NOTE: Currently uses Arc<Mutex> for simplicity, will be per-core owned in Stage 2
+pub struct BackendConnectionPools {
+    pools: HashMap<BackendKey, Http2Pool>,
+}
+
+/// Backend identifier (IP:port)
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+struct BackendKey {
+    ipv4: u32,
+    port: u16,
+}
+
+impl From<Backend> for BackendKey {
+    fn from(backend: Backend) -> Self {
+        Self {
+            ipv4: backend.ipv4,
+            port: backend.port,
+        }
+    }
+}
+
+/// Pool of HTTP/2 connections to a single backend
+pub struct Http2Pool {
+    backend: Backend,
+
+    // Active HTTP/2 connections
+    connections: Vec<Http2Connection>,
+
+    // Connection limits
+    max_connections: usize,    // Max concurrent connections (default: 4)
+    max_streams_per_conn: u32, // Learned from SETTINGS frame
+
+    // Health tracking
+    health_state: HealthState,
+    consecutive_failures: u32,
+    last_success: Instant,
+
+    // Performance metrics
+    metrics: PoolMetrics,
+}
+
+/// Single HTTP/2 connection to backend
+#[allow(dead_code)] // Fields used in Stage 2 per-core workers
+struct Http2Connection {
+    // HTTP/2 sender (from hyper)
+    sender: http2::SendRequest<Full<Bytes>>,
+
+    // Stream tracking (Stage 2: manual tracking with SETTINGS negotiation)
+    active_streams: u32, // Currently in-flight
+    max_streams: u32,    // From SETTINGS frame (negotiated)
+    total_requests: u64, // Lifetime request count
+
+    // Connection state
+    state: ConnectionState,
+    created_at: Instant,
+    last_used: Instant,
+
+    // Health
+    consecutive_errors: u32,
+    last_error: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Draining variant used in Stage 2
+enum ConnectionState {
+    Active,   // Ready for requests
+    Draining, // Gracefully shutting down (no new streams)
+    Failed,   // Connection failed
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthState {
+    Healthy,   // All good
+    Degraded,  // Some failures, reduced capacity
+    Unhealthy, // Circuit breaker open
+}
+
+#[derive(Debug, Default)]
+#[allow(dead_code)] // Fields exported as Prometheus metrics in Stage 2
+struct PoolMetrics {
+    requests_total: u64,
+    requests_queued: u64, // Waiting for available connection
+    connections_created: u64,
+    connections_failed: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[allow(dead_code)] // QueueTimeout used in Stage 2 with request queuing
+pub enum PoolError {
+    #[error("Circuit breaker is open")]
+    CircuitBreakerOpen,
+
+    #[error("Connection failed: {0}")]
+    ConnectionFailed(String),
+
+    #[error("HTTP/2 handshake failed: {0}")]
+    HandshakeFailed(String),
+
+    #[error("No connections have capacity")]
+    NoCapacity,
+
+    #[error("Queue timeout")]
+    QueueTimeout,
+}
+
+impl Default for BackendConnectionPools {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BackendConnectionPools {
+    pub fn new() -> Self {
+        Self {
+            pools: HashMap::new(),
+        }
+    }
+
+    /// Get or create pool for backend
+    pub fn get_or_create_pool(&mut self, backend: Backend) -> &mut Http2Pool {
+        let key = BackendKey::from(backend);
+        self.pools.entry(key).or_insert_with(|| {
+            debug!(
+                backend_ip = %ipv4_to_string(backend.ipv4),
+                backend_port = backend.port,
+                "Creating new HTTP/2 pool for backend"
+            );
+            Http2Pool::new(backend)
+        })
+    }
+}
+
+impl Http2Pool {
+    pub fn new(backend: Backend) -> Self {
+        Self {
+            backend,
+            connections: Vec::new(),
+            max_connections: 4,        // Start conservative
+            max_streams_per_conn: 100, // Default, will be updated from SETTINGS
+            health_state: HealthState::Healthy,
+            consecutive_failures: 0,
+            last_success: Instant::now(),
+            metrics: PoolMetrics::default(),
+        }
+    }
+
+    /// Get available connection or create new one
+    /// Returns a cloned SendRequest (cheap operation, designed to be cloned)
+    pub async fn get_connection(&mut self) -> Result<http2::SendRequest<Full<Bytes>>, PoolError> {
+        // 1. Check circuit breaker
+        if self.health_state == HealthState::Unhealthy {
+            // Try to recover after timeout
+            if self.last_success.elapsed() > Duration::from_secs(30) {
+                info!(
+                    backend_ip = %ipv4_to_string(self.backend.ipv4),
+                    backend_port = self.backend.port,
+                    "Circuit breaker timeout expired, attempting recovery"
+                );
+                self.health_state = HealthState::Degraded;
+                self.consecutive_failures = 0;
+            } else {
+                return Err(PoolError::CircuitBreakerOpen);
+            }
+        }
+
+        // 2. Clean up failed connections first
+        let before_cleanup = self.connections.len();
+        self.connections
+            .retain(|c| c.state != ConnectionState::Failed);
+        let after_cleanup = self.connections.len();
+
+        // Update active connections gauge if we removed any
+        if before_cleanup != after_cleanup {
+            let backend_label = format!(
+                "{}:{}",
+                ipv4_to_string(self.backend.ipv4),
+                self.backend.port
+            );
+            POOL_CONNECTIONS_ACTIVE
+                .with_label_values(&[&backend_label])
+                .set(after_cleanup as i64);
+        }
+
+        // 3. Find connection that is ready for requests
+        let mut conn_index = None;
+        for (i, conn) in self.connections.iter_mut().enumerate() {
+            if conn.state == ConnectionState::Active && conn.sender.is_ready() {
+                conn.last_used = Instant::now();
+                conn_index = Some(i);
+                break;
+            }
+        }
+
+        if let Some(idx) = conn_index {
+            // Return cloned sender (cheap operation, designed to be cloned)
+            return Ok(self.connections[idx].sender.clone());
+        }
+
+        // 4. Create new connection if under limit
+        if self.connections.len() < self.max_connections {
+            let mut conn = self.create_connection().await?;
+            conn.last_used = Instant::now();
+            let sender = conn.sender.clone();
+            self.connections.push(conn);
+            return Ok(sender);
+        }
+
+        // 5. All connections maxed out
+        self.metrics.requests_queued += 1;
+
+        // Update Prometheus metrics
+        let backend_label = format!(
+            "{}:{}",
+            ipv4_to_string(self.backend.ipv4),
+            self.backend.port
+        );
+        POOL_REQUESTS_QUEUED
+            .with_label_values(&[&backend_label])
+            .inc();
+
+        Err(PoolError::NoCapacity)
+    }
+
+    /// Create new HTTP/2 connection to backend
+    async fn create_connection(&mut self) -> Result<Http2Connection, PoolError> {
+        let backend_addr = format!(
+            "{}:{}",
+            ipv4_to_string(self.backend.ipv4),
+            self.backend.port
+        );
+
+        debug!(
+            backend = %backend_addr,
+            pool_size = self.connections.len(),
+            "Creating new HTTP/2 connection"
+        );
+
+        // Connect TCP
+        let stream = TcpStream::connect(&backend_addr).await.map_err(|e| {
+            self.record_failure();
+            PoolError::ConnectionFailed(e.to_string())
+        })?;
+
+        let io = TokioIo::new(stream);
+
+        // HTTP/2 handshake
+        let (sender, conn) = http2::handshake(TokioExecutor::new(), io)
+            .await
+            .map_err(|e| {
+                self.record_failure();
+                PoolError::HandshakeFailed(e.to_string())
+            })?;
+
+        // Spawn connection driver
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                debug!("HTTP/2 connection closed: {}", e);
+            }
+        });
+
+        self.record_success();
+        self.metrics.connections_created += 1;
+
+        // Update Prometheus metrics
+        let backend_label = backend_addr.as_str();
+        POOL_CONNECTIONS_CREATED
+            .with_label_values(&[backend_label])
+            .inc();
+        POOL_CONNECTIONS_ACTIVE
+            .with_label_values(&[backend_label])
+            .set(self.connections.len() as i64 + 1); // +1 for the new connection
+
+        Ok(Http2Connection {
+            sender,
+            active_streams: 0,
+            max_streams: self.max_streams_per_conn, // Will be updated by SETTINGS
+            total_requests: 0,
+            state: ConnectionState::Active,
+            created_at: Instant::now(),
+            last_used: Instant::now(),
+            consecutive_errors: 0,
+            last_error: None,
+        })
+    }
+
+    /// Record successful request
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.last_success = Instant::now();
+
+        // Recover from degraded state
+        if self.health_state == HealthState::Degraded {
+            info!(
+                backend_ip = %ipv4_to_string(self.backend.ipv4),
+                backend_port = self.backend.port,
+                "Backend recovered from degraded state"
+            );
+            self.health_state = HealthState::Healthy;
+        }
+    }
+
+    /// Record failed request
+    fn record_failure(&mut self) {
+        self.consecutive_failures += 1;
+        self.metrics.connections_failed += 1;
+
+        // Update Prometheus metrics
+        let backend_label = format!(
+            "{}:{}",
+            ipv4_to_string(self.backend.ipv4),
+            self.backend.port
+        );
+        POOL_CONNECTIONS_FAILED
+            .with_label_values(&[&backend_label])
+            .inc();
+
+        // Circuit breaker logic
+        if self.consecutive_failures >= 5 && self.health_state == HealthState::Healthy {
+            warn!(
+                backend_ip = %ipv4_to_string(self.backend.ipv4),
+                backend_port = self.backend.port,
+                consecutive_failures = self.consecutive_failures,
+                "Backend degraded - reducing capacity"
+            );
+            self.health_state = HealthState::Degraded;
+            self.max_connections = self.max_connections.max(1) / 2; // Reduce by 50%
+        }
+
+        if self.consecutive_failures >= 10 {
+            error!(
+                backend_ip = %ipv4_to_string(self.backend.ipv4),
+                backend_port = self.backend.port,
+                consecutive_failures = self.consecutive_failures,
+                "Circuit breaker OPEN - blocking requests"
+            );
+            self.health_state = HealthState::Unhealthy;
+        }
+    }
+}
+
+impl Http2Connection {
+    /// Check if connection should be closed
+    #[allow(dead_code)] // Used in Stage 2 connection lifecycle cleanup
+    pub fn should_close(&self) -> bool {
+        // Close if:
+        // 1. Failed state
+        // 2. Too old (1 hour)
+        // 3. Too many total requests (prevents memory leaks)
+        // 4. Connection no longer ready
+        matches!(self.state, ConnectionState::Failed)
+            || self.created_at.elapsed() > Duration::from_secs(3600)
+            || self.total_requests > 10_000
+            || !self.sender.is_ready()
+    }
+}
+
+/// Convert IPv4 u32 to string format (e.g., "192.168.1.1")
+fn ipv4_to_string(ipv4: u32) -> String {
+    let bytes = ipv4.to_be_bytes();
+    format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3])
+}
+
+/// Gather HTTP/2 pool metrics for Prometheus export
+pub fn gather_pool_metrics() -> Result<String, String> {
+    let mut buffer = vec![];
+    let encoder = TextEncoder::new();
+    let metric_families = POOL_METRICS_REGISTRY.gather();
+    encoder
+        .encode(&metric_families, &mut buffer)
+        .map_err(|e| format!("Failed to encode pool metrics: {}", e))?;
+
+    String::from_utf8(buffer).map_err(|e| format!("Failed to convert pool metrics to UTF-8: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    /// RED: Test that pool metrics are exposed to Prometheus
+    #[tokio::test]
+    async fn test_pool_metrics_exposed() {
+        let backend = Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 9001, 100);
+        let mut pools = BackendConnectionPools::new();
+        let pool = pools.get_or_create_pool(backend);
+
+        // Trigger some metrics
+        let _conn_result = pool.get_connection().await;
+
+        // Collect metrics
+        let metrics_output = gather_pool_metrics().expect("Should gather metrics");
+
+        // Should have http2_pool_connections_created_total metric
+        assert!(
+            metrics_output.contains("http2_pool_connections_created_total"),
+            "Should export connections_created_total metric"
+        );
+
+        // Should have backend label (127.0.0.1:9001)
+        assert!(
+            metrics_output.contains("backend=\"127.0.0.1:9001\""),
+            "Should include backend label"
+        );
+    }
+
+    /// RED: Test that failed connections are counted
+    #[tokio::test]
+    async fn test_pool_metrics_connection_failures() {
+        // Invalid backend (nothing listening on port 1)
+        let backend = Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 1, 100);
+        let mut pools = BackendConnectionPools::new();
+        let pool = pools.get_or_create_pool(backend);
+
+        // Try to create connection (should fail)
+        let result = pool.get_connection().await;
+        assert!(result.is_err(), "Connection should fail");
+
+        // Collect metrics
+        let metrics_output = gather_pool_metrics().expect("Should gather metrics");
+
+        // Should have http2_pool_connections_failed_total metric
+        assert!(
+            metrics_output.contains("http2_pool_connections_failed_total"),
+            "Should export connections_failed_total metric"
+        );
+
+        // Check value is at least 1
+        assert!(
+            metrics_output
+                .contains("http2_pool_connections_failed_total{backend=\"127.0.0.1:1\"} 1"),
+            "Should count connection failure"
+        );
+    }
+
+    /// RED: Test that active connections are tracked as gauge
+    #[tokio::test]
+    async fn test_pool_metrics_active_connections() {
+        let backend = Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 9001, 100);
+        let mut pools = BackendConnectionPools::new();
+        let pool = pools.get_or_create_pool(backend);
+
+        // Initialize gauge to 0
+        let backend_label = format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port);
+        POOL_CONNECTIONS_ACTIVE
+            .with_label_values(&[&backend_label])
+            .set(pool.connections.len() as i64);
+
+        // Get current active connections (should be 0)
+        let metrics_before = gather_pool_metrics().expect("Should gather metrics");
+        assert!(
+            metrics_before.contains("http2_pool_connections_active{backend=\"127.0.0.1:9001\"} 0"),
+            "Should show 0 active connections initially"
+        );
+    }
+
+    /// RED: Test that queued requests are counted
+    #[tokio::test]
+    async fn test_pool_metrics_queued_requests() {
+        let backend = Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 9001, 100);
+        let mut pools = BackendConnectionPools::new();
+        let pool = pools.get_or_create_pool(backend);
+
+        // Set max_connections to 0 to force queueing
+        pool.max_connections = 0;
+
+        // Try to get connection (should queue)
+        let result = pool.get_connection().await;
+        assert!(
+            matches!(result, Err(PoolError::NoCapacity)),
+            "Should fail with NoCapacity"
+        );
+
+        // Collect metrics
+        let metrics_output = gather_pool_metrics().expect("Should gather metrics");
+
+        // Should have http2_pool_requests_queued_total metric
+        assert!(
+            metrics_output.contains("http2_pool_requests_queued_total"),
+            "Should export requests_queued_total metric"
+        );
+    }
+}

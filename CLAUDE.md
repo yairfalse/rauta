@@ -1,78 +1,73 @@
-# RAUTA: Kubernetes Gateway API Controller + eBPF Observability
+# RAUTA: Kubernetes Gateway API Controller with WASM Plugins
 
-**RAUTA = Iron-clad routing with deep visibility** ⚡🦀
+**RAUTA = Iron-clad routing with safe extensibility**
 
 ---
 
-## ⚠️ CRITICAL: Project Nature
+## CRITICAL: Project Nature
 
 **THIS IS A PRODUCTION-FOCUSED LEARNING PROJECT**
-- **Goal**: Build a production-ready K8s Gateway API controller with unique eBPF observability
-- **Language**: 100% Rust (userspace) + eBPF (observability)
-- **Status**: 🚧 Stage 1 COMPLETE ✅ | Stage 2 NEXT
+- **Goal**: Build a production-ready K8s Gateway API controller with WASM plugin extensibility
+- **Language**: 100% Rust (userspace) + WASM (plugins)
+- **Status**: Stage 1 COMPLETE (Gateway API controller) | Stage 2 NEXT (WASM plugins)
 - **Approach**: Ship working software, learn by building, validate with research
 
 ---
 
-## 🎯 PROJECT MISSION
+## PROJECT MISSION
 
-**Mission**: Build the fastest, most observable Kubernetes Gateway API controller using Rust + eBPF
+**Mission**: Build a Kubernetes Gateway API controller that developers can safely extend with WASM plugins
 
-**The Three Use Cases:**
+**Core Value Proposition:**
 
-1. **Ingress Controller** (Stage 1 - DONE ✅)
-   - Modern Gateway API native L7 routing
-   - Maglev load balancing, Prometheus metrics
-   - Validated in kind cluster
+**"Gateway API routing you can extend with WASM plugins - like Kong, but safer"**
 
-2. **Observability Layer** (Stage 2 - NEXT)
-   - Deep HTTP insights via eBPF (XDP observation mode)
-   - Detect slow responses, 5xx spikes, probe failures
-   - Complements TAPIO in false-systems platform
+**The Differentiator: WASM Plugins**
+- Kong uses Lua plugins (can crash the gateway)
+- Envoy uses C++ filters (dangerous to write, requires recompilation)
+- RAUTA uses WASM plugins (sandboxed, multi-language, hot-reload)
 
-3. **Service Mesh Without Sidecars** (Stage 3 - FUTURE)
-   - Transparent proxy using eBPF sockops
-   - 30% latency reduction (Cilium validates)
-   - No sidecar overhead
+**Why This Matters:**
+- Write plugins in ANY language (Rust, Go, TypeScript, C++)
+- Cannot crash the gateway (sandboxed execution)
+- Hot-reload without downtime
+- Built-in rate limiting (CPU, memory per plugin)
 
 **Core Philosophy:**
-- **eBPF captures, userspace parses** (Brendan Gregg principle)
 - **Rust for safety and performance** (Cloudflare Pingora validates this)
 - **Gateway API native** (no legacy Ingress baggage)
+- **WASM for extensibility** (safe, fast, multi-language)
 - **Research-backed decisions** (HTTP/2 > HTTP/3, io_uring, skip DPDK)
 
 ---
 
-## 🏗️ ARCHITECTURE PHILOSOPHY
+## ARCHITECTURE PHILOSOPHY
 
-### The Consolidated Vision
+### The Vision
 
-**RAUTA combines three capabilities:**
+**RAUTA is a Gateway API controller with three layers:**
 
 ```
 ┌────────────────────────────────────────────────────────┐
 │                RAUTA Architecture                       │
 ├────────────────────────────────────────────────────────┤
 │                                                        │
-│  Observability Layer (eBPF - Stage 2)                  │
+│  WASM Plugin Layer (Stage 2 - NEXT)                    │
 │  ┌──────────────────────────────────────────────────┐ │
-│  │  XDP Program (observation mode)                  │ │
-│  │  - Parse HTTP requests/responses                 │ │
-│  │  - Track latency, errors                         │ │
-│  │  - Send to ring buffer                           │ │
-│  │  - ALWAYS return XDP_PASS ✅                     │ │
-│  └────────────────┬─────────────────────────────────┘ │
-│                   │ Ring Buffer                        │
-│                   ▼                                    │
-│  ┌──────────────────────────────────────────────────┐ │
-│  │  Processors (TAPIO pattern)                      │ │
-│  │  - SlowResponseProcessor                         │ │
-│  │  - ErrorRateProcessor                            │ │
-│  │  - HealthCheckProcessor                          │ │
-│  └────────────────┬─────────────────────────────────┘ │
-│                   │                                    │
-│                   ▼                                    │
-│  Control + Data Plane (Rust - Stage 1 DONE ✅)        │
+│  │  Plugin Runtime (wasmtime)                       │ │
+│  │  - Request/Response hooks                        │ │
+│  │  - Plugin SDK (Rust, Go, TypeScript)             │ │
+│  │  - Hot-reload support                            │ │
+│  │  - CPU/memory limits per plugin                  │ │
+│  │                                                  │ │
+│  │  Built-in Plugins                                │ │
+│  │  - JWT authentication                            │ │
+│  │  - CORS handling                                 │ │
+│  │  - Rate limiting                                 │ │
+│  │  - Request transformation                        │ │
+│  └──────────────────────────────────────────────────┘ │
+│                                                        │
+│  Gateway Core (Rust - Stage 1 DONE)                    │
 │  ┌──────────────────────────────────────────────────┐ │
 │  │  Gateway API Controllers                         │ │
 │  │  - GatewayClass, Gateway, HTTPRoute              │ │
@@ -92,47 +87,90 @@
 ```
 
 **Why This Architecture:**
-- **XDP observability** - Sees packets BEFORE kernel TCP stack (true latency)
-- **Userspace L7** - Full HTTP/2, TLS, complex routing
+- **Userspace L7** - Full HTTP/2, TLS, complex routing (not eBPF)
+- **WASM plugins** - Safe extensibility without gateway crashes
 - **Gateway API** - Modern K8s standard (not legacy Ingress)
-- **false-systems integration** - RAUTA → TAPIO → AHTI → URPO
+- **Rust core** - Memory safety, performance, zero-cost abstractions
+
+**What We Learned from "Learning eBPF" (Liz Rice):**
+- XDP operates on raw packets BEFORE TCP reassembly
+- XDP cannot parse HTTP/2, TLS, or complex protocols
+- Even Cilium uses Envoy for L7 HTTP parsing (not eBPF)
+- eBPF is excellent for L3/L4, NOT for L7 application logic
+- Conclusion: HTTP routing belongs in userspace, NOT in XDP
 
 ---
 
-## 🦀 RUST + AYA REQUIREMENTS
+## RUST + WASM REQUIREMENTS
 
 ### Language Requirements
 - **THIS IS A RUST PROJECT** - All userspace code in Rust
-- **eBPF Code**: Aya-RS (Rust eBPF framework)
+- **WASM for Plugins**: wasmtime runtime (Rust-based)
 - **NO GO CODE** - Unlike Cilium's Go control plane, we use Rust everywhere
 - **STRONG TYPING ONLY** - No `Box<dyn Any>` or runtime type checking
 
-### Aya Framework Patterns
+### WASM Plugin Pattern
 
 ```rust
-// ✅ Load XDP program for observation (Stage 2)
-use aya::{Bpf, programs::Xdp};
+// Loading and running WASM plugins
+use wasmtime::*;
 
-let mut bpf = Bpf::load(include_bytes_aligned!(
-    "../../target/bpfel-unknown-none/release/rauta-observer"
-))?;
+pub struct PluginRuntime {
+    engine: Engine,
+    plugins: HashMap<String, Plugin>,
+}
 
-let program: &mut Xdp = bpf.program_mut("rauta_observe")?.try_into()?;
-program.load()?;
-program.attach("eth0", XdpFlags::SKB_MODE)?;  // Observation mode
+pub struct Plugin {
+    instance: Instance,
+    on_request: TypedFunc<(u32, u32), u32>,  // (request_ptr, request_len) -> decision
+    on_response: TypedFunc<(u32, u32), u32>,
+}
 
-// ✅ Access ring buffer events
-use aya::maps::RingBuf;
+impl PluginRuntime {
+    pub async fn load_plugin(&mut self, name: &str, wasm_bytes: &[u8]) -> Result<()> {
+        let module = Module::new(&self.engine, wasm_bytes)?;
+        let mut store = Store::new(&self.engine, ());
 
-let mut ring_buf = RingBuf::try_from(bpf.map_mut("EVENTS")?)?;
+        // Create instance with memory limits
+        let instance = Instance::new(&mut store, &module, &[])?;
 
-while let Some(event) = ring_buf.next() {
-    let http_event: HttpRequestEvent = unsafe {
-        std::ptr::read(event.as_ptr() as *const HttpRequestEvent)
-    };
+        // Get exported functions
+        let on_request = instance
+            .get_typed_func::<(u32, u32), u32>(&mut store, "on_request")?;
+        let on_response = instance
+            .get_typed_func::<(u32, u32), u32>(&mut store, "on_response")?;
 
-    // Process event in Rust (not eBPF!)
-    process_http_event(http_event).await;
+        self.plugins.insert(name.to_string(), Plugin {
+            instance,
+            on_request,
+            on_response,
+        });
+
+        Ok(())
+    }
+
+    pub async fn run_request_plugins(&self, req: &Request) -> PluginDecision {
+        for plugin in self.plugins.values() {
+            // Serialize request to plugin memory
+            let req_bytes = serialize_request(req);
+
+            // Call plugin (with timeout and resource limits)
+            let decision = plugin.on_request.call(&mut store,
+                (req_ptr, req_len))?;
+
+            match decision {
+                PLUGIN_CONTINUE => continue,
+                PLUGIN_REJECT => return PluginDecision::Reject,
+                PLUGIN_MODIFY => {
+                    // Read modified request from plugin memory
+                    let modified_req = deserialize_request(&plugin_memory);
+                    *req = modified_req;
+                }
+            }
+        }
+
+        PluginDecision::Allow
+    }
 }
 ```
 
@@ -140,7 +178,7 @@ while let Some(event) = ring_buf.next() {
 
 ---
 
-## 🧪 TDD Workflow (RED → GREEN → REFACTOR)
+## TDD Workflow (RED → GREEN → REFACTOR)
 
 **MANDATORY**: All code must follow strict Test-Driven Development
 
@@ -177,7 +215,7 @@ async fn test_gateway_route_idempotency() {
 
 // Step 2: Verify test FAILS
 // $ cargo test
-// # test_gateway_route_idempotency ... FAILED ✅ RED phase confirmed
+// # test_gateway_route_idempotency ... FAILED (RED phase confirmed)
 ```
 
 ### GREEN Phase: Minimal Implementation
@@ -224,7 +262,7 @@ impl Router {
 
 // Step 4: Verify tests PASS
 // $ cargo test
-// # test_gateway_route_idempotency ... ok ✅ GREEN phase confirmed
+// # test_gateway_route_idempotency ... ok (GREEN phase confirmed)
 ```
 
 ### REFACTOR Phase: Improve Code Quality
@@ -259,7 +297,7 @@ impl Router {
 
 // Step 7: Verify tests still PASS after refactor
 // $ cargo test
-// # All tests ... ok ✅ REFACTOR complete
+// # All tests ... ok (REFACTOR complete)
 ```
 
 ### TDD Checklist
@@ -275,85 +313,89 @@ impl Router {
 **Example Session:**
 ```bash
 # Router idempotency (TDD - 3 commits)
-1. RED:   Write test_gateway_route_idempotency → FAIL ✅
-2. GREEN: Implement idempotent add_route → PASS ✅
+1. RED:   Write test_gateway_route_idempotency → FAIL
+2. GREEN: Implement idempotent add_route → PASS
 3. COMMIT: git commit -m "feat: add router idempotency for K8s reconciliation"
 
 # Add update test (TDD - 2 commits)
-1. RED:   Write test_router_update_route_backends → FAIL ✅
-2. GREEN: Fix backend comparison logic → PASS ✅
+1. RED:   Write test_router_update_route_backends → FAIL
+2. GREEN: Fix backend comparison logic → PASS
 3. COMMIT: git commit -m "fix: handle backend updates in router"
 ```
 
 ---
 
-## 🔥 PERFORMANCE REQUIREMENTS
+## PERFORMANCE REQUIREMENTS
 
 ### Target: Production-Ready L7 Performance
 
 **Current (Stage 1):**
-- ✅ ~10,000 rps baseline (validated)
-- ✅ ~55ns metrics overhead (0.0016% of latency)
-- ✅ Maglev O(1) backend selection
+- ~10,000 rps baseline (validated)
+- ~55ns metrics overhead (0.0016% of latency)
+- Maglev O(1) backend selection
 
 **Research-Backed Roadmap:**
 
 From **cutting-edge-research-2024-2025.md**:
 
-**Stage 2: HTTP/2 Support**
-- ✅ Stick with HTTP/2 (ACM 2024: HTTP/3 is 45% slower!)
-- ✅ Multiplexing, header compression
-- Expected: 5x throughput → 50,000 rps
+**Month 1-2: Production-Ready Gateway**
+- EndpointSlice resolution (dynamic backends)
+- HTTP/2 support (ACM 2024: HTTP/3 is 45% slower)
+- TLS termination with rustls
+- Basic rate limiting and circuit breakers
+- DaemonSet deployment model
+- Expected: 50,000+ rps
 
-**Stage 3: io_uring Backend**
-- ✅ Zero-copy splice/sendfile (Kernel Recipes 2024)
-- ✅ +31-43% throughput improvement → 70,000+ rps
-- Linux 5.7+ requirement (acceptable)
-- Implementation: tokio-uring crate
+**Month 3-4: WASM Plugin System (THE DIFFERENTIATOR)**
+- wasmtime runtime integration
+- Plugin SDK (Rust, Go, TypeScript bindings)
+- Built-in plugins (JWT, CORS, rate-limit)
+- Hot-reload and resource limits
+- Expected: 40,000+ rps (with plugins enabled)
 
-**Stage 4: eBPF Sockmap** (Service Mesh Mode)
-- ✅ 30% latency reduction (Cilium validates)
-- ✅ Bypass kernel TCP stack for pod-to-pod
-- Used by: Cilium, Istio in production
+**Month 5-6: Performance Optimization**
+- io_uring backend (Kernel Recipes 2024: +31-43% throughput)
+- Zero-copy splice/sendfile
+- Expected: 70,000+ rps
 
 **Decisions NOT to Implement:**
-- ❌ HTTP/3: Research proves it's 45% slower than HTTP/2 (ACM 2024)
-- ❌ DPDK: L7 bottleneck is HTTP parsing, not network (F-Stack research)
+- HTTP/3: Research proves it's 45% slower than HTTP/2 (ACM 2024)
+- DPDK: L7 bottleneck is HTTP parsing, not network (F-Stack research)
+- XDP HTTP parsing: Impossible for HTTP/2, TLS (Learning eBPF validates)
 
 **Expected Final Performance:**
 ```
 Baseline (Stage 1):     ~10,000 rps
-+ Streaming:            → 50,000 rps
-+ HTTP/2:               → 100,000 rps
-+ io_uring:             → 140,000 rps
-+ eBPF sockmap:         → 180,000 rps (service mesh mode)
++ HTTP/2:               → 50,000 rps
++ WASM plugins:         → 40,000 rps (20% overhead acceptable)
++ io_uring:             → 60,000 rps
 ```
 
 ### Performance Patterns
 
 ```rust
-// ✅ Zero-allocation strings (Arc<str>)
+// Zero-allocation strings (Arc<str>)
 struct Route {
     pattern: Arc<str>,  // 5ns clone vs 50ns for String
     backends: Vec<Backend>,
     maglev_table: Vec<u8>,
 }
 
-// ✅ Static string helpers
+// Static string helpers
 fn method_to_str(method: &HttpMethod) -> &'static str {
     match method {
         HttpMethod::GET => "GET",
         HttpMethod::POST => "POST",
-        // No allocations!
+        // No allocations
     }
 }
 
-// ✅ Cardinality control for metrics
+// Cardinality control for metrics
 HTTP_REQUESTS_TOTAL
     .with_label_values(&[method_str, route.pattern.as_ref(), status_str])
-    .inc();  // Use pattern, not actual path!
+    .inc();  // Use pattern, not actual path
 
-// ✅ Early return for /metrics endpoint
+// Early return for /metrics endpoint
 if path == "/metrics" && *req.method() == hyper::Method::GET {
     return serve_metrics().await;  // Don't record metrics for metrics endpoint
 }
@@ -361,9 +403,9 @@ if path == "/metrics" && *req.method() == hyper::Method::GET {
 
 ---
 
-## 🎯 KUBERNETES INTEGRATION
+## KUBERNETES INTEGRATION
 
-### Gateway API v1 (Stage 1 - DONE ✅)
+### Gateway API v1 (Stage 1 - DONE)
 
 ```rust
 use gateway_api::apis::standard::{
@@ -389,7 +431,7 @@ async fn reconcile_http_route(route: Arc<HTTPRoute>, ctx: Arc<Context>) -> Resul
         let matches = rule.matches;  // PathPrefix, Headers, etc.
         let backend_refs = rule.backend_refs;  // Services
 
-        // Add route to router (idempotent!)
+        // Add route to router (idempotent)
         ctx.router.add_route(
             HttpMethod::GET,  // HTTPRoute doesn't specify method
             &matches[0].path.value,
@@ -403,7 +445,7 @@ async fn reconcile_http_route(route: Arc<HTTPRoute>, ctx: Arc<Context>) -> Resul
 }
 ```
 
-**Status**: ✅ WORKING
+**Status**: WORKING
 - GatewayClass, Gateway, HTTPRoute controllers implemented
 - Router idempotency handles reconciliation loops
 - Validated in kind cluster
@@ -412,101 +454,101 @@ async fn reconcile_http_route(route: Arc<HTTPRoute>, ctx: Arc<Context>) -> Resul
 
 ---
 
-## 📊 eBPF OBSERVABILITY (Stage 2 - NEXT)
+## WASM PLUGIN SYSTEM (Stage 2 - NEXT)
 
-### XDP Observer Pattern (Brendan Gregg Approach)
+### Plugin SDK Design
 
-**eBPF Role**: Capture HTTP events, NOT route packets
-
+**Plugin Lifecycle Hooks:**
 ```rust
-// XDP program (observation mode)
-#[xdp]
-fn rauta_observe(ctx: XdpContext) -> u32 {
-    // Parse ethernet → IP → TCP
-    let eth = parse_eth(&ctx)?;
-    let ip = parse_ipv4(&ctx, eth)?;
-    let tcp = parse_tcp(&ctx, ip)?;
+// Plugin interface (exported by WASM module)
+#[no_mangle]
+pub extern "C" fn on_request(req_ptr: *const u8, req_len: usize) -> u32 {
+    // PLUGIN_CONTINUE = 0
+    // PLUGIN_REJECT = 1
+    // PLUGIN_MODIFY = 2
+}
 
-    // Parse HTTP request (if present)
-    let http_start = tcp_payload_start(&tcp);
-    if let Ok(request) = parse_http_request(&ctx, http_start) {
-        let evt = HttpRequestEvent {
-            timestamp: bpf_ktime_get_ns(),
-            client_ip: ip.saddr,
-            server_ip: ip.daddr,
-            server_port: tcp.dest,
-            method: request.method,
-            path_hash: fnv1a_hash(&request.path),
-            path: request.path,  // Up to 256 bytes
-        };
-
-        // Send to ring buffer (non-blocking)
-        EVENTS.output(&ctx, &evt, 0);
-    }
-
-    // ALWAYS pass packet to kernel (observation only!)
-    XDP_PASS
+#[no_mangle]
+pub extern "C" fn on_response(resp_ptr: *const u8, resp_len: usize) -> u32 {
+    // Same return codes
 }
 ```
 
-### Processor Pattern (TAPIO Architecture)
-
+**Example: JWT Authentication Plugin (Rust)**
 ```rust
-// SlowResponseProcessor (userspace Rust)
-pub struct SlowResponseProcessor {
-    baseline_store: Arc<BaselineStore>,
-}
+use rauta_plugin_sdk::*;
 
-impl HttpProcessor for SlowResponseProcessor {
-    fn process(
-        &self,
-        ctx: &ProcessorContext,
-        req: &HttpRequestEvent,
-        resp: Option<&HttpResponseEvent>,
-    ) -> Option<ObserverEvent> {
-        let resp = resp?;
+#[rauta_plugin]
+fn on_request(req: Request) -> PluginResult {
+    // Extract Authorization header
+    let auth_header = req.headers().get("Authorization")?;
 
-        // Calculate latency
-        let latency_ns = resp.timestamp - req.timestamp;
-        let latency_ms = (latency_ns as f64) / 1_000_000.0;
+    // Verify JWT
+    let claims = verify_jwt(auth_header)?;
 
-        // Lookup baseline p99 for this service
-        let service_key = (req.server_ip, req.server_port);
-        let baseline = self.baseline_store.get_p99(service_key)?;
+    // Add user ID to request context
+    req.set_metadata("user_id", &claims.sub);
 
-        // Detect slow response (p99 > 2x baseline)
-        if latency_ms > baseline * 2.0 {
-            Some(ObserverEvent {
-                type_: "http_latency".into(),
-                subtype: "slow_response".into(),
-                http_data: Some(HttpEventData {
-                    method: req.method.to_string(),
-                    path: String::from_utf8_lossy(&req.path).into(),
-                    status_code: resp.status_code,
-                    latency_ms,
-                    server_ip: ipv4_to_string(req.server_ip),
-                    server_port: req.server_port,
-                    // K8s enrichment added later
-                    pod_name: None,
-                    namespace: None,
-                }),
-                k8s_context: None,
-            })
-        } else {
-            None
-        }
-    }
+    PluginResult::Continue
 }
 ```
 
-**Status**: Design complete (3-month MVP planned)
-- TAPIO processor pattern proven
-- Brendan Gregg patterns documented
-- Ready for implementation
+**Example: Rate Limiting Plugin (Go)**
+```go
+package main
+
+import "github.com/rauta/plugin-sdk-go"
+
+//export on_request
+func on_request(reqPtr *byte, reqLen int) int32 {
+    req := plugin.DecodeRequest(reqPtr, reqLen)
+
+    // Get client IP
+    clientIP := req.Header("X-Forwarded-For")
+
+    // Check rate limit
+    if rateLimiter.IsAllowed(clientIP) {
+        return plugin.CONTINUE
+    }
+
+    // Reject with 429 Too Many Requests
+    req.SetResponse(429, "Rate limit exceeded")
+    return plugin.REJECT
+}
+```
+
+**Plugin Configuration (HTTPRoute annotation):**
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api-route
+  annotations:
+    rauta.io/plugins: |
+      - name: jwt-auth
+        config:
+          secret: jwt-signing-key
+          issuer: https://auth.example.com
+      - name: rate-limit
+        config:
+          requests_per_minute: 100
+          burst: 20
+spec:
+  parentRefs:
+  - name: rauta-gateway
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /api
+    backendRefs:
+    - name: api-service
+      port: 8080
+```
 
 ---
 
-## 🧪 TESTING STRATEGY
+## TESTING STRATEGY
 
 ### Unit Tests (Rust)
 
@@ -544,6 +586,26 @@ async fn test_router_maglev_distribution() {
 }
 ```
 
+### WASM Plugin Tests
+
+```rust
+#[tokio::test]
+async fn test_jwt_plugin_rejects_invalid_token() {
+    let runtime = PluginRuntime::new();
+    runtime.load_plugin("jwt-auth", include_bytes!("plugins/jwt_auth.wasm")).await.unwrap();
+
+    let mut req = Request::builder()
+        .uri("/api/users")
+        .header("Authorization", "Bearer invalid_token")
+        .body(())
+        .unwrap();
+
+    let decision = runtime.run_request_plugins(&req).await;
+
+    assert_eq!(decision, PluginDecision::Reject);
+}
+```
+
 ### Integration Tests (Kind Cluster)
 
 ```bash
@@ -570,11 +632,12 @@ EOF
 kubectl get gatewayclass rauta -o yaml
 # Should show: status.conditions[type=Accepted].status=True
 
-# Create Gateway + HTTPRoute
-kubectl apply -f examples/gateway-httproute.yaml
+# Create Gateway + HTTPRoute with plugin
+kubectl apply -f examples/gateway-httproute-with-plugins.yaml
 
-# Test routing
-curl http://$(kubectl get svc rauta -o jsonpath='{.status.loadBalancer.ingress[0].ip}')/api/test
+# Test routing with JWT
+curl -H "Authorization: Bearer $(generate_jwt)" \
+  http://$(kubectl get svc rauta -o jsonpath='{.status.loadBalancer.ingress[0].ip}')/api/test
 ```
 
 ### Load Testing
@@ -588,13 +651,21 @@ Expected:
   Latency p99: <50ms
   Memory: <100MB
 
+# With WASM plugins enabled
+wrk -t12 -c400 -d30s -H "Authorization: Bearer $JWT" http://rauta-lb/api/test
+
+Expected:
+  Requests/sec: 8,000+ (20% overhead acceptable)
+  Latency p99: <60ms
+  Memory: <150MB
+
 # Check metrics
 curl http://rauta-lb:9090/metrics | grep rauta_requests_total
 ```
 
 ---
 
-## 🚀 DEPLOYMENT
+## DEPLOYMENT
 
 ### DaemonSet (One per Node)
 
@@ -622,57 +693,45 @@ spec:
         - containerPort: 443
         - containerPort: 9090  # Prometheus metrics
         env:
-        - name: RAUTA_MODE
-          value: "ingress"  # Or "observability", "mesh"
         - name: RAUTA_GATEWAY_CLASS
           value: "rauta"
         - name: RAUTA_LOG_LEVEL
           value: "info"
-```
-
-### Observability Mode (Stage 2)
-
-```yaml
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: rauta-observer
-spec:
-  template:
-    spec:
-      hostNetwork: true
-      containers:
-      - name: rauta
-        image: rauta:v0.2.0
-        securityContext:
-          privileged: true  # Required for XDP
-          capabilities:
-            add: ["NET_ADMIN", "SYS_ADMIN", "BPF"]
-        env:
-        - name: RAUTA_MODE
-          value: "observability"
-        - name: RAUTA_INTERFACE
-          value: "eth0"
-        - name: OTEL_EXPORTER_OTLP_ENDPOINT
-          value: "http://otel-collector:4318"
+        - name: RAUTA_PLUGIN_DIR
+          value: "/etc/rauta/plugins"
+        volumeMounts:
+        - name: plugin-config
+          mountPath: /etc/rauta/plugins
+      volumes:
+      - name: plugin-config
+        configMap:
+          name: rauta-plugins
 ```
 
 ---
 
-## 📚 LEARNING RESOURCES
+## LEARNING RESOURCES
 
 ### Must Read
 
-1. **BPF Performance Tools** (Brendan Gregg) - Chapter 10: Networking
-2. **Cilium Architecture**: https://docs.cilium.io/en/stable/concepts/ebpf/
-3. **Gateway API**: https://gateway-api.sigs.k8s.io/
-4. **Aya Book**: https://aya-rs.dev/book/
+1. **"Learning eBPF"** (Liz Rice) - Chapter 8: Networking
+   - Key lesson: XDP cannot parse HTTP/2, TLS, or complex protocols
+   - Even Cilium uses Envoy for L7 (not eBPF)
+
+2. **"Crafting Interpreters"** (Bob Nystrom) - WASM runtime concepts
+
+3. **Cloudflare Pingora**: https://github.com/cloudflare/pingora
+   - Validates Rust for L7 proxies
+
+4. **Gateway API**: https://gateway-api.sigs.k8s.io/
+
+5. **wasmtime Book**: https://docs.wasmtime.dev/
 
 ### Code References
 
 - **Cloudflare Pingora**: Rust proxy (validates architecture)
-- **TAPIO**: `/Users/yair/projects/tapio/` (processor pattern)
-- **Cilium**: eBPF + Envoy integration patterns
+- **Kong**: Lua plugins (what we're improving upon)
+- **Envoy**: C++ filters (shows need for safer extension model)
 
 ### Research Papers
 
@@ -682,43 +741,51 @@ spec:
 
 ---
 
-## ⚠️ REALISTIC SCOPE
+## REALISTIC SCOPE
 
 ### What RAUTA IS
 
-✅ **Production-ready Gateway API controller**
+**Production-ready Gateway API controller**
 - Full Gateway API v1 support (GatewayClass, Gateway, HTTPRoute)
 - Maglev load balancing
 - Prometheus observability
 - Validated in kind cluster
 
-✅ **Learning project for Rust + eBPF**
-- Explore Rust async patterns (tokio, hyper)
-- Learn eBPF observability (XDP observation, not routing)
-- Build production-quality systems
+**Safe plugin extensibility**
+- WASM runtime (wasmtime)
+- Multi-language SDK (Rust, Go, TypeScript)
+- Sandboxed execution (cannot crash gateway)
+- Hot-reload support
 
-✅ **false-systems platform component**
-- RAUTA (HTTP ingress) → TAPIO (pod metrics) → AHTI (correlation) → URPO (UI)
+**Learning project for Rust + WASM**
+- Explore Rust async patterns (tokio, hyper)
+- Learn WASM runtime integration
+- Build production-quality systems
 
 ### What RAUTA IS NOT
 
-❌ **Not an XDP HTTP router**
+**Not an XDP HTTP router**
 - XDP sees raw packets (no TCP reassembly)
 - Modern protocols (HTTP/2, TLS) require userspace
-- eBPF is for observation, NOT routing
+- Learning eBPF (Liz Rice) confirms: even Cilium uses Envoy for L7
 
-❌ **Not trying to beat Katran**
+**Not trying to beat Katran**
 - Katran does L4 (10M pps)
 - RAUTA does L7 (100K+ rps)
 - Different problem spaces
 
-❌ **Not replacing Envoy/NGINX**
+**Not replacing Envoy/NGINX**
 - Those are mature, battle-tested
-- RAUTA is a focused tool with unique strengths
+- RAUTA is a focused tool with unique strengths (WASM plugins)
+
+**Not building eBPF observability**
+- Observability is out of scope
+- Focus on Gateway API routing and WASM plugins
+- Keep concerns separated
 
 ---
 
-## 🎖️ DEFINITION OF DONE
+## DEFINITION OF DONE
 
 A feature is complete when:
 
@@ -734,42 +801,142 @@ A feature is complete when:
 
 ---
 
-## 🏆 FINAL MANIFESTO
+## DEVELOPMENT ROADMAP
+
+### Month 1-2: Production-Ready Gateway (Table Stakes)
+
+**Week 1: EndpointSlice resolution**
+- Dynamic backend discovery
+- Pod IP updates without restart
+- Health checking integration
+
+**Week 2: HTTP/2 support**
+- Multiplexing
+- Header compression
+- Server push (optional)
+
+**Week 3: TLS termination**
+- rustls integration
+- SNI support
+- Certificate rotation
+
+**Week 4: Basic rate limiting and circuit breakers**
+- Token bucket algorithm
+- Per-route limits
+- Failure detection
+
+**Week 5-6: DaemonSet deployment model**
+- Host network mode
+- Node-local routing
+- HA considerations
+
+**Week 7-8: Testing and production hardening**
+- Load testing (wrk, vegeta)
+- Chaos testing (toxiproxy)
+- Security review
+
+### Month 3-4: WASM Plugin System (THE DIFFERENTIATOR)
+
+**Week 9-10: WASM runtime integration**
+- wasmtime setup
+- Memory limits
+- CPU limits
+- Timeout handling
+
+**Week 11-12: Plugin SDK and lifecycle hooks**
+- Rust SDK
+- Go SDK bindings
+- TypeScript SDK (wit-bindgen)
+- Request/response hooks
+
+**Week 13-14: Built-in plugins**
+- JWT authentication
+- CORS handling
+- Rate limiting (WASM-based)
+- Request transformation
+
+**Week 15-16: Plugin configuration and hot-reload**
+- HTTPRoute annotations
+- ConfigMap integration
+- Reload without downtime
+- Plugin versioning
+
+### Month 5-6: Developer Experience and Launch
+
+**Week 17-18: kubectl rauta plugin**
+- Debugging tools
+- Plugin logs
+- Performance profiling
+
+**Week 19-20: Plugin marketplace**
+- Plugin registry
+- Installation CLI
+- Documentation site
+
+**Week 21-22: Examples and tutorials**
+- Getting started guide
+- Plugin development tutorial
+- Production deployment guide
+
+**Week 23-24: Launch prep**
+- Blog posts
+- Conference talks
+- Community building
+
+---
+
+## COMPETITIVE POSITIONING
+
+**vs Kong**
+- Kong: Lua plugins can crash gateway
+- RAUTA: WASM plugins are sandboxed
+- Expected: 10-15x faster (no LuaJIT overhead)
+
+**vs Envoy**
+- Envoy: C++ filters are dangerous to write
+- RAUTA: WASM plugins in any language
+- Benefit: Memory safe, easier to extend
+
+**vs Traefik**
+- Traefik: Limited plugin ecosystem
+- RAUTA: Multi-language WASM support
+- Benefit: Write plugins in Rust, Go, TypeScript
+
+**vs NGINX**
+- NGINX: C modules require recompilation
+- RAUTA: Hot-reload WASM plugins
+- Benefit: Zero-downtime updates
+
+**Unique Differentiators:**
+1. **Gateway API native** - Modern standard from day 1
+2. **WASM plugins** - Safe, fast, multi-language extensibility
+3. **Rust core** - Memory safety without garbage collection
+4. **Maglev hashing** - Google's algorithm (proven at scale)
+5. **Research-backed** - ACM papers, not hype
+
+**The Pitch:**
+> "RAUTA is the Gateway API controller you can safely extend with WASM plugins. Like Kong, but your plugins can't crash the gateway. Like Envoy, but you don't need to write C++. Write plugins in Rust, Go, or TypeScript - they run sandboxed with CPU and memory limits."
+
+---
+
+## FINAL MANIFESTO
 
 **RAUTA is a production-focused learning project for building modern K8s infrastructure in Rust.**
 
 **We're building:**
-- ✅ Real-world Gateway API controller (working in kind cluster)
-- ✅ Deep observability via eBPF (without trying to do L7 in kernel)
-- ✅ Research-backed architecture (Cloudflare, Cilium, Brendan Gregg)
-- ✅ Production-quality Rust (TDD, strong typing, pre-commit hooks)
+- Real-world Gateway API controller (working in kind cluster)
+- Safe WASM plugin extensibility (the differentiator)
+- Research-backed architecture (Cloudflare Pingora, wasmtime)
+- Production-quality Rust (TDD, strong typing, pre-commit hooks)
 
 **We're NOT building:**
-- ❌ XDP HTTP parser (unrealistic for HTTP/2, TLS, gRPC)
-- ❌ Another Envoy clone (learn from Envoy, don't copy it)
-- ❌ Experimental dead-end (every feature has production use case)
+- XDP HTTP parser (unrealistic for HTTP/2, TLS - Learning eBPF validates)
+- Another Envoy clone (learn from Envoy, improve the plugin model)
+- Experimental dead-end (every feature has production use case)
+- eBPF observability (that's TAPIO's job - separation of concerns)
 
-**Competitive Positioning:**
-- **vs Kong**: Native Rust (no LuaJIT overhead), 10-15x faster expected
-- **vs Envoy**: Memory safe, zero-copy streaming, built-in eBPF observability
-- **vs Cilium**: Works with any CNI (incremental adoption, not replacement)
-
-**Unique Differentiators:**
-1. **Gateway API native** - Modern standard from day 1
-2. **Maglev hashing** - Google's algorithm (proven at scale)
-3. **eBPF observability** - Kernel + userspace visibility
-4. **Cloudflare-proven** - Pingora validates Rust architecture
-5. **Research-backed** - ACM papers, not hype (HTTP/2 > HTTP/3)
-
-**Learn. Build. Ship. 🦀⚡**
+**Learn. Build. Ship.**
 
 ---
 
-**Finnish Tool Ecosystem:**
-- **URPO**: Trace explorer 🔍
-- **TAPIO**: K8s observer 🌲
-- **AHTI**: Correlation engine 🌊
-- **ELAVA**: AWS scanner 💚
-- **RAUTA**: Ingress controller ⚙️ (iron)
-
-**Iron-clad routing with deep visibility.**
+**Iron-clad routing with safe extensibility.**

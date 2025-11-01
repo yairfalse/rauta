@@ -4,7 +4,7 @@ use crate::apis::metrics::CONTROLLER_METRICS_REGISTRY;
 use crate::proxy::router::Router;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use hyper::server::conn::http1;
+use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
@@ -14,10 +14,12 @@ use lazy_static::lazy_static;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
-use tracing::{error, info, warn};
+use tokio::sync::Mutex;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 lazy_static! {
@@ -53,11 +55,23 @@ lazy_static! {
     };
 }
 
+use crate::proxy::backend_pool::{gather_pool_metrics, BackendConnectionPools, PoolError};
+
+/// Production-grade HTTP/2 backend connection pools
+/// NOTE: Arc<Mutex> is temporary until Stage 2 per-core workers
+/// In Stage 2, each worker will own their BackendConnectionPools (no lock!)
+type BackendPools = Arc<Mutex<BackendConnectionPools>>;
+
+/// Protocol detection cache - tracks which backends support HTTP/2
+type ProtocolCache = Arc<Mutex<HashMap<String, bool>>>; // true = HTTP/2, false = HTTP/1.1
+
 /// HTTP Proxy Server
 pub struct ProxyServer {
     bind_addr: String,
     router: Arc<Router>,
     client: Client<HttpConnector, Full<Bytes>>,
+    backend_pools: BackendPools,
+    protocol_cache: ProtocolCache,
 }
 
 impl ProxyServer {
@@ -66,11 +80,27 @@ impl ProxyServer {
         // Create HTTP client with connection pooling
         let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
 
+        // Create production-grade HTTP/2 backend connection pools
+        let backend_pools = Arc::new(Mutex::new(BackendConnectionPools::new()));
+
+        // Create protocol detection cache
+        let protocol_cache = Arc::new(Mutex::new(HashMap::new()));
+
         Ok(Self {
             bind_addr,
             router,
             client,
+            backend_pools,
+            protocol_cache,
         })
+    }
+
+    /// Mark a backend as supporting HTTP/2 (for testing or explicit configuration)
+    #[allow(dead_code)] // Used in tests and for explicit HTTP/2 backend configuration
+    pub async fn set_backend_protocol_http2(&self, backend_host: &str, backend_port: u16) {
+        let backend_key = format!("{}:{}", backend_host, backend_port);
+        let mut cache = self.protocol_cache.lock().await;
+        cache.insert(backend_key, true);
     }
 
     /// Start serving HTTP requests
@@ -91,6 +121,8 @@ impl ProxyServer {
 
             let router = self.router.clone();
             let client = self.client.clone();
+            let backend_pools = self.backend_pools.clone();
+            let protocol_cache = self.protocol_cache.clone();
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
@@ -98,10 +130,59 @@ impl ProxyServer {
                 let service = service_fn(move |req: Request<hyper::body::Incoming>| {
                     let router = router.clone();
                     let client = client.clone();
-                    async move { handle_request(req, router, client).await }
+                    let backend_pools = backend_pools.clone();
+                    let protocol_cache = protocol_cache.clone();
+                    async move {
+                        handle_request(req, router, client, backend_pools, protocol_cache).await
+                    }
                 });
 
                 let _ = http1::Builder::new().serve_connection(io, service).await;
+            });
+        }
+    }
+
+    /// Start serving HTTP/2 requests
+    #[allow(dead_code)]
+    pub async fn serve_http2(self) -> Result<(), String> {
+        let listener = TcpListener::bind(&self.bind_addr)
+            .await
+            .map_err(|e| format!("Failed to bind to {}: {}", self.bind_addr, e))?;
+
+        let _actual_addr = listener
+            .local_addr()
+            .map_err(|e| format!("Failed to get local addr: {}", e))?;
+
+        info!("HTTP/2 proxy server listening on {}", self.bind_addr);
+
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .map_err(|e| format!("Failed to accept connection: {}", e))?;
+
+            let router = self.router.clone();
+            let client = self.client.clone();
+            let backend_pools = self.backend_pools.clone();
+            let protocol_cache = self.protocol_cache.clone();
+
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+
+                let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let router = router.clone();
+                    let client = client.clone();
+                    let backend_pools = backend_pools.clone();
+                    let protocol_cache = protocol_cache.clone();
+                    async move {
+                        handle_request(req, router, client, backend_pools, protocol_cache).await
+                    }
+                });
+
+                // Use HTTP/2 connection builder
+                let _ = http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, service)
+                    .await;
             });
         }
     }
@@ -118,6 +199,7 @@ fn ipv4_to_string(ipv4: u32) -> String {
     )
 }
 
+/// Get or create HTTP/2 connection to backend
 /// Check if a header is hop-by-hop and should not be forwarded
 /// Per RFC 2616 Section 13.5.1
 fn is_hop_by_hop_header(name: &str) -> bool {
@@ -140,6 +222,8 @@ async fn forward_to_backend(
     backend: common::Backend,
     client: Client<HttpConnector, Full<Bytes>>,
     request_id: &str,
+    backend_pools: BackendPools,
+    protocol_cache: ProtocolCache,
 ) -> Result<Response<Full<Bytes>>, String> {
     let request_start = Instant::now();
 
@@ -225,20 +309,69 @@ async fn forward_to_backend(
         "Sending request to backend"
     );
 
-    // Send request to backend
+    // Try HTTP/2 first (with production connection pool), fallback to HTTP/1.1
+    let backend_key = format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port);
+    let use_http2 = {
+        let cache = protocol_cache.lock().await;
+        cache.get(&backend_key).copied()
+    };
+
     let backend_connect_start = Instant::now();
-    let backend_resp = client.request(backend_req).await.map_err(|e| {
-        error!(
-            request_id = %request_id,
-            error.message = %e,
-            error.type = "backend_connection",
-            network.peer.address = %ipv4_to_string(backend.ipv4),
-            network.peer.port = backend.port,
-            elapsed_us = backend_connect_start.elapsed().as_micros() as u64,
-            "Backend connection failed"
-        );
-        format!("Backend connection failed: {}", e)
-    })?;
+    let backend_resp = match use_http2 {
+        Some(true) => {
+            // Backend is known to support HTTP/2, use production connection pool
+            debug!(request_id = %request_id, "Using HTTP/2 connection pool for backend {}", backend_key);
+
+            let mut sender = {
+                let mut pools = backend_pools.lock().await;
+                let pool = pools.get_or_create_pool(backend);
+                pool.get_connection().await.map_err(|e| match e {
+                    PoolError::CircuitBreakerOpen => {
+                        error!(
+                            request_id = %request_id,
+                            backend = %backend_key,
+                            "Circuit breaker open for backend"
+                        );
+                        "Circuit breaker open".to_string()
+                    }
+                    _ => format!("Failed to get HTTP/2 connection: {}", e),
+                })?
+            };
+
+            sender.send_request(backend_req).await.map_err(|e| {
+                error!(
+                    request_id = %request_id,
+                    error.message = %e,
+                    error.type = "http2_request",
+                    "HTTP/2 request failed"
+                );
+                format!("HTTP/2 request failed: {}", e)
+            })?
+        }
+        Some(false) | None => {
+            // Backend uses HTTP/1.1 (cached or unknown)
+            debug!(request_id = %request_id, "Using HTTP/1.1 for backend {}", backend_key);
+
+            // Cache as HTTP/1.1 if unknown
+            if use_http2.is_none() {
+                let mut cache = protocol_cache.lock().await;
+                cache.insert(backend_key.clone(), false);
+            }
+
+            client.request(backend_req).await.map_err(|e| {
+                error!(
+                    request_id = %request_id,
+                    error.message = %e,
+                    error.type = "backend_connection",
+                    network.peer.address = %ipv4_to_string(backend.ipv4),
+                    network.peer.port = backend.port,
+                    elapsed_us = backend_connect_start.elapsed().as_micros() as u64,
+                    "Backend connection failed"
+                );
+                format!("Backend connection failed: {}", e)
+            })?
+        }
+    };
 
     let backend_connect_duration = backend_connect_start.elapsed();
     let response_status = backend_resp.status().as_u16();
@@ -351,6 +484,8 @@ async fn handle_request(
     req: Request<hyper::body::Incoming>,
     router: Arc<Router>,
     client: Client<HttpConnector, Full<Bytes>>,
+    backend_pools: BackendPools,
+    protocol_cache: ProtocolCache,
 ) -> Result<Response<Full<Bytes>>, String> {
     // Generate or extract request ID
     let request_id = req
@@ -380,12 +515,12 @@ async fn handle_request(
         let mut buffer = vec![];
         let encoder = TextEncoder::new();
 
-        // Gather metrics from both registries (proxy + controller)
+        // Gather metrics from all registries (proxy + controller + HTTP/2 pool)
         let mut metric_families = METRICS_REGISTRY.gather();
         let controller_metrics = CONTROLLER_METRICS_REGISTRY.gather();
         metric_families.extend(controller_metrics);
 
-        // Handle encoding failure gracefully
+        // Encode proxy + controller metrics
         if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
             error!("Failed to encode metrics: {}", e);
             return Ok(Response::builder()
@@ -396,6 +531,13 @@ async fn handle_request(
                     e
                 ))))
                 .unwrap());
+        }
+
+        // Append HTTP/2 pool metrics
+        if let Ok(pool_metrics_text) = gather_pool_metrics() {
+            buffer.extend_from_slice(pool_metrics_text.as_bytes());
+        } else {
+            warn!("Failed to gather HTTP/2 pool metrics");
         }
 
         return Ok(Response::builder()
@@ -433,7 +575,15 @@ async fn handle_request(
                 "Route matched, forwarding to backend"
             );
 
-            let result = forward_to_backend(req, route_match.backend, client, &request_id).await;
+            let result = forward_to_backend(
+                req,
+                route_match.backend,
+                client,
+                &request_id,
+                backend_pools,
+                protocol_cache,
+            )
+            .await;
             let duration = start.elapsed();
 
             // Record metrics (zero-allocation with static strings)
@@ -1332,6 +1482,261 @@ mod tests {
         assert!(
             body.contains(r#"gatewayclass="rauta""#),
             "Should contain test GatewayClass name"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http2_server_support() {
+        // This test verifies that the proxy server:
+        // 1. Accepts HTTP/2 connections from clients
+        // 2. Returns 404 for non-existent routes via HTTP/2
+
+        // Create router with no routes
+        let router = crate::proxy::router::Router::new();
+
+        // Start HTTP/2 proxy server
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
+
+        tokio::spawn(async move {
+            let _ = server.serve_http2().await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Make HTTP/2 client request
+        let stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let io = TokioIo::new(stream);
+
+        let (mut request_sender, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+                .await
+                .unwrap();
+
+        // Spawn connection driver
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        // Send HTTP/2 request to non-existent route
+        let req = Request::builder()
+            .uri("/api/test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let response = request_sender.send_request(req).await.unwrap();
+
+        // Should get 404 (no routes configured)
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_http2_forwards_to_http1_backend() {
+        // REFACTOR: Test HTTP/2 client → HTTP/2 proxy → HTTP/1.1 backend
+        // This is the realistic production scenario
+
+        // Start mock HTTP/1.1 backend
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = backend_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+
+            let service = service_fn(|_req: Request<hyper::body::Incoming>| async move {
+                Ok::<_, hyper::Error>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from("Hello from HTTP/1.1 backend")))
+                        .unwrap(),
+                )
+            });
+
+            let _ = http1::Builder::new().serve_connection(io, service).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Create router pointing to HTTP/1.1 backend
+        let router = crate::proxy::router::Router::new();
+        let backend_ip = match backend_addr.ip() {
+            std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
+            _ => panic!("Expected IPv4 address"),
+        };
+        let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
+        router
+            .add_route(HttpMethod::GET, "/api/test", backends)
+            .unwrap();
+
+        // Start HTTP/2 proxy server
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
+
+        tokio::spawn(async move {
+            let _ = server.serve_http2().await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Make HTTP/2 client request
+        let stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let io = TokioIo::new(stream);
+
+        let (mut request_sender, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+                .await
+                .unwrap();
+
+        // Spawn connection driver
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        // Send HTTP/2 request
+        let req = Request::builder()
+            .uri("/api/test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let response = request_sender.send_request(req).await.unwrap();
+
+        // Verify response
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        assert_eq!(body, "Hello from HTTP/1.1 backend");
+    }
+
+    #[tokio::test]
+    async fn test_http2_backend_connection_reuse() {
+        // RED: Test HTTP/2 connection pool to backends
+        //
+        // This test verifies:
+        // 1. Proxy uses HTTP/2 to connect to backends
+        // 2. Multiple requests reuse the same connection (multiplexing)
+        // 3. Connection is kept alive between requests
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        // Track number of connections accepted by backend
+        let connection_count = StdArc::new(AtomicUsize::new(0));
+        let connection_count_clone = connection_count.clone();
+
+        // Start HTTP/2 backend server
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = backend_listener.accept().await.unwrap();
+                connection_count_clone.fetch_add(1, Ordering::SeqCst);
+
+                let io = TokioIo::new(stream);
+
+                let service = service_fn(|req: Request<hyper::body::Incoming>| async move {
+                    // Echo request path in response
+                    let path = req.uri().path().to_string();
+                    Ok::<_, hyper::Error>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::from(format!("Response to {}", path))))
+                            .unwrap(),
+                    )
+                });
+
+                // Accept HTTP/2 connections
+                tokio::spawn(async move {
+                    let _ = http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(io, service)
+                        .await;
+                });
+            }
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Create router pointing to HTTP/2 backend
+        let router = crate::proxy::router::Router::new();
+        let backend_ip = match backend_addr.ip() {
+            std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
+            _ => panic!("Expected IPv4 address"),
+        };
+        let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
+        router
+            .add_route(HttpMethod::GET, "/api/test1", backends.clone())
+            .unwrap();
+        router
+            .add_route(HttpMethod::GET, "/api/test2", backends.clone())
+            .unwrap();
+        router
+            .add_route(HttpMethod::GET, "/api/test3", backends)
+            .unwrap();
+
+        // Start HTTP/2 proxy server
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
+
+        // Mark backend as HTTP/2 (since we know it supports HTTP/2)
+        server
+            .set_backend_protocol_http2("127.0.0.1", backend_addr.port())
+            .await;
+
+        tokio::spawn(async move {
+            let _ = server.serve_http2().await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Make HTTP/2 client connection to proxy
+        let stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let io = TokioIo::new(stream);
+
+        let (mut request_sender, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+                .await
+                .unwrap();
+
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        // Make 3 sequential requests through the proxy
+        for i in 1..=3 {
+            let req = Request::builder()
+                .uri(format!("/api/test{}", i))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+
+            let response = request_sender.send_request(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+            assert_eq!(body, format!("Response to /api/test{}", i));
+        }
+
+        // Give time for connections to settle
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // CRITICAL ASSERTION: Backend should only see 1 connection (HTTP/2 pooling)
+        // Currently FAILS because proxy creates new HTTP/1.1 connection per request
+        let connections = connection_count.load(Ordering::SeqCst);
+        assert_eq!(
+            connections, 1,
+            "Backend should see only 1 HTTP/2 connection (multiplexed), but saw {}",
+            connections
         );
     }
 }
