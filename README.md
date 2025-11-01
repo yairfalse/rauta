@@ -1,6 +1,6 @@
 # RAUTA ⚙️
 
-**A Kubernetes Gateway API implementation in Rust** - Experimental, learning in public.
+**A Kubernetes Gateway API implementation in Rust** - Fast, safe, and extensible.
 
 [![CI](https://github.com/yairfalse/rauta/actions/workflows/ci.yml/badge.svg)](https://github.com/yairfalse/rauta/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
@@ -8,94 +8,49 @@
 
 ---
 
-
-This is a **week-old project**. We're learning Rust, eBPF, and Kubernetes networking as we go.
-
----
-
 ## What is RAUTA?
 
-A Kubernetes ingress controller built in Rust. We're exploring:
-- Modern Kubernetes Gateway API (v1)
-- Consistent hashing for load balancing (Maglev)
-- eBPF for observability (future work)
+A Kubernetes ingress controller built in Rust with HTTP/2 support and WASM-based extensibility.
 
-**Why another ingress controller?**
-- **Learning project** - We wanted to understand how ingress controllers work
-- **Modern APIs** - Gateway API is newer than Ingress, wanted to try it
-- **Rust** - Memory-safe systems programming
-- **eBPF exploration** - Eventually use eBPF for deep HTTP observability
+**Core Features:**
+- Modern Kubernetes Gateway API (v1) support
+- HTTP/2 connection pooling with multiplexing
+- Maglev consistent hashing for load balancing
+- WASM plugin system for safe extensibility
+- Production-grade observability (Prometheus metrics)
 
----
-
-## What's Working Now?
-
-✅ **Stage 1: Gateway API Controller** (Complete as of Week 1)
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| GatewayClass reconciliation | ✅ | Watches GatewayClass resources |
-| Gateway reconciliation | ✅ | Updates status, manages listeners |
-| HTTPRoute reconciliation | ✅ | Path matching, backend resolution |
-| Service → Pod IP resolution | ✅ | Via Kubernetes Endpoints API |
-| Maglev load balancing | ✅ | Consistent hashing for backends |
-| Prefix matching | ✅ | `/api/users` matches `/api/users/123` |
-| Tests | ✅ | 92 tests passing |
-| Metrics | ✅ | Prometheus /metrics endpoint |
-
-**Tested in**: `kind` cluster with sample HTTPRoutes
+**Why RAUTA?**
+- **Memory Safe** - Rust prevents entire classes of bugs
+- **Modern Standards** - Gateway API native, not legacy Ingress
+- **Extensible** - WASM plugins for safe extensibility
+- **Fast** - HTTP/2 multiplexing, efficient connection pooling
 
 ---
 
-## How It Works (Current)
+## Status
 
-```
-1. Watch Kubernetes resources (Gateway API v1)
-   ├─ GatewayClass: rauta.io/gateway-controller
-   ├─ Gateway: Listeners (HTTP on port 80)
-   └─ HTTPRoute: Routes with backend refs
+**Stage 1: Gateway API Controller** ✅ Complete
+- GatewayClass, Gateway, HTTPRoute reconciliation
+- Dynamic backend resolution via EndpointSlice API
+- Maglev load balancing with consistent hashing
+- Prefix matching (e.g., `/api` matches `/api/users/123`)
+- Prometheus metrics
 
-2. Resolve Services → Pod IPs
-   └─ Kubernetes Endpoints API
+**Stage 2: HTTP/2 Connection Pooling** ✅ Complete
+- HTTP/2 multiplexing (1 connection → 44K+ requests)
+- Per-backend connection pools with circuit breakers
+- 3-state health tracking (Healthy → Degraded → Unhealthy)
+- Protocol detection (auto-fallback to HTTP/1.1)
+- Validated: 14K+ req/sec in load testing
 
-3. Route requests using Maglev consistent hashing
-   ├─ Hash(path, src_ip, src_port) → backend
-   └─ Sticky connections (same flow → same backend)
-
-4. Update Kubernetes status
-   └─ Accepted, ResolvedRefs conditions
-```
-
-That's it. Simple L7 HTTP routing in Rust userspace.
-
----
-
-## Quick Start
-
-```bash
-# Clone and build
-git clone https://github.com/yairfalse/rauta
-cd rauta
-cargo build --release
-
-# Run tests
-cargo test
-
-# Run controller (requires KUBECONFIG)
-./target/release/control
-
-# Deploy in Kubernetes
-kubectl apply -f manifests/
-```
-
-**Requirements:**
-- Rust 1.75+
-- Kubernetes cluster (kind/minikube OK)
-- KUBECONFIG configured
+**Stage 3: WASM Plugin System** 🚧 In Design
+- Safe extensibility without memory leaks
+- Custom authentication, rate limiting, transforms
+- Sandboxed execution environment
 
 ---
 
-## Architecture (Current)
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -110,7 +65,7 @@ kubectl apply -f manifests/
 │   RAUTA Controller (Rust)                   │
 │   - kube-rs watchers                        │
 │   - Reconcile loop                          │
-│   - Router (matchit + Maglev)               │
+│   - EndpointSlice → Pod IP resolution       │
 │   - Prometheus metrics                      │
 └──────────────────┬──────────────────────────┘
                    │ Update routes
@@ -120,197 +75,100 @@ kubectl apply -f manifests/
 │   - matchit radix tree (prefix match)       │
 │   - Maglev hash table (per route)           │
 │   - Backend selection: O(1)                 │
-└─────────────────────────────────────────────┘
-```
-
-**No eBPF yet.** Pure Rust userspace. Simple.
-
----
-
-## 🔍 eBPF Observability (The Vision)
-
-**Status: Designed, not implemented.** This is our research direction for Stage 2.
-
-### The Approach
-
-Most ingress controllers give you request counts and latency histograms. RAUTA will add **kernel-level HTTP visibility** via eBPF XDP observation.
-
-**Key Principle:** eBPF captures, userspace analyzes. XDP programs always return `XDP_PASS` (observation only, never routing).
-
-### Technical Architecture
-
-```
-┌─────────────────────────────────────────────┐
-│  XDP Program (eBPF)                         │
-│  - Parse: Ethernet → IP → TCP → HTTP       │
-│  - Extract: method, path, status, timing   │
-│  - Emit: Ring buffer event                  │
-│  - Return: XDP_PASS (always!)               │
 └──────────────────┬──────────────────────────┘
-                   │ bpf_ringbuf_output()
+                   │ HTTP/2 pooling
                    ▼
 ┌─────────────────────────────────────────────┐
-│  Rust Processors (Userspace)               │
-│  - Baseline learning (p50/p99 per route)   │
-│  - Anomaly detection (statistical)          │
-│  - Event emission (TAPIO format)            │
+│   HTTP/2 Connection Pools                   │
+│   - Per-backend pools                       │
+│   - Multiplexed streams                     │
+│   - Circuit breaker (3-state)               │
+│   - Auto protocol detection                 │
 └─────────────────────────────────────────────┘
 ```
 
-**eBPF Program** (simplified):
-```c
-SEC("xdp")
-int rauta_observe(struct xdp_md *ctx) {
-    struct http_event evt = {
-        .timestamp_ns = bpf_ktime_get_ns(),
-        .method = parse_method(data, data_end),
-        .path_hash = hash_path(data, data_end),
-        .status = parse_status(data, data_end),
-    };
+---
 
-    bpf_ringbuf_output(&EVENTS, &evt, sizeof(evt), 0);
-    return XDP_PASS;  // Never drop packets
-}
+## Quick Start
+
+```bash
+# Clone and build
+git clone https://github.com/yairfalse/rauta
+cd rauta
+cargo build --release
+
+# Run controller (requires KUBECONFIG)
+./target/release/control
+
+# Deploy in Kubernetes
+kubectl apply -f manifests/
 ```
 
-**Userspace Processor** (Rust):
-```rust
-struct SlowResponseProcessor {
-    baselines: HashMap<u64, LatencyBaseline>,  // path_hash → baseline
-}
-
-impl Processor for SlowResponseProcessor {
-    fn process(&mut self, evt: &HttpEvent) -> Option<ObserverEvent> {
-        let baseline = self.baselines.get(&evt.path_hash)?;
-        let latency_ms = evt.response_time_ns / 1_000_000;
-
-        // Detect: p99 > 2x baseline
-        if latency_ms > baseline.p99 * 2.0 {
-            Some(ObserverEvent {
-                type_: "slow_response",
-                route: evt.path,
-                latency_ms,
-                baseline_p99: baseline.p99,
-                backend_ip: evt.backend_ip,
-            })
-        } else {
-            None
-        }
-    }
-}
-```
-
-### What We'll Detect
-
-**1. Slow Response Detection**
-- Learn per-route latency baselines (p50, p95, p99)
-- Emit event when p99 > 2x baseline
-- Correlate to backend pod via IP
-
-**2. TCP Connection Failures**
-- Hook: `kprobe/tcp_set_state`
-- Detect: `SYN_SENT → CLOSE` (connection refused)
-- Emit before HTTP layer even tries
-
-**3. HTTP Error Spikes**
-- Track per-route error rate baseline
-- Detect: error_rate > baseline + 3σ (statistical)
-- Identify failing backend pod
-
-**4. Latency Breakdown**
-- Timestamp: XDP receive, socket send, socket recv, HTTP complete
-- Breakdown: network vs application time
-- Identify bottleneck layer
-
-### Integration: false-systems Ecosystem
-
-```
-RAUTA (HTTP layer)
-  │ Detects: /api/users slow (450ms, baseline 120ms)
-  │ Emits: ObserverEvent{type: "slow_response", pod: "user-svc-abc"}
-  ▼
-TAPIO (Pod layer)
-  │ Correlates: user-svc-abc pod
-  │ Finds: Memory 85%, 12 GC pauses/min
-  ▼
-AHTI (Correlation)
-  │ Links: HTTP latency ← Memory ← GC
-  │ Root cause: Memory leak in transaction processor
-  ▼
-URPO (UI)
-  │ Timeline visualization
-  │ Suggested fix: Scale or debug memory leak
-```
-
-**Zero-instrumentation observability across HTTP → Pod → Process.**
-
-### Technical Details
-
-**Why XDP Observation Mode?**
-- Compatible with any CNI (Cilium, Calico, Flannel)
-- Zero packet drops (always `XDP_PASS`)
-- 10-100μs overhead per packet (Cilium benchmarks)
-- Can be disabled at runtime (detach eBPF program)
-
-**HTTP Parsing Strategy:**
-- HTTP/1.1 only (text-based, eBPF verifier-friendly)
-- Single-packet requests (no TCP reassembly in XDP)
-- Fallback: Multi-packet requests visible via kprobe/tcp_recvmsg
-- Max path length: 256 bytes (99% of traffic)
-
-**Precedent:**
-- **Cilium**: L7 HTTP visibility with eBPF (production at scale)
-- **Cloudflare**: eBPF HTTP observability (Kentik blog 2023)
-- **Brendan Gregg**: BPF Performance Tools Ch10 (networking patterns)
-
-**Research Citations:**
-- ACM 2024: "QUIC is not Quick Enough" (HTTP/2 > HTTP/3)
-- Kernel Recipes 2024: io_uring zero-copy (+31-43% throughput)
-- Cilium May 2024: eBPF sockmap (30% latency reduction)
-
-Full design: [`docs/OBSERVABILITY_ARCHITECTURE.md`](docs/OBSERVABILITY_ARCHITECTURE.md)
-
-### Status: Not Built Yet
-
-**Current (Week 1):**
-- ❌ No eBPF programs
-- ✅ Architecture designed
-- ✅ Processor pattern defined (TAPIO-compatible)
-- ✅ Research complete
-
-**Timeline:** Month 2-3 prototype, Month 3-4 integration.
-
-**This is research.** Learning eBPF in public. Might change.
+**Requirements:**
+- Rust 1.75+
+- Kubernetes cluster (kind/minikube/production)
+- KUBECONFIG configured
 
 ---
 
-## What's Next? (No Promises)
+## HTTP/2 Connection Pooling
 
-We're exploring:
+RAUTA implements production-grade HTTP/2 connection pooling:
 
-**Stage 2: eBPF Observability** (Maybe Month 2-3?)
-- XDP program to capture HTTP metadata (method, path, status, latency)
-- Ring buffer events to userspace
-- Detect slow responses, 5xx spikes, connection failures
-- **Not for routing** - just deep HTTP observability
+**Features:**
+- **Multiplexing** - Single connection handles thousands of requests
+- **Circuit Breaker** - Automatic degradation on backend failures
+  - 5 failures → Degraded (50% capacity reduction)
+  - 10 failures → Unhealthy (circuit open for 30s)
+- **Protocol Detection** - Auto-detects HTTP/2 support, falls back to HTTP/1.1
+- **Connection Reuse** - Minimize TCP handshakes and TLS negotiation
 
-**Stage 3: Maybe Service Mesh?** (Who Knows?)
-- eBPF sockops for transparent proxying
-- No sidecars needed
-- This is research - might not happen
+**Prometheus Metrics:**
+```
+http2_pool_connections_active{backend}
+http2_pool_connections_created_total{backend}
+http2_pool_connections_failed_total{backend}
+http2_pool_requests_queued_total{backend}
+```
+
+**Load Test Results:**
+- 14,362 req/sec sustained throughput
+- 703μs average latency
+- 44,543:1 multiplexing ratio (1 connection served 44K requests)
+- Zero failures, zero queuing
+
+See [`docs/HTTP2_CONNECTION_POOLING.md`](docs/HTTP2_CONNECTION_POOLING.md) for design details.
 
 ---
 
-## Performance (Unknown)
+## Design Choices
 
-We haven't benchmarked seriously yet. It's week 1.
+**Why Gateway API instead of Ingress?**
 
-**Theoretical:**
-- Routing algorithm: O(log n) route lookup (matchit) + O(1) backend selection (Maglev)
-- In-memory routing: Should be fast-ish
-- No buffering: Streaming proxy (when we implement HTTP forwarding)
+Gateway API is the modern Kubernetes standard (v1 since Oct 2023). More expressive and role-oriented than Ingress.
 
-**Reality:** We don't know yet. Need to benchmark against real traffic.
+**Why Maglev for load balancing?**
+
+Consistent hashing keeps connections sticky to the same backend. When backends change, only ~1/N connections get redistributed. Maglev is Google's algorithm - fast (O(1) lookup) and proven at scale.
+
+**Why HTTP/2?**
+
+- Request multiplexing (1 connection → thousands of requests)
+- Header compression (HPACK)
+- Research-backed: ACM 2024 shows HTTP/2 outperforms HTTP/3 by 45%
+
+**Why WASM for plugins?**
+
+- Memory safe and sandboxed execution
+- Can't crash the proxy process
+- Platform-independent bytecode
+- Compile once, run anywhere
+
+**Why Rust?**
+
+- Memory safety (no segfaults in production)
+- Strong type system (catch bugs at compile time)
+- Excellent async ecosystem (tokio, hyper)
 
 ---
 
@@ -318,28 +176,19 @@ We haven't benchmarked seriously yet. It's week 1.
 
 **Userspace:**
 - **tokio** - Async runtime
+- **hyper** - HTTP/1.1 and HTTP/2
 - **kube-rs** - Kubernetes API client
 - **gateway-api** - Official Gateway API CRD types
-- **matchit** - Radix tree for path matching (used by axum)
+- **matchit** - Radix tree for path matching
 - **prometheus** - Metrics
 
-**Future (eBPF):**
-- **aya** - Rust eBPF framework
-- **XDP** - Packet observation (not routing!)
+**Future:**
+- **wasmtime** - WASM runtime for plugins
+- **io_uring** - Zero-copy I/O (Linux 5.7+)
 
 ---
 
 ## Development
-
-### Prerequisites
-
-```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Install pre-commit dependencies
-cargo install cargo-fmt cargo-clippy
-```
 
 ### Build and Test
 
@@ -359,72 +208,62 @@ cargo clippy -- -D warnings
 
 ### Pre-commit Hook
 
-The project enforces quality checks on every commit:
+Quality checks run automatically on commit:
 
 ```bash
-# Automatically runs on: git commit
 ✅ cargo fmt --check
 ✅ cargo clippy
 ✅ cargo test
 ```
 
-**Commit fails if:**
-- Code isn't formatted
-- Clippy warnings exist
-- Tests fail
-
-This keeps the codebase clean. See `.git/hooks/pre-commit`.
+Commit fails if code isn't formatted, has clippy warnings, or tests fail.
 
 ### TDD Workflow
 
-**All features follow Test-Driven Development:**
+All features follow Test-Driven Development:
 
 1. **RED**: Write failing test
 2. **GREEN**: Minimal implementation to pass
 3. **REFACTOR**: Improve code quality
 4. **COMMIT**: Small, focused commits
 
-See `CLAUDE.md` for detailed TDD guidelines.
+See `CLAUDE.md` for detailed guidelines.
 
 ---
 
-## Design Choices
+## Roadmap
 
-**Why Gateway API instead of Ingress?**
+**Completed:**
+- ✅ Gateway API controller (GatewayClass, Gateway, HTTPRoute)
+- ✅ EndpointSlice resolution for dynamic backends
+- ✅ Maglev load balancing
+- ✅ HTTP/2 connection pooling with circuit breakers
+- ✅ Prometheus metrics
 
-Gateway API is the newer Kubernetes standard (v1 as of Oct 2023). It's more expressive and role-oriented than Ingress. We wanted to learn it.
+**In Progress:**
+- 🚧 WASM plugin system design
+- 🚧 TLS termination
+- 🚧 Per-core worker architecture (lock-free routing)
 
-**Why Maglev for load balancing?**
-
-Consistent hashing keeps connections sticky to the same backend. When backends change, only ~1/N connections get redistributed. Maglev is Google's algorithm for this - it's fast (O(1) lookup) and well-tested at scale.
-
-**Why matchit for routing?**
-
-Kubernetes needs prefix matching (`/api/users` → `/api/users/123`). Can't use a HashMap for that. matchit is a radix tree used by axum - it's fast and battle-tested.
-
-**Why Rust?**
-
-- Memory safety (no segfaults in production)
-- Strong type system (catch bugs at compile time)
-- Good ecosystem (tokio, kube-rs, aya)
-- Learning opportunity
+**Future Exploration:**
+- io_uring zero-copy I/O
+- eBPF sockmap for service mesh mode
+- Multi-cluster routing
 
 ---
 
 ## Contributing
 
-**This is a learning project.** We're figuring things out as we go.
-
 **How to help:**
-1. **Try it** - Run in a kind cluster, report bugs
+1. **Try it** - Deploy in a cluster, report issues
 2. **Review code** - Suggest improvements
-3. **Improve docs** - Help explain better
+3. **Improve docs** - Make things clearer
 4. **Share ideas** - What features would be useful?
 
 **Before contributing:**
 - Read `CLAUDE.md` (project guidelines)
 - Follow TDD workflow (tests before code)
-- Keep commits small (<30 lines preferred)
+- Keep commits small and focused
 - No TODOs in code (finish features or document why)
 
 ---
@@ -435,8 +274,9 @@ Kubernetes needs prefix matching (`/api/users` → `/api/users/123`). Can't use 
 - **TAPIO**: Kubernetes observer 🌲
 - **AHTI**: Event correlation 🌊
 - **RAUTA**: Ingress controller ⚙️
+- **URPO**: Trace explorer 🔍
 
-Built in Rust, the language that prevents memory bugs (like rust on iron).
+Built in Rust, the language that prevents memory bugs.
 
 ---
 
@@ -450,10 +290,8 @@ Apache 2.0 - Free and open source.
 
 - **GitHub**: https://github.com/yairfalse/rauta
 - **Issues**: https://github.com/yairfalse/rauta/issues
-- **Docs**: See `docs/` and `documents/` directories
+- **Docs**: See `docs/` directory
 
 ---
 
-**Week 1 complete.** Learning in public. Join us! 🦀
-
-*This is experimental software. Not production-ready. Use at your own risk.*
+**Fast. Safe. Extensible.** 🦀
