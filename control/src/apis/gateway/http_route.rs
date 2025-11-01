@@ -50,7 +50,7 @@ impl HTTPRouteReconciler {
         &self,
         service_name: &str,
         namespace: &str,
-        _service_port: u32,
+        service_port: u32,
     ) -> Result<Vec<Backend>, kube::Error> {
         use k8s_openapi::api::discovery::v1::EndpointSlice;
         use kube::api::ListParams;
@@ -66,9 +66,10 @@ impl HTTPRouteReconciler {
             Ok(endpointslice_list) => {
                 let mut backends = Vec::new();
 
-                // Merge backends from all EndpointSlices
+                // Merge backends from all EndpointSlices, matching the target port
                 for endpointslice in endpointslice_list.items {
-                    let slice_backends = parse_endpointslice_to_backends(&endpointslice);
+                    let slice_backends =
+                        parse_endpointslice_to_backends(&endpointslice, service_port as u16);
                     backends.extend(slice_backends);
                 }
 
@@ -173,16 +174,13 @@ impl HTTPRouteReconciler {
                     }
 
                     if !backends.is_empty() {
+                        let backend_count = backends.len();
                         // Add route to router (using GET as default method)
-                        match ctx
-                            .router
-                            .add_route(HttpMethod::GET, path, backends.clone())
-                        {
+                        match ctx.router.add_route(HttpMethod::GET, path, backends) {
                             Ok(_) => {
                                 info!(
                                     "  - Added route: {} -> {} total backends",
-                                    path,
-                                    backends.len()
+                                    path, backend_count
                                 );
                                 routes_added += 1;
                             }
@@ -318,14 +316,19 @@ impl HTTPRouteReconciler {
 /// Parse EndpointSlice into Backend structs
 fn parse_endpointslice_to_backends(
     endpoint_slice: &k8s_openapi::api::discovery::v1::EndpointSlice,
+    target_port: u16,
 ) -> Vec<Backend> {
     let mut backends = Vec::new();
 
-    // Get port from EndpointSlice (default to 80 if not specified)
+    // Match the target port in EndpointSlice ports
     let port = if let Some(ports) = &endpoint_slice.ports {
-        ports.first().and_then(|p| p.port).unwrap_or(80) as u16
+        ports
+            .iter()
+            .find(|p| p.port.map(|pnum| pnum as u16) == Some(target_port))
+            .and_then(|p| p.port)
+            .unwrap_or(target_port as i32) as u16
     } else {
-        80
+        target_port
     };
 
     // Iterate through endpoints
@@ -493,8 +496,8 @@ mod tests {
             }]),
         };
 
-        // Parse into backends
-        let backends = parse_endpointslice_to_backends(&endpoint_slice);
+        // Parse into backends (target port 8080)
+        let backends = parse_endpointslice_to_backends(&endpoint_slice, 8080);
 
         // Verify we got 3 backends
         assert_eq!(backends.len(), 3, "Should have 3 backends");
@@ -582,7 +585,7 @@ mod tests {
             }]),
         };
 
-        let backends = parse_endpointslice_to_backends(&endpoint_slice);
+        let backends = parse_endpointslice_to_backends(&endpoint_slice, 8080);
 
         // Should only get 2 backends (the ready ones)
         assert_eq!(backends.len(), 2, "Should have 2 ready backends");
@@ -614,7 +617,7 @@ mod tests {
             }]),
         };
 
-        let backends = parse_endpointslice_to_backends(&endpoint_slice);
+        let backends = parse_endpointslice_to_backends(&endpoint_slice, 8080);
         assert_eq!(backends.len(), 0, "Should have 0 backends");
     }
 
@@ -639,7 +642,7 @@ mod tests {
             ports: None, // No port specified
         };
 
-        let backends = parse_endpointslice_to_backends(&endpoint_slice);
+        let backends = parse_endpointslice_to_backends(&endpoint_slice, 80);
         assert_eq!(backends.len(), 1);
         assert_eq!(backends[0].port, 80, "Should default to port 80");
     }
