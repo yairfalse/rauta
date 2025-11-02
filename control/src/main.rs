@@ -135,21 +135,25 @@ fn add_example_routes(router: &Arc<Router>) -> Result<()> {
     let backend_addr =
         env::var("RAUTA_BACKEND_ADDR").unwrap_or_else(|_| "127.0.0.1:9090".to_string());
 
-    // Parse IP:port
-    let parts: Vec<&str> = backend_addr.split(':').collect();
-    if parts.len() != 2 {
-        return Err(anyhow::anyhow!(
+    // Parse IP:port using rsplit_once to handle IPv6 addresses
+    // IPv6 format: [::1]:8080, IPv4 format: 127.0.0.1:8080
+    let (ip_str, port_str) = backend_addr.rsplit_once(':').ok_or_else(|| {
+        anyhow::anyhow!(
             "Invalid RAUTA_BACKEND_ADDR format. Expected IP:PORT, got: {}",
             backend_addr
-        ));
-    }
+        )
+    })?;
 
-    let ip: Ipv4Addr = parts[0]
+    // Parse port first
+    let port: u16 = port_str
         .parse()
-        .map_err(|e| anyhow::anyhow!("Invalid backend IP {}: {}", parts[0], e))?;
-    let port: u16 = parts[1]
+        .map_err(|e| anyhow::anyhow!("Invalid backend port {}: {}", port_str, e))?;
+
+    // Parse IPv4 address (strip brackets if present for IPv6 format)
+    let ip_str = ip_str.trim_start_matches('[').trim_end_matches(']');
+    let ip: Ipv4Addr = ip_str
         .parse()
-        .map_err(|e| anyhow::anyhow!("Invalid backend port {}: {}", parts[1], e))?;
+        .map_err(|e| anyhow::anyhow!("Invalid backend IP {}: {}", ip_str, e))?;
 
     // Route all paths to configured backend
     let backends = vec![Backend::new(u32::from(ip), port, 100)];

@@ -36,13 +36,6 @@ pub struct Router {
     prefix_router: Arc<RwLock<matchit::Router<RouteKey>>>,
 }
 
-impl Router {
-    /// Create new router
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
 impl Default for Router {
     fn default() -> Self {
         Self {
@@ -53,6 +46,11 @@ impl Default for Router {
 }
 
 impl Router {
+    /// Create new router
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Add or update route with backends (idempotent)
     ///
     /// If the route already exists with the same backends, this is a no-op.
