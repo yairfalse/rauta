@@ -385,7 +385,7 @@ async fn forward_to_backend(
     backend_req_builder = backend_req_builder.header("Host", backend_host);
 
     let backend_req = backend_req_builder
-        .body(Full::new(body_bytes))
+        .body(Full::new(body_bytes.clone())) // Clone for potential HTTP/2 → HTTP/1.1 fallback
         .map_err(|e| {
             error!(
                 request_id = %request_id,
@@ -411,12 +411,12 @@ async fn forward_to_backend(
     let backend_key = format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port);
     let use_http2 = {
         let cache = protocol_cache.lock().await;
-        cache.get(&backend_key).copied()
+        cache.get(&backend_key).copied().unwrap_or(true) // Default to HTTP/2 for modern backends
     };
 
     let backend_connect_start = Instant::now();
     let backend_resp = match use_http2 {
-        Some(true) => {
+        true => {
             // Backend is known to support HTTP/2, use production connection pool
             debug!(request_id = %request_id, "Using HTTP/2 connection pool for backend {}", backend_key);
 
@@ -467,25 +467,54 @@ async fn forward_to_backend(
                 })?
             };
 
-            sender.send_request(backend_req).await.map_err(|e| {
-                error!(
-                    request_id = %request_id,
-                    error.message = %e,
-                    error.type = "http2_request",
-                    "HTTP/2 request failed"
-                );
-                format!("HTTP/2 request failed: {}", e)
-            })?
-        }
-        Some(false) | None => {
-            // Backend uses HTTP/1.1 (cached or unknown)
-            debug!(request_id = %request_id, "Using HTTP/1.1 for backend {}", backend_key);
+            match sender.send_request(backend_req).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    // HTTP/2 failed - backend might be HTTP/1.1 only
+                    // Cache as HTTP/1.1 and retry
+                    warn!(
+                        request_id = %request_id,
+                        error.message = %e,
+                        backend = %backend_key,
+                        "HTTP/2 failed, falling back to HTTP/1.1"
+                    );
 
-            // Cache as HTTP/1.1 if unknown
-            if use_http2.is_none() {
-                let mut cache = protocol_cache.lock().await;
-                cache.insert(backend_key.clone(), false);
+                    // Cache as HTTP/1.1 for future requests
+                    {
+                        let mut cache = protocol_cache.lock().await;
+                        cache.insert(backend_key.clone(), false);
+                    }
+
+                    // Retry with HTTP/1.1
+                    // Rebuild the request (we have body_bytes, method_str, and backend_uri already)
+                    let method = hyper::Method::from_bytes(method_str.as_bytes())
+                        .map_err(|e| format!("Invalid method: {}", e))?;
+
+                    let fallback_req = Request::builder()
+                        .method(method)
+                        .uri(&backend_uri)
+                        .header(
+                            "Host",
+                            format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port),
+                        )
+                        .body(Full::new(body_bytes.clone()))
+                        .map_err(|e| format!("Failed to build fallback request: {}", e))?;
+
+                    client.request(fallback_req).await.map_err(|e| {
+                        error!(
+                            request_id = %request_id,
+                            error.message = %e,
+                            error.type = "backend_connection",
+                            "HTTP/1.1 fallback also failed"
+                        );
+                        format!("Backend connection failed: {}", e)
+                    })?
+                }
             }
+        }
+        false => {
+            // Backend uses HTTP/1.1 (explicitly cached as HTTP/1.1 only)
+            debug!(request_id = %request_id, "Using HTTP/1.1 for backend {} (cached)", backend_key);
 
             client.request(backend_req).await.map_err(|e| {
                 error!(
@@ -859,7 +888,7 @@ mod tests {
         let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_addr = backend_listener.local_addr().unwrap();
 
-        // Backend responds with "Hello from backend"
+        // Backend responds with "Hello from backend" (HTTP/2 support)
         tokio::spawn(async move {
             let (stream, _) = backend_listener.accept().await.unwrap();
             let io = TokioIo::new(stream);
@@ -873,7 +902,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         // Wait for backend to start
@@ -943,7 +975,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1013,7 +1048,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1108,7 +1146,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1194,7 +1235,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1281,7 +1325,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1368,7 +1415,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1459,7 +1509,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1692,7 +1745,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
