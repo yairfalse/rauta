@@ -23,7 +23,7 @@ impl Worker {
         Self {
             id,
             router,
-            pools: BackendConnectionPools::new(),
+            pools: BackendConnectionPools::new(id), // Pass worker_id to pools
         }
     }
 

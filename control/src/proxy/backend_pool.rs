@@ -23,13 +23,13 @@ lazy_static! {
     /// Global HTTP/2 pool metrics registry
     static ref POOL_METRICS_REGISTRY: Registry = Registry::new();
 
-    /// Active HTTP/2 connections per backend (Gauge)
+    /// Active HTTP/2 connections per backend and worker (Gauge)
     static ref POOL_CONNECTIONS_ACTIVE: IntGaugeVec = {
         let opts = Opts::new(
             "http2_pool_connections_active",
-            "Active HTTP/2 connections per backend"
+            "Active HTTP/2 connections per backend and worker (for lock-free verification)"
         );
-        let gauge = IntGaugeVec::new(opts, &["backend"])
+        let gauge = IntGaugeVec::new(opts, &["backend", "worker_id"])
             .expect("Failed to create http2_pool_connections_active gauge");
         POOL_METRICS_REGISTRY
             .register(Box::new(gauge.clone()))
@@ -37,13 +37,13 @@ lazy_static! {
         gauge
     };
 
-    /// Total HTTP/2 connections created (Counter)
+    /// Total HTTP/2 connections created per backend and worker (Counter)
     static ref POOL_CONNECTIONS_CREATED: IntCounterVec = {
         let opts = Opts::new(
             "http2_pool_connections_created_total",
-            "Total HTTP/2 connections created"
+            "Total HTTP/2 connections created per backend and worker"
         );
-        let counter = IntCounterVec::new(opts, &["backend"])
+        let counter = IntCounterVec::new(opts, &["backend", "worker_id"])
             .expect("Failed to create http2_pool_connections_created_total counter");
         POOL_METRICS_REGISTRY
             .register(Box::new(counter.clone()))
@@ -51,13 +51,13 @@ lazy_static! {
         counter
     };
 
-    /// Total HTTP/2 connection failures (Counter)
+    /// Total HTTP/2 connection failures per backend and worker (Counter)
     static ref POOL_CONNECTIONS_FAILED: IntCounterVec = {
         let opts = Opts::new(
             "http2_pool_connections_failed_total",
-            "Total HTTP/2 connection failures"
+            "Total HTTP/2 connection failures per backend and worker"
         );
-        let counter = IntCounterVec::new(opts, &["backend"])
+        let counter = IntCounterVec::new(opts, &["backend", "worker_id"])
             .expect("Failed to create http2_pool_connections_failed_total counter");
         POOL_METRICS_REGISTRY
             .register(Box::new(counter.clone()))
@@ -65,13 +65,13 @@ lazy_static! {
         counter
     };
 
-    /// Total requests queued waiting for connection (Counter)
+    /// Total requests queued waiting for connection per backend and worker (Counter)
     static ref POOL_REQUESTS_QUEUED: IntCounterVec = {
         let opts = Opts::new(
             "http2_pool_requests_queued_total",
-            "Total requests queued waiting for connection"
+            "Total requests queued waiting for connection per backend and worker"
         );
-        let counter = IntCounterVec::new(opts, &["backend"])
+        let counter = IntCounterVec::new(opts, &["backend", "worker_id"])
             .expect("Failed to create http2_pool_requests_queued_total counter");
         POOL_METRICS_REGISTRY
             .register(Box::new(counter.clone()))
@@ -84,8 +84,9 @@ lazy_static! {
 type Full<T> = http_body_util::Full<T>;
 
 /// Per-worker backend connection pools
-/// NOTE: Currently uses Arc<Mutex> for simplicity, will be per-core owned in Stage 2
+/// Each worker owns its pools (no Arc/Mutex on hot path)
 pub struct BackendConnectionPools {
+    worker_id: usize, // For metrics labeling
     pools: HashMap<BackendKey, Http2Pool>,
 }
 
@@ -108,6 +109,7 @@ impl From<Backend> for BackendKey {
 /// Pool of HTTP/2 connections to a single backend
 pub struct Http2Pool {
     backend: Backend,
+    worker_id: usize, // For per-worker metrics
 
     // Active HTTP/2 connections
     connections: Vec<Http2Connection>,
@@ -191,13 +193,14 @@ pub enum PoolError {
 
 impl Default for BackendConnectionPools {
     fn default() -> Self {
-        Self::new()
+        Self::new(0) // Default to worker 0 for backwards compat
     }
 }
 
 impl BackendConnectionPools {
-    pub fn new() -> Self {
+    pub fn new(worker_id: usize) -> Self {
         Self {
+            worker_id,
             pools: HashMap::new(),
         }
     }
@@ -205,21 +208,24 @@ impl BackendConnectionPools {
     /// Get or create pool for backend
     pub fn get_or_create_pool(&mut self, backend: Backend) -> &mut Http2Pool {
         let key = BackendKey::from(backend);
+        let worker_id = self.worker_id; // Capture for closure
         self.pools.entry(key).or_insert_with(|| {
             debug!(
                 backend_ip = %ipv4_to_string(backend.ipv4),
                 backend_port = backend.port,
+                worker_id = worker_id,
                 "Creating new HTTP/2 pool for backend"
             );
-            Http2Pool::new(backend)
+            Http2Pool::new(backend, worker_id)
         })
     }
 }
 
 impl Http2Pool {
-    pub fn new(backend: Backend) -> Self {
+    pub fn new(backend: Backend, worker_id: usize) -> Self {
         Self {
             backend,
+            worker_id,
             connections: Vec::new(),
             max_connections: 4,        // Start conservative
             max_streams_per_conn: 100, // Default, will be updated from SETTINGS
@@ -262,8 +268,9 @@ impl Http2Pool {
                 ipv4_to_string(self.backend.ipv4),
                 self.backend.port
             );
+            let worker_label = self.worker_id.to_string();
             POOL_CONNECTIONS_ACTIVE
-                .with_label_values(&[&backend_label])
+                .with_label_values(&[&backend_label, &worker_label])
                 .set(after_cleanup as i64);
         }
 
@@ -300,8 +307,9 @@ impl Http2Pool {
             ipv4_to_string(self.backend.ipv4),
             self.backend.port
         );
+        let worker_label = self.worker_id.to_string();
         POOL_REQUESTS_QUEUED
-            .with_label_values(&[&backend_label])
+            .with_label_values(&[&backend_label, &worker_label])
             .inc();
 
         Err(PoolError::NoCapacity)
@@ -349,11 +357,12 @@ impl Http2Pool {
 
         // Update Prometheus metrics
         let backend_label = backend_addr.as_str();
+        let worker_label = self.worker_id.to_string();
         POOL_CONNECTIONS_CREATED
-            .with_label_values(&[backend_label])
+            .with_label_values(&[backend_label, &worker_label])
             .inc();
         POOL_CONNECTIONS_ACTIVE
-            .with_label_values(&[backend_label])
+            .with_label_values(&[backend_label, &worker_label])
             .set(self.connections.len() as i64 + 1); // +1 for the new connection
 
         Ok(Http2Connection {
@@ -396,8 +405,9 @@ impl Http2Pool {
             ipv4_to_string(self.backend.ipv4),
             self.backend.port
         );
+        let worker_label = self.worker_id.to_string();
         POOL_CONNECTIONS_FAILED
-            .with_label_values(&[&backend_label])
+            .with_label_values(&[&backend_label, &worker_label])
             .inc();
 
         // Circuit breaker logic
@@ -469,7 +479,7 @@ mod tests {
     #[ignore]
     async fn test_pool_metrics_exposed() {
         let backend = Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 9001, 100);
-        let mut pools = BackendConnectionPools::new();
+        let mut pools = BackendConnectionPools::new(0); // Test worker 0
         let pool = pools.get_or_create_pool(backend);
 
         // Trigger some metrics
@@ -496,7 +506,7 @@ mod tests {
     async fn test_pool_metrics_connection_failures() {
         // Invalid backend (nothing listening on port 1)
         let backend = Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 1, 100);
-        let mut pools = BackendConnectionPools::new();
+        let mut pools = BackendConnectionPools::new(0); // Test worker 0
         let pool = pools.get_or_create_pool(backend);
 
         // Try to create connection (should fail)
@@ -512,10 +522,11 @@ mod tests {
             "Should export connections_failed_total metric"
         );
 
-        // Check value is at least 1
+        // Check value is at least 1 (with worker_id label)
         assert!(
-            metrics_output
-                .contains("http2_pool_connections_failed_total{backend=\"127.0.0.1:1\"} 1"),
+            metrics_output.contains(
+                "http2_pool_connections_failed_total{backend=\"127.0.0.1:1\",worker_id=\"0\"} 1"
+            ),
             "Should count connection failure"
         );
     }
@@ -524,19 +535,22 @@ mod tests {
     #[tokio::test]
     async fn test_pool_metrics_active_connections() {
         let backend = Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 9001, 100);
-        let mut pools = BackendConnectionPools::new();
+        let mut pools = BackendConnectionPools::new(0); // Test worker 0
         let pool = pools.get_or_create_pool(backend);
 
         // Initialize gauge to 0
         let backend_label = format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port);
+        let worker_label = pool.worker_id.to_string();
         POOL_CONNECTIONS_ACTIVE
-            .with_label_values(&[&backend_label])
+            .with_label_values(&[&backend_label, &worker_label])
             .set(pool.connections.len() as i64);
 
         // Get current active connections (should be 0)
         let metrics_before = gather_pool_metrics().expect("Should gather metrics");
         assert!(
-            metrics_before.contains("http2_pool_connections_active{backend=\"127.0.0.1:9001\"} 0"),
+            metrics_before.contains(
+                "http2_pool_connections_active{backend=\"127.0.0.1:9001\",worker_id=\"0\"} 0"
+            ),
             "Should show 0 active connections initially"
         );
     }
@@ -545,7 +559,7 @@ mod tests {
     #[tokio::test]
     async fn test_pool_metrics_queued_requests() {
         let backend = Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 9001, 100);
-        let mut pools = BackendConnectionPools::new();
+        let mut pools = BackendConnectionPools::new(0); // Test worker 0
         let pool = pools.get_or_create_pool(backend);
 
         // Set max_connections to 0 to force queueing

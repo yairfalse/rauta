@@ -114,8 +114,8 @@ impl ProxyServer {
         // Create HTTP client with connection pooling
         let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
 
-        // Create production-grade HTTP/2 backend connection pools
-        let backend_pools = Arc::new(Mutex::new(BackendConnectionPools::new()));
+        // Create production-grade HTTP/2 backend connection pools (shared, non-worker mode)
+        let backend_pools = Arc::new(Mutex::new(BackendConnectionPools::new(0)));
 
         // Create protocol detection cache
         let protocol_cache = Arc::new(Mutex::new(HashMap::new()));
@@ -157,7 +157,7 @@ impl ProxyServer {
             bind_addr,
             router,
             client,
-            backend_pools: Arc::new(Mutex::new(BackendConnectionPools::new())), // Not used in worker mode
+            backend_pools: Arc::new(Mutex::new(BackendConnectionPools::new(0))), // Not used in worker mode
             protocol_cache,
             workers: Some(Arc::new(Mutex::new(workers))),
             worker_selector: Some(Arc::new(WorkerSelector::new(num_workers))),
