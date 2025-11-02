@@ -38,6 +38,22 @@ impl Worker {
     pub fn pools(&mut self) -> &mut BackendConnectionPools {
         &mut self.pools
     }
+
+    /// Get HTTP/2 connection for backend (lock-free!)
+    ///
+    /// This is the hot path method - no Arc<Mutex> here!
+    /// Each worker owns its pools, so this is just a mutable borrow.
+    #[allow(dead_code)] // Will be used in request handling
+    pub async fn get_backend_connection(
+        &mut self,
+        backend: common::Backend,
+    ) -> Result<
+        hyper::client::conn::http2::SendRequest<http_body_util::Full<hyper::body::Bytes>>,
+        crate::proxy::backend_pool::PoolError,
+    > {
+        let pool = self.pools.get_or_create_pool(backend);
+        pool.get_connection().await
+    }
 }
 
 #[cfg(test)]

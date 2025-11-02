@@ -67,6 +67,30 @@ type BackendPools = Arc<Mutex<BackendConnectionPools>>;
 /// Each worker owns its own BackendConnectionPools (no Arc<Mutex>!)
 type Workers = Arc<Mutex<Vec<Worker>>>;
 
+/// Worker selector for round-robin distribution
+/// In production, this would use CPU affinity, but round-robin is simpler for now
+struct WorkerSelector {
+    counter: std::sync::atomic::AtomicUsize,
+    num_workers: usize,
+}
+
+impl WorkerSelector {
+    fn new(num_workers: usize) -> Self {
+        Self {
+            counter: std::sync::atomic::AtomicUsize::new(0),
+            num_workers,
+        }
+    }
+
+    /// Select next worker (round-robin)
+    fn select(&self) -> usize {
+        let current = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        current % self.num_workers
+    }
+}
+
 /// Protocol detection cache - tracks which backends support HTTP/2
 type ProtocolCache = Arc<Mutex<HashMap<String, bool>>>; // true = HTTP/2, false = HTTP/1.1
 
@@ -79,6 +103,8 @@ pub struct ProxyServer {
     protocol_cache: ProtocolCache,
     #[allow(dead_code)] // Used in tests; will be used in request handling path
     workers: Option<Workers>, // None = legacy mode, Some = per-core workers (lock-free!)
+    #[allow(dead_code)] // Used when workers are enabled
+    worker_selector: Option<Arc<WorkerSelector>>, // Round-robin worker selection
 }
 
 impl ProxyServer {
@@ -100,6 +126,7 @@ impl ProxyServer {
             backend_pools,
             protocol_cache,
             workers: None, // Legacy mode (Arc<Mutex> pools)
+            worker_selector: None,
         })
     }
 
@@ -132,6 +159,7 @@ impl ProxyServer {
             backend_pools: Arc::new(Mutex::new(BackendConnectionPools::new())), // Not used in worker mode
             protocol_cache,
             workers: Some(Arc::new(Mutex::new(workers))),
+            worker_selector: Some(Arc::new(WorkerSelector::new(num_workers))),
         })
     }
 
