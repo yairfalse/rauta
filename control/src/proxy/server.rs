@@ -385,8 +385,12 @@ async fn forward_to_backend(
     let backend_host = format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port);
     backend_req_builder = backend_req_builder.header("Host", backend_host);
 
+    // Clone body once for potential retry (Bytes::clone is cheap - Arc increment)
+    // Use the clone for HTTP/2 attempt, keep original for fallback if needed
+    let body_for_http2 = body_bytes.clone();
+
     let backend_req = backend_req_builder
-        .body(Full::new(body_bytes.clone())) // Clone for potential HTTP/2 → HTTP/1.1 fallback
+        .body(Full::new(body_for_http2))
         .map_err(|e| {
             error!(
                 request_id = %request_id,
@@ -489,7 +493,7 @@ async fn forward_to_backend(
                     }
 
                     // Retry with HTTP/1.1
-                    // Rebuild the request (we have body_bytes, method_str, and backend_uri already)
+                    // Rebuild the request using original body_bytes (no additional clone needed!)
                     let method = hyper::Method::from_bytes(method_str.as_bytes())
                         .map_err(|e| format!("Invalid method: {}", e))?;
 
@@ -500,7 +504,7 @@ async fn forward_to_backend(
                             "Host",
                             format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port),
                         )
-                        .body(Full::new(body_bytes.clone()))
+                        .body(Full::new(body_bytes)) // Use original, already cloned once above
                         .map_err(|e| format!("Failed to build fallback request: {}", e))?;
 
                     client.request(fallback_req).await.map_err(|e| {
