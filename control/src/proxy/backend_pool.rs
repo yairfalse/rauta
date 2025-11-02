@@ -228,7 +228,7 @@ impl Http2Pool {
             worker_id,
             connections: Vec::new(),
             max_connections: 4,        // Start conservative
-            max_streams_per_conn: 100, // Default, will be updated from SETTINGS
+            max_streams_per_conn: 500, // RFC 7540 Section 6.5.2 - increased from 100 for Phase 1
             health_state: HealthState::Healthy,
             consecutive_failures: 0,
             last_success: Instant::now(),
@@ -337,8 +337,11 @@ impl Http2Pool {
 
         let io = TokioIo::new(stream);
 
-        // HTTP/2 handshake
-        let (sender, conn) = http2::handshake(TokioExecutor::new(), io)
+        // HTTP/2 handshake with Builder to configure max_concurrent_streams
+        // Per RFC 7540 Section 6.5.2: SETTINGS_MAX_CONCURRENT_STREAMS
+        let (sender, conn) = http2::Builder::new(TokioExecutor::new())
+            .max_concurrent_streams(self.max_streams_per_conn)
+            .handshake(io)
             .await
             .map_err(|e| {
                 self.record_failure();
@@ -579,6 +582,22 @@ mod tests {
         assert!(
             metrics_output.contains("http2_pool_requests_queued_total"),
             "Should export requests_queued_total metric"
+        );
+    }
+
+    /// RED: Test that max_concurrent_streams is configured to 500 (Phase 1: Connection Pool Tuning)
+    /// Per RFC 7540 Section 6.5.2 and HTTP2_OPTIMIZATION_ROADMAP.md
+    /// This test will FAIL until we implement http2::Builder with max_concurrent_streams(500)
+    #[tokio::test]
+    async fn test_max_concurrent_streams_configured() {
+        let backend = Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 9001, 100);
+        let mut pools = BackendConnectionPools::new(0);
+        let pool = pools.get_or_create_pool(backend);
+
+        // Verify pool is configured for 500 streams per connection (not default 100)
+        assert_eq!(
+            pool.max_streams_per_conn, 500,
+            "Pool should be configured for 500 max concurrent streams per RFC 7540"
         );
     }
 }
