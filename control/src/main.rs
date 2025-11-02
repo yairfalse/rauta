@@ -165,6 +165,8 @@ fn add_example_routes(router: &Arc<Router>) -> Result<()> {
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid backend IP {}: {}", ip_str, e))?;
 
+    info!("   Backend: {}:{}", ip, port);
+
     // Route all paths to configured backend
     let backends = vec![Backend::new(u32::from(ip), port, 100)];
 

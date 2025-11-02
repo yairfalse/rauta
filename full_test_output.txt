@@ -1,0 +1,61 @@
+🚀 RAUTA Load Test Suite
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🧹 Cleaning up old processes...
+📦 Building binaries...
+    Finished `release` profile [optimized] target(s) in 0.35s
+🔧 Starting HTTP/2 backend server on :8082...
+✅ Testing backend...
+🔧 Starting proxy server on :8081 -> :8082...
+✅ Testing proxy...
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ Test environment ready!
+   Backend PID: 11281 (port 8082)
+   Proxy PID: 11299 (port 8081)
+   Logs: backend.log, proxy.log
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔥 Starting progressive load tests...
+━━━ TEST 1: BASELINE (10 conn, 5s) ━━━
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   130.96us   92.76us   4.27ms   97.84%
+Requests/sec:  76188.17
+
+━━━ TEST 2: LIGHT (50 conn, 10s) ━━━
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   536.24us  202.95us  14.73ms   96.45%
+Requests/sec:  88328.13
+
+━━━ TEST 3: MEDIUM (100 conn, 10s) ━━━
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     1.72ms    2.47ms  91.50ms   94.53%
+Requests/sec:  70641.86
+
+━━━ TEST 4: HEAVY (200 conn, 10s) ━━━
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.78ms    2.31ms 106.14ms   95.41%
+Requests/sec:  77257.83
+
+━━━ TEST 5: STRESS (400 conn, 10s) ━━━
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.79ms    1.07ms  34.22ms   90.85%
+Requests/sec:  81915.29
+
+━━━ TEST 6: MAX (800 conn, 10s) ━━━
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     9.33ms    0.85ms  28.86ms   91.19%
+Requests/sec:  84629.61
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 SUMMARY (Requests/sec):
+     1	Requests/sec:  76188.17
+     2	Requests/sec:  88328.13
+     3	Requests/sec:  70641.86
+     4	Requests/sec:  77257.83
+     5	Requests/sec:  81915.29
+     6	Requests/sec:  84629.61
+
+📁 Full results: load_test_results.txt
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+

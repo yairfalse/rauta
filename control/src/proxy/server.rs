@@ -108,7 +108,8 @@ pub struct ProxyServer {
 }
 
 impl ProxyServer {
-    /// Create new proxy server
+    /// Create new proxy server (legacy method - use new_with_workers for better performance)
+    #[allow(dead_code)]
     pub fn new(bind_addr: String, router: Arc<Router>) -> Result<Self, String> {
         // Create HTTP client with connection pooling
         let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
@@ -191,6 +192,8 @@ impl ProxyServer {
             let client = self.client.clone();
             let backend_pools = self.backend_pools.clone();
             let protocol_cache = self.protocol_cache.clone();
+            let workers = self.workers.clone();
+            let worker_selector = self.worker_selector.clone();
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
@@ -200,8 +203,19 @@ impl ProxyServer {
                     let client = client.clone();
                     let backend_pools = backend_pools.clone();
                     let protocol_cache = protocol_cache.clone();
+                    let workers = workers.clone();
+                    let worker_selector = worker_selector.clone();
                     async move {
-                        handle_request(req, router, client, backend_pools, protocol_cache).await
+                        handle_request(
+                            req,
+                            router,
+                            client,
+                            backend_pools,
+                            protocol_cache,
+                            workers,
+                            worker_selector,
+                        )
+                        .await
                     }
                 });
 
@@ -233,6 +247,8 @@ impl ProxyServer {
             let client = self.client.clone();
             let backend_pools = self.backend_pools.clone();
             let protocol_cache = self.protocol_cache.clone();
+            let workers = self.workers.clone();
+            let worker_selector = self.worker_selector.clone();
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
@@ -242,8 +258,19 @@ impl ProxyServer {
                     let client = client.clone();
                     let backend_pools = backend_pools.clone();
                     let protocol_cache = protocol_cache.clone();
+                    let workers = workers.clone();
+                    let worker_selector = worker_selector.clone();
                     async move {
-                        handle_request(req, router, client, backend_pools, protocol_cache).await
+                        handle_request(
+                            req,
+                            router,
+                            client,
+                            backend_pools,
+                            protocol_cache,
+                            workers,
+                            worker_selector,
+                        )
+                        .await
                     }
                 });
 
@@ -285,6 +312,7 @@ fn is_hop_by_hop_header(name: &str) -> bool {
 }
 
 /// Forward request to backend server
+#[allow(clippy::too_many_arguments)] // Workers integration requires additional parameters
 async fn forward_to_backend(
     req: Request<hyper::body::Incoming>,
     backend: common::Backend,
@@ -292,6 +320,8 @@ async fn forward_to_backend(
     request_id: &str,
     backend_pools: BackendPools,
     protocol_cache: ProtocolCache,
+    workers: Option<Workers>,
+    worker_index: Option<usize>,
 ) -> Result<Response<Full<Bytes>>, String> {
     let request_start = Instant::now();
 
@@ -390,7 +420,38 @@ async fn forward_to_backend(
             // Backend is known to support HTTP/2, use production connection pool
             debug!(request_id = %request_id, "Using HTTP/2 connection pool for backend {}", backend_key);
 
-            let mut sender = {
+            let mut sender = if let (Some(workers_arc), Some(idx)) = (workers, worker_index) {
+                // Worker path: Lock-free! Each worker owns its pools
+                debug!(
+                    request_id = %request_id,
+                    worker_index = idx,
+                    "Using per-core worker connection pool (lock-free)"
+                );
+
+                let mut workers_guard = workers_arc.lock().await;
+                let worker = &mut workers_guard[idx];
+                worker
+                    .get_backend_connection(backend)
+                    .await
+                    .map_err(|e| match e {
+                        PoolError::CircuitBreakerOpen => {
+                            error!(
+                                request_id = %request_id,
+                                backend = %backend_key,
+                                worker_index = idx,
+                                "Circuit breaker open for backend"
+                            );
+                            "Circuit breaker open".to_string()
+                        }
+                        _ => format!("Failed to get HTTP/2 connection from worker: {}", e),
+                    })?
+            } else {
+                // Legacy path: Shared pools with Arc<Mutex> (slower)
+                debug!(
+                    request_id = %request_id,
+                    "Using legacy shared connection pool"
+                );
+
                 let mut pools = backend_pools.lock().await;
                 let pool = pools.get_or_create_pool(backend);
                 pool.get_connection().await.map_err(|e| match e {
@@ -554,6 +615,8 @@ async fn handle_request(
     client: Client<HttpConnector, Full<Bytes>>,
     backend_pools: BackendPools,
     protocol_cache: ProtocolCache,
+    workers: Option<Workers>,
+    worker_selector: Option<Arc<WorkerSelector>>,
 ) -> Result<Response<Full<Bytes>>, String> {
     // Generate or extract request ID
     let request_id = req
@@ -634,12 +697,16 @@ async fn handle_request(
 
     match route_match {
         Some(route_match) => {
+            // Select worker for this request (lock-free round-robin)
+            let worker_index = worker_selector.as_ref().map(|selector| selector.select());
+
             info!(
                 request_id = %request_id,
                 stage = "route_matched",
                 route.pattern = %route_match.pattern,
                 network.peer.address = %ipv4_to_string(route_match.backend.ipv4),
                 network.peer.port = route_match.backend.port,
+                worker_index = ?worker_index,
                 "Route matched, forwarding to backend"
             );
 
@@ -650,6 +717,8 @@ async fn handle_request(
                 &request_id,
                 backend_pools,
                 protocol_cache,
+                workers,
+                worker_index,
             )
             .await;
             let duration = start.elapsed();

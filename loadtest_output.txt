@@ -1,0 +1,82 @@
+🚀 RAUTA Load Test Suite
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🧹 Cleaning up old processes...
+📦 Building binaries...
+    Finished `release` profile [optimized] target(s) in 0.21s
+🔧 Starting HTTP/2 backend server on :8082...
+✅ Testing backend...
+🔧 Starting proxy server on :8081 -> :8082...
+✅ Testing proxy...
+⚠️  Proxy may not be ready, checking logs...
+...
+296 |     pub async fn run(self) -> Result<(), kube::Error> {
+    |                  ^^^
+
+warning: function `parse_endpointslice_to_backends` is never used
+   --> control/src/apis/gateway/http_route.rs:317:4
+    |
+317 | fn parse_endpointslice_to_backends(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_httproute_reconciliation` is never used
+   --> control/src/apis/metrics.rs:100:8
+    |
+100 | pub fn record_httproute_reconciliation(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `control` (lib) generated 9 warnings
+    Finished `release` profile [optimized] target(s) in 0.06s
+     Running `target/release/control`
+[2m2025-11-01T21:31:55.683275Z[0m [31mERROR[0m [2mcontrol[0m[2m:[0m Server error: Failed to bind to 127.0.0.1:8081: Address already in use (os error 48)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ Test environment ready!
+   Backend PID: 85018 (port 8082)
+   Proxy PID: 85042 (port 8081)
+   Logs: backend.log, proxy.log
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔥 Starting progressive load tests...
+━━━ TEST 1: BASELINE (10 conn, 5s) ━━━
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     0.00us    0.00us   0.00us     nan%
+Requests/sec:      0.00
+
+━━━ TEST 2: LIGHT (50 conn, 10s) ━━━
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     0.00us    0.00us   0.00us     nan%
+Requests/sec:      0.00
+
+━━━ TEST 3: MEDIUM (100 conn, 10s) ━━━
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     0.00us    0.00us   0.00us     nan%
+Requests/sec:      0.00
+
+━━━ TEST 4: HEAVY (200 conn, 10s) ━━━
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     0.00us    0.00us   0.00us     nan%
+Requests/sec:      0.00
+
+━━━ TEST 5: STRESS (400 conn, 10s) ━━━
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     0.00us    0.00us   0.00us     nan%
+Requests/sec:      0.00
+
+━━━ TEST 6: MAX (800 conn, 10s) ━━━
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     0.00us    0.00us   0.00us     nan%
+Requests/sec:      0.00
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 SUMMARY (Requests/sec):
+     1	Requests/sec:      0.00
+     2	Requests/sec:      0.00
+     3	Requests/sec:      0.00
+     4	Requests/sec:      0.00
+     5	Requests/sec:      0.00
+     6	Requests/sec:      0.00
+
+📁 Full results: load_test_results.txt
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
