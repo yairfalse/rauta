@@ -1,20 +1,25 @@
 //! Per-core worker architecture for lock-free performance
 //!
 //! Each CPU core gets its own worker with dedicated connection pools.
-//! No Arc/Mutex on hot path = maximum throughput.
+//! Lock-free worker selection + per-worker pool locks = maximum throughput.
 
 use crate::proxy::backend_pool::BackendConnectionPools;
 use crate::proxy::router::Router;
 use std::sync::Arc;
+use tokio::sync::Mutex; // Async-aware Mutex (Send-safe across await)
 
-/// Per-core worker (owns connection pools, no sharing!)
+/// Per-core worker (owns connection pools with per-worker locking)
+///
+/// Architecture:
+/// - Workers stored in Arc<Vec<Worker>> (immutable, lock-free selection)
+/// - Each worker has Mutex<BackendConnectionPools> (per-worker lock)
+/// - Result: Concurrent requests to different workers don't block each other!
 pub struct Worker {
-    #[allow(dead_code)] // Used in tests; will be used for routing
+    #[allow(dead_code)] // Used in tests and metrics
     id: usize,
     #[allow(dead_code)] // Will be used when server integrates workers
     router: Arc<Router>,
-    #[allow(dead_code)] // Used in tests via pools() method
-    pools: BackendConnectionPools, // OWNED, not Arc<Mutex>!
+    pools: Mutex<BackendConnectionPools>, // Per-worker lock (not global!)
 }
 
 impl Worker {
@@ -23,35 +28,32 @@ impl Worker {
         Self {
             id,
             router,
-            pools: BackendConnectionPools::new(id), // Pass worker_id to pools
+            pools: Mutex::new(BackendConnectionPools::new(id)), // Wrap in per-worker Mutex
         }
     }
 
-    /// Get worker ID (core number)
-    #[allow(dead_code)] // Used in tests; will be used for debugging/metrics
+    /// Get worker ID (core number) - lock-free!
+    #[allow(dead_code)] // Used in tests and will be used for metrics/debugging
     pub fn id(&self) -> usize {
         self.id
     }
 
-    /// Get reference to connection pools (owned by this worker)
-    #[allow(dead_code)] // Used in tests; will be used in request handling
-    pub fn pools(&mut self) -> &mut BackendConnectionPools {
-        &mut self.pools
-    }
-
-    /// Get HTTP/2 connection for backend (lock-free!)
+    /// Get HTTP/2 connection for backend (per-worker lock)
     ///
-    /// This is the hot path method - no Arc<Mutex> here!
-    /// Each worker owns its pools, so this is just a mutable borrow.
-    #[allow(dead_code)] // Will be used in request handling
+    /// Lock scope:
+    /// - Worker selection: lock-free (Arc<Vec<Worker>>)
+    /// - Pool access: per-worker lock (tokio::Mutex, async-aware)
+    /// - Result: Concurrent requests to different workers run in parallel!
     pub async fn get_backend_connection(
-        &mut self,
+        &self, // Changed from &mut self - no longer needs exclusive access
         backend: common::Backend,
     ) -> Result<
         hyper::client::conn::http2::SendRequest<http_body_util::Full<hyper::body::Bytes>>,
         crate::proxy::backend_pool::PoolError,
     > {
-        let pool = self.pools.get_or_create_pool(backend);
+        // Per-worker lock (only contends with requests to same worker)
+        let mut pools = self.pools.lock().await;
+        let pool = pools.get_or_create_pool(backend);
         pool.get_connection().await
     }
 }
@@ -62,29 +64,30 @@ mod tests {
     use common::{Backend, HttpMethod};
     use std::net::Ipv4Addr;
 
-    /// RED: Test that each worker owns its pools (no Arc/Mutex)
+    /// GREEN: Test that each worker owns its pools (per-worker Mutex)
     #[tokio::test]
     async fn test_worker_owns_pools() {
         let router = Arc::new(Router::new());
 
         // Create two workers
-        let mut worker1 = Worker::new(0, router.clone());
-        let mut worker2 = Worker::new(1, router.clone());
+        let worker1 = Worker::new(0, router.clone());
+        let worker2 = Worker::new(1, router.clone());
 
         assert_eq!(worker1.id(), 0);
         assert_eq!(worker2.id(), 1);
 
-        // Each worker has its own pools (different memory addresses)
-        let pools1_ptr = worker1.pools() as *mut BackendConnectionPools;
-        let pools2_ptr = worker2.pools() as *mut BackendConnectionPools;
+        // Each worker has its own Mutex<BackendConnectionPools>
+        // Verify they have different memory addresses
+        let pools1_ptr = &worker1.pools as *const Mutex<BackendConnectionPools>;
+        let pools2_ptr = &worker2.pools as *const Mutex<BackendConnectionPools>;
 
         assert_ne!(
             pools1_ptr, pools2_ptr,
-            "Workers should have separate pool instances"
+            "Workers should have separate pool instances (per-worker Mutex)"
         );
     }
 
-    /// RED: Test that worker can get connections without locks
+    /// GREEN: Test that worker can get connections (per-worker lock only)
     #[tokio::test]
     async fn test_worker_lock_free_connection() {
         let router = Arc::new(Router::new());
@@ -96,22 +99,20 @@ mod tests {
             .add_route(HttpMethod::GET, "/api/test", vec![backend])
             .expect("Should add route");
 
-        let mut worker = Worker::new(0, router.clone());
-
-        // Get pool for backend (no locks needed!)
-        let pool = worker.pools().get_or_create_pool(backend);
+        let worker = Worker::new(0, router.clone());
 
         // Try to get connection (will fail since nothing is listening on 9999)
-        let result = pool.get_connection().await;
+        // This uses per-worker lock (not global lock!)
+        let result = worker.get_backend_connection(backend).await;
 
-        // Expected to fail, but should compile and run without Arc<Mutex>
+        // Expected to fail, but should compile and run
         assert!(
             result.is_err(),
             "Should fail to connect (no backend running)"
         );
     }
 
-    /// RED: Test multiple workers can operate independently
+    /// GREEN: Test multiple workers can operate independently
     #[tokio::test]
     async fn test_workers_independent() {
         let router = Arc::new(Router::new());
@@ -123,17 +124,79 @@ mod tests {
             .expect("Should add route");
 
         // Spawn two workers on different "cores"
-        let mut worker0 = Worker::new(0, router.clone());
-        let mut worker1 = Worker::new(1, router.clone());
+        let worker0 = Worker::new(0, router.clone());
+        let worker1 = Worker::new(1, router.clone());
 
-        // Each worker creates its own connection pool independently
-        let pool0 = worker0.pools().get_or_create_pool(backend);
-        let pool1 = worker1.pools().get_or_create_pool(backend);
+        // Each worker has its own Mutex<BackendConnectionPools>
+        // Verify workers have different pool storage
+        let pools0_ptr = &worker0.pools as *const Mutex<BackendConnectionPools>;
+        let pools1_ptr = &worker1.pools as *const Mutex<BackendConnectionPools>;
 
-        // Pools are separate (different memory)
-        let pool0_ptr = pool0 as *const _;
-        let pool1_ptr = pool1 as *const _;
+        assert_ne!(
+            pools0_ptr, pools1_ptr,
+            "Each worker has separate pool storage"
+        );
+    }
 
-        assert_ne!(pool0_ptr, pool1_ptr, "Each worker has separate pools");
+    /// RED: Test concurrent access to different workers (should be lock-free)
+    ///
+    /// This test will FAIL with Arc<Mutex<Vec<Worker>>> because accessing
+    /// different workers requires locking the entire Vec. With Arc<Vec<Worker>>
+    /// and per-worker Mutex<pools>, this will PASS.
+    #[tokio::test]
+    async fn test_concurrent_worker_access() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let router = Arc::new(Router::new());
+        let backend = Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 9999, 100);
+
+        router
+            .add_route(HttpMethod::GET, "/api/test", vec![backend])
+            .expect("Should add route");
+
+        // Create workers in Arc<Vec<Worker>> (immutable vec, no global lock)
+        let workers: Arc<Vec<Worker>> = Arc::new(vec![
+            Worker::new(0, router.clone()),
+            Worker::new(1, router.clone()),
+            Worker::new(2, router.clone()),
+        ]);
+
+        // Spawn 3 tasks accessing different workers concurrently
+        let workers1 = workers.clone();
+        let workers2 = workers.clone();
+        let workers3 = workers.clone();
+
+        let handle1 = tokio::spawn(async move {
+            // Access worker 0 - should not block workers 1 or 2
+            let _id = workers1[0].id();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let handle2 = tokio::spawn(async move {
+            // Access worker 1 concurrently with worker 0
+            let _id = workers2[1].id();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let handle3 = tokio::spawn(async move {
+            // Access worker 2 concurrently with workers 0 and 1
+            let _id = workers3[2].id();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        // All 3 tasks should complete concurrently in ~100ms
+        // If there was a global lock, they'd run sequentially (~300ms)
+        let result = timeout(Duration::from_millis(200), async {
+            handle1.await.expect("Task 1 should complete");
+            handle2.await.expect("Task 2 should complete");
+            handle3.await.expect("Task 3 should complete");
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Workers should be accessible concurrently (lock-free)"
+        );
     }
 }

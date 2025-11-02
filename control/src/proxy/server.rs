@@ -64,8 +64,9 @@ use crate::proxy::worker::Worker;
 type BackendPools = Arc<Mutex<BackendConnectionPools>>;
 
 /// Per-core workers (lock-free architecture)
-/// Each worker owns its own BackendConnectionPools (no Arc<Mutex>!)
-type Workers = Arc<Mutex<Vec<Worker>>>;
+/// Workers stored in immutable Vec - selection is lock-free!
+/// Each worker has Mutex<BackendConnectionPools> - per-worker locking only
+type Workers = Arc<Vec<Worker>>;
 
 /// Worker selector for round-robin distribution
 /// In production, this would use CPU affinity, but round-robin is simpler for now
@@ -159,7 +160,7 @@ impl ProxyServer {
             client,
             backend_pools: Arc::new(Mutex::new(BackendConnectionPools::new(0))), // Not used in worker mode
             protocol_cache,
-            workers: Some(Arc::new(Mutex::new(workers))),
+            workers: Some(Arc::new(workers)), // Immutable Vec - lock-free selection!
             worker_selector: Some(Arc::new(WorkerSelector::new(num_workers))),
         })
     }
@@ -421,15 +422,17 @@ async fn forward_to_backend(
             debug!(request_id = %request_id, "Using HTTP/2 connection pool for backend {}", backend_key);
 
             let mut sender = if let (Some(workers_arc), Some(idx)) = (workers, worker_index) {
-                // Worker path: Lock-free! Each worker owns its pools
+                // Worker path: Lock-free worker selection + per-worker pool lock
                 debug!(
                     request_id = %request_id,
                     worker_index = idx,
-                    "Using per-core worker connection pool (lock-free)"
+                    "Using per-core worker connection pool (lock-free selection)"
                 );
 
-                let mut workers_guard = workers_arc.lock().await;
-                let worker = &mut workers_guard[idx];
+                // Lock-free worker selection - just array indexing!
+                let worker = &workers_arc[idx];
+
+                // Per-worker lock (only contends with requests to same worker)
                 worker
                     .get_backend_connection(backend)
                     .await
@@ -1837,13 +1840,12 @@ mod tests {
         let server = server.unwrap();
         assert!(server.workers.is_some(), "Workers should be initialized");
 
-        // Verify we have 4 workers
+        // Verify we have 4 workers (no lock needed - Arc<Vec<Worker>>!)
         let workers = server.workers.unwrap();
-        let workers_guard = workers.lock().await;
-        assert_eq!(workers_guard.len(), 4, "Should have 4 workers");
+        assert_eq!(workers.len(), 4, "Should have 4 workers");
 
-        // Verify each worker has unique ID
-        let worker_ids: Vec<_> = workers_guard.iter().map(|w| w.id()).collect();
+        // Verify each worker has unique ID (lock-free access)
+        let worker_ids: Vec<_> = workers.iter().map(|w| w.id()).collect();
         assert_eq!(worker_ids, vec![0, 1, 2, 3], "Worker IDs should be 0..3");
     }
 
