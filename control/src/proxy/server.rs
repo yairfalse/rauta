@@ -385,22 +385,68 @@ async fn forward_to_backend(
     let backend_host = format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port);
     backend_req_builder = backend_req_builder.header("Host", backend_host);
 
-    // Clone body once for potential retry (Bytes::clone is cheap - Arc increment)
-    // Use the clone for HTTP/2 attempt, keep original for fallback if needed
-    let body_for_http2 = body_bytes.clone();
+    // Check protocol cache BEFORE cloning body (optimization: avoid clone on hot path)
+    let backend_key = format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port);
+    let protocol_cached = {
+        let cache = protocol_cache.lock().await;
+        cache.get(&backend_key).copied()
+    };
 
-    let backend_req = backend_req_builder
-        .body(Full::new(body_for_http2))
-        .map_err(|e| {
-            error!(
-                request_id = %request_id,
-                error.message = %e,
-                error.type = "backend_request_build",
-                backend_uri = %backend_uri,
-                "Failed to build backend request"
-            );
-            format!("Failed to build backend request: {}", e)
-        })?;
+    // Optimization: Only clone body if protocol is UNKNOWN (first request to backend)
+    // - Known HTTP/1.1: No clone needed, won't retry
+    // - Known HTTP/2: No clone needed, failures are errors (not protocol issues)
+    // - Unknown: Clone needed, might need HTTP/1.1 fallback
+    let (backend_req, use_http2, body_for_fallback) = match protocol_cached {
+        Some(true) => {
+            // Cached as HTTP/2 - no clone needed (99% of requests after warmup)
+            let req = backend_req_builder
+                .body(Full::new(body_bytes))
+                .map_err(|e| {
+                    error!(
+                        request_id = %request_id,
+                        error.message = %e,
+                        error.type = "backend_request_build",
+                        backend_uri = %backend_uri,
+                        "Failed to build backend request"
+                    );
+                    format!("Failed to build backend request: {}", e)
+                })?;
+            (req, true, None)
+        }
+        Some(false) => {
+            // Cached as HTTP/1.1 - no clone needed
+            let req = backend_req_builder
+                .body(Full::new(body_bytes))
+                .map_err(|e| {
+                    error!(
+                        request_id = %request_id,
+                        error.message = %e,
+                        error.type = "backend_request_build",
+                        backend_uri = %backend_uri,
+                        "Failed to build backend request"
+                    );
+                    format!("Failed to build backend request: {}", e)
+                })?;
+            (req, false, None)
+        }
+        None => {
+            // Unknown protocol - clone for potential fallback (first request only)
+            let body_for_http2 = body_bytes.clone();
+            let req = backend_req_builder
+                .body(Full::new(body_for_http2))
+                .map_err(|e| {
+                    error!(
+                        request_id = %request_id,
+                        error.message = %e,
+                        error.type = "backend_request_build",
+                        backend_uri = %backend_uri,
+                        "Failed to build backend request"
+                    );
+                    format!("Failed to build backend request: {}", e)
+                })?;
+            (req, true, Some(body_bytes)) // Default to HTTP/2, keep body for fallback
+        }
+    };
 
     info!(
         request_id = %request_id,
@@ -409,15 +455,9 @@ async fn forward_to_backend(
         network.peer.port = backend.port,
         url.full = %backend_uri,
         http.request.method = %method_str,
+        protocol_cached = ?protocol_cached,
         "Sending request to backend"
     );
-
-    // Try HTTP/2 first (with production connection pool), fallback to HTTP/1.1
-    let backend_key = format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port);
-    let use_http2 = {
-        let cache = protocol_cache.lock().await;
-        cache.get(&backend_key).copied().unwrap_or(true) // Default to HTTP/2 for modern backends
-    };
 
     let backend_connect_start = Instant::now();
     let backend_resp = match use_http2 {
@@ -477,45 +517,57 @@ async fn forward_to_backend(
             match sender.send_request(backend_req).await {
                 Ok(resp) => resp,
                 Err(e) => {
-                    // HTTP/2 failed - backend might be HTTP/1.1 only
-                    // Cache as HTTP/1.1 and retry
-                    warn!(
-                        request_id = %request_id,
-                        error.message = %e,
-                        backend = %backend_key,
-                        "HTTP/2 failed, falling back to HTTP/1.1"
-                    );
+                    // HTTP/2 failed - check if we can fallback
+                    if let Some(fallback_body) = body_for_fallback {
+                        // Protocol was unknown, we have body for retry
+                        warn!(
+                            request_id = %request_id,
+                            error.message = %e,
+                            backend = %backend_key,
+                            "HTTP/2 failed (unknown backend), falling back to HTTP/1.1"
+                        );
 
-                    // Cache as HTTP/1.1 for future requests
-                    {
-                        let mut cache = protocol_cache.lock().await;
-                        cache.insert(backend_key.clone(), false);
-                    }
+                        // Cache as HTTP/1.1 for future requests
+                        {
+                            let mut cache = protocol_cache.lock().await;
+                            cache.insert(backend_key.clone(), false);
+                        }
 
-                    // Retry with HTTP/1.1
-                    // Rebuild the request using original body_bytes (no additional clone needed!)
-                    let method = hyper::Method::from_bytes(method_str.as_bytes())
-                        .map_err(|e| format!("Invalid method: {}", e))?;
+                        // Retry with HTTP/1.1 using fallback body
+                        let method = hyper::Method::from_bytes(method_str.as_bytes())
+                            .map_err(|e| format!("Invalid method: {}", e))?;
 
-                    let fallback_req = Request::builder()
-                        .method(method)
-                        .uri(&backend_uri)
-                        .header(
-                            "Host",
-                            format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port),
-                        )
-                        .body(Full::new(body_bytes)) // Use original, already cloned once above
-                        .map_err(|e| format!("Failed to build fallback request: {}", e))?;
+                        let fallback_req = Request::builder()
+                            .method(method)
+                            .uri(&backend_uri)
+                            .header(
+                                "Host",
+                                format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port),
+                            )
+                            .body(Full::new(fallback_body))
+                            .map_err(|e| format!("Failed to build fallback request: {}", e))?;
 
-                    client.request(fallback_req).await.map_err(|e| {
+                        client.request(fallback_req).await.map_err(|e| {
+                            error!(
+                                request_id = %request_id,
+                                error.message = %e,
+                                error.type = "backend_connection",
+                                "HTTP/1.1 fallback also failed"
+                            );
+                            format!("Backend connection failed: {}", e)
+                        })?
+                    } else {
+                        // Backend was cached as HTTP/2 but request failed
+                        // No fallback available (body was moved), return error
                         error!(
                             request_id = %request_id,
                             error.message = %e,
                             error.type = "backend_connection",
-                            "HTTP/1.1 fallback also failed"
+                            backend = %backend_key,
+                            "HTTP/2 request failed for cached HTTP/2 backend (no fallback)"
                         );
-                        format!("Backend connection failed: {}", e)
-                    })?
+                        return Err(format!("HTTP/2 backend connection failed: {}", e));
+                    }
                 }
             }
         }
