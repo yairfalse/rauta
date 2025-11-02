@@ -12,7 +12,7 @@ sleep 1
 
 # Build the control binary
 echo "📦 Building control binary..."
-cd /Users/yair/projects/rauta
+cd "$(dirname "$0")/.."
 cargo build --release --bin control 2>&1 | tail -3
 
 # Start HTTP/2 backend server on port 8082
