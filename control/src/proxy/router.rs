@@ -36,13 +36,19 @@ pub struct Router {
     prefix_router: Arc<RwLock<matchit::Router<RouteKey>>>,
 }
 
-impl Router {
-    /// Create new router
-    pub fn new() -> Self {
+impl Default for Router {
+    fn default() -> Self {
         Self {
             routes: Arc::new(RwLock::new(HashMap::new())),
             prefix_router: Arc::new(RwLock::new(matchit::Router::new())),
         }
+    }
+}
+
+impl Router {
+    /// Create new router
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Add or update route with backends (idempotent)

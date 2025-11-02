@@ -97,6 +97,7 @@ lazy_static! {
 }
 
 /// Record HTTPRoute reconciliation
+#[allow(dead_code)] // Used in K8s mode
 pub fn record_httproute_reconciliation(
     httproute: &str,
     namespace: &str,

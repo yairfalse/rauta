@@ -41,7 +41,7 @@ A Kubernetes ingress controller built in Rust with HTTP/2 support and WASM-based
 - Per-backend connection pools with circuit breakers
 - 3-state health tracking (Healthy → Degraded → Unhealthy)
 - Protocol detection (auto-fallback to HTTP/1.1)
-- Validated: 14K+ req/sec in load testing
+- Validated: **88K+ req/sec peak** in load testing
 
 **Stage 3: WASM Plugin System** 🚧 In Design
 - Safe extensibility without memory leaks
@@ -131,11 +131,12 @@ http2_pool_connections_failed_total{backend}
 http2_pool_requests_queued_total{backend}
 ```
 
-**Load Test Results:**
-- 14,362 req/sec sustained throughput
-- 703μs average latency
-- 44,543:1 multiplexing ratio (1 connection served 44K requests)
-- Zero failures, zero queuing
+**Load Test Results (Progressive Testing):**
+- **Peak: 88,328 req/sec** (50 concurrent connections)
+- **Sustained: 84,630 req/sec** (800 concurrent connections)
+- **p99 Latency: 9.33ms** at max stress (800 connections)
+- **Multiplexing: 44,543:1 ratio** (1 connection served 44K requests)
+- Zero failures across all test levels
 
 See [`docs/HTTP2_CONNECTION_POOLING.md`](docs/HTTP2_CONNECTION_POOLING.md) for design details.
 

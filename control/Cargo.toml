@@ -38,7 +38,7 @@ chrono = "0.4"
 
 # HTTP Server (Week 1-2)
 hyper = { version = "1.0", features = ["server", "http1", "http2", "client"] }
-hyper-util = { version = "0.1", features = ["tokio", "client-legacy"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "server", "server-auto"] }
 http-body-util = "0.1"
 
 # Routing

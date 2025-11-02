@@ -131,16 +131,38 @@ async fn main() -> Result<()> {
 ///
 /// Week 4-5: Replace with K8s Ingress watcher
 fn add_example_routes(router: &Arc<Router>) -> Result<()> {
-    // Route all paths to Python backend on 127.0.0.1:9090
-    let backends = vec![Backend::new(
-        u32::from(Ipv4Addr::new(127, 0, 0, 1)),
-        9090,
-        100,
-    )];
+    // Get backend from environment: RAUTA_BACKEND_ADDR (default: 127.0.0.1:9090)
+    let backend_addr =
+        env::var("RAUTA_BACKEND_ADDR").unwrap_or_else(|_| "127.0.0.1:9090".to_string());
+
+    // Parse IP:port using rsplit_once to handle IPv6 addresses
+    // IPv6 format: [::1]:8080, IPv4 format: 127.0.0.1:8080
+    let (ip_str, port_str) = backend_addr.rsplit_once(':').ok_or_else(|| {
+        anyhow::anyhow!(
+            "Invalid RAUTA_BACKEND_ADDR format. Expected IP:PORT, got: {}",
+            backend_addr
+        )
+    })?;
+
+    // Parse port first
+    let port: u16 = port_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid backend port {}: {}", port_str, e))?;
+
+    // Parse IPv4 address (strip brackets if present for IPv6 format)
+    let ip_str = ip_str.trim_start_matches('[').trim_end_matches(']');
+    let ip: Ipv4Addr = ip_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid backend IP {}: {}", ip_str, e))?;
+
+    // Route all paths to configured backend
+    let backends = vec![Backend::new(u32::from(ip), port, 100)];
 
     router
         .add_route(HttpMethod::GET, "/", backends)
         .map_err(|e| anyhow::anyhow!("Failed to add route: {}", e))?;
+
+    info!("📍 Backend configured: {}", backend_addr);
 
     Ok(())
 }

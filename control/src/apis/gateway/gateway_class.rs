@@ -15,13 +15,16 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info};
 
 /// Controller name for RAUTA Gateway API implementation
+#[allow(dead_code)] // Used in K8s mode
 pub const RAUTA_CONTROLLER_NAME: &str = "rauta.io/gateway-controller";
 
 /// GatewayClass reconciler
+#[allow(dead_code)] // Used in K8s mode
 pub struct GatewayClassReconciler {
     client: Client,
 }
 
+#[allow(dead_code)] // Used in K8s mode
 impl GatewayClassReconciler {
     pub fn new(client: Client) -> Self {
         Self { client }
