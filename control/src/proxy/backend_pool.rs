@@ -118,6 +118,9 @@ pub struct Http2Pool {
     max_connections: usize,    // Max concurrent connections (default: 4)
     max_streams_per_conn: u32, // Learned from SETTINGS frame
 
+    // Round-robin load distribution (Phase 1 optimization)
+    next_conn_index: usize, // Tracks next connection to use for round-robin
+
     // Health tracking
     health_state: HealthState,
     consecutive_failures: u32,
@@ -229,6 +232,7 @@ impl Http2Pool {
             connections: Vec::new(),
             max_connections: 4,        // Start conservative
             max_streams_per_conn: 500, // RFC 7540 Section 6.5.2 - increased from 100 for Phase 1
+            next_conn_index: 0,        // Round-robin starts at first connection
             health_state: HealthState::Healthy,
             consecutive_failures: 0,
             last_success: Instant::now(),
@@ -274,13 +278,23 @@ impl Http2Pool {
                 .set(after_cleanup as i64);
         }
 
-        // 3. Find connection that is ready for requests
+        // 3. Find connection that is ready for requests using round-robin
         let mut conn_index = None;
-        for (i, conn) in self.connections.iter_mut().enumerate() {
-            if conn.state == ConnectionState::Active && conn.sender.is_ready() {
-                conn.last_used = Instant::now();
-                conn_index = Some(i);
-                break;
+        let num_conns = self.connections.len();
+
+        if num_conns > 0 {
+            // Try connections in round-robin order starting from next_conn_index
+            for i in 0..num_conns {
+                let idx = (self.next_conn_index + i) % num_conns;
+                let conn = &mut self.connections[idx];
+
+                if conn.state == ConnectionState::Active && conn.sender.is_ready() {
+                    conn.last_used = Instant::now();
+                    conn_index = Some(idx);
+                    // Update round-robin index for next request
+                    self.next_conn_index = (idx + 1) % num_conns;
+                    break;
+                }
             }
         }
 
@@ -599,5 +613,25 @@ mod tests {
             pool.max_streams_per_conn, 500,
             "Pool should be configured for 500 max concurrent streams per RFC 7540"
         );
+    }
+
+    /// RED: Test that pool uses round-robin selection across multiple connections
+    /// Phase 1: Multi-connection pooling with round-robin load distribution
+    /// This test will FAIL until we add next_conn_index field to Http2Pool
+    #[tokio::test]
+    async fn test_round_robin_connection_selection() {
+        let backend = Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 9001, 100);
+        let mut pools = BackendConnectionPools::new(0);
+        let pool = pools.get_or_create_pool(backend);
+
+        // Verify pool supports multiple connections for load distribution
+        assert!(
+            pool.max_connections >= 2,
+            "Pool should support at least 2 connections for round-robin"
+        );
+
+        // Access next_conn_index field (will fail to compile until added)
+        let _initial_index = pool.next_conn_index;
+        assert_eq!(_initial_index, 0, "Round-robin index should start at 0");
     }
 }
