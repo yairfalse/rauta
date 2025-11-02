@@ -37,6 +37,21 @@ lazy_static! {
         gauge
     };
 
+    /// Max concurrent streams configured per connection (Gauge)
+    /// Phase 1: Tracks SETTINGS_MAX_CONCURRENT_STREAMS value (RFC 7540)
+    static ref POOL_MAX_CONCURRENT_STREAMS: IntGaugeVec = {
+        let opts = Opts::new(
+            "http2_pool_max_concurrent_streams",
+            "Max concurrent streams configured per HTTP/2 connection (RFC 7540 Section 6.5.2)"
+        );
+        let gauge = IntGaugeVec::new(opts, &["backend", "worker_id"])
+            .expect("Failed to create http2_pool_max_concurrent_streams gauge");
+        POOL_METRICS_REGISTRY
+            .register(Box::new(gauge.clone()))
+            .expect("Failed to register http2_pool_max_concurrent_streams gauge");
+        gauge
+    };
+
     /// Total HTTP/2 connections created per backend and worker (Counter)
     static ref POOL_CONNECTIONS_CREATED: IntCounterVec = {
         let opts = Opts::new(
@@ -226,13 +241,22 @@ impl BackendConnectionPools {
 
 impl Http2Pool {
     pub fn new(backend: Backend, worker_id: usize) -> Self {
+        let max_streams_per_conn = 500; // RFC 7540 Section 6.5.2 - increased from 100 for Phase 1
+
+        // Set max_concurrent_streams metric
+        let backend_label = format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port);
+        let worker_label = worker_id.to_string();
+        POOL_MAX_CONCURRENT_STREAMS
+            .with_label_values(&[&backend_label, &worker_label])
+            .set(max_streams_per_conn as i64);
+
         Self {
             backend,
             worker_id,
             connections: Vec::new(),
-            max_connections: 4,        // Start conservative
-            max_streams_per_conn: 500, // RFC 7540 Section 6.5.2 - increased from 100 for Phase 1
-            next_conn_index: 0,        // Round-robin starts at first connection
+            max_connections: 4, // Start conservative
+            max_streams_per_conn,
+            next_conn_index: 0, // Round-robin starts at first connection
             health_state: HealthState::Healthy,
             consecutive_failures: 0,
             last_success: Instant::now(),
