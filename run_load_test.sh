@@ -15,7 +15,7 @@ sleep 2
 
 # Build
 echo "📦 Building binaries..."
-cd /Users/yair/projects/rauta
+cd "$(dirname "$0")"
 cargo build --release --bin control --example http2_backend 2>&1 | grep -E "(Compiling|Finished)" || true
 
 # Start HTTP/2 backend on port 8082
