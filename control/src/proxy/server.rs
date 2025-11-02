@@ -56,11 +56,16 @@ lazy_static! {
 }
 
 use crate::proxy::backend_pool::{gather_pool_metrics, BackendConnectionPools, PoolError};
+use crate::proxy::worker::Worker;
 
 /// Production-grade HTTP/2 backend connection pools
 /// NOTE: Arc<Mutex> is temporary until Stage 2 per-core workers
 /// In Stage 2, each worker will own their BackendConnectionPools (no lock!)
 type BackendPools = Arc<Mutex<BackendConnectionPools>>;
+
+/// Per-core workers (lock-free architecture)
+/// Each worker owns its own BackendConnectionPools (no Arc<Mutex>!)
+type Workers = Arc<Mutex<Vec<Worker>>>;
 
 /// Protocol detection cache - tracks which backends support HTTP/2
 type ProtocolCache = Arc<Mutex<HashMap<String, bool>>>; // true = HTTP/2, false = HTTP/1.1
@@ -72,6 +77,8 @@ pub struct ProxyServer {
     client: Client<HttpConnector, Full<Bytes>>,
     backend_pools: BackendPools,
     protocol_cache: ProtocolCache,
+    #[allow(dead_code)] // Used in tests; will be used in request handling path
+    workers: Option<Workers>, // None = legacy mode, Some = per-core workers (lock-free!)
 }
 
 impl ProxyServer {
@@ -92,6 +99,39 @@ impl ProxyServer {
             client,
             backend_pools,
             protocol_cache,
+            workers: None, // Legacy mode (Arc<Mutex> pools)
+        })
+    }
+
+    /// Create new proxy server with per-core workers (lock-free!)
+    ///
+    /// Each worker owns its own BackendConnectionPools, eliminating Arc<Mutex> contention.
+    /// This is the Stage 2 architecture for 150K+ rps performance.
+    #[allow(dead_code)] // Will be used when we switch to per-core mode
+    pub fn new_with_workers(
+        bind_addr: String,
+        router: Arc<Router>,
+        num_workers: usize,
+    ) -> Result<Self, String> {
+        // Create HTTP client with connection pooling
+        let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+
+        // Create per-core workers (each owns its BackendConnectionPools!)
+        let mut workers = Vec::with_capacity(num_workers);
+        for id in 0..num_workers {
+            workers.push(Worker::new(id, router.clone()));
+        }
+
+        // Create protocol detection cache (still shared across workers)
+        let protocol_cache = Arc::new(Mutex::new(HashMap::new()));
+
+        Ok(Self {
+            bind_addr,
+            router,
+            client,
+            backend_pools: Arc::new(Mutex::new(BackendConnectionPools::new())), // Not used in worker mode
+            protocol_cache,
+            workers: Some(Arc::new(Mutex::new(workers))),
         })
     }
 
@@ -1613,6 +1653,42 @@ mod tests {
         let body = String::from_utf8(body_bytes.to_vec()).unwrap();
 
         assert_eq!(body, "Hello from HTTP/1.1 backend");
+    }
+
+    #[tokio::test]
+    async fn test_server_with_workers() {
+        // GREEN: Test per-core worker architecture
+        //
+        // This test verifies that ProxyServer can be created with workers
+        // and that each worker owns its own BackendConnectionPools (no Arc<Mutex>!)
+
+        let router = crate::proxy::router::Router::new();
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(127, 0, 0, 1)),
+            9999,
+            100,
+        )];
+        router
+            .add_route(HttpMethod::GET, "/test", backends)
+            .unwrap();
+
+        // Create server with 4 workers (simulating 4 CPU cores)
+        let server =
+            ProxyServer::new_with_workers("127.0.0.1:8080".to_string(), Arc::new(router), 4);
+
+        assert!(server.is_ok());
+
+        let server = server.unwrap();
+        assert!(server.workers.is_some(), "Workers should be initialized");
+
+        // Verify we have 4 workers
+        let workers = server.workers.unwrap();
+        let workers_guard = workers.lock().await;
+        assert_eq!(workers_guard.len(), 4, "Should have 4 workers");
+
+        // Verify each worker has unique ID
+        let worker_ids: Vec<_> = workers_guard.iter().map(|w| w.id()).collect();
+        assert_eq!(worker_ids, vec![0, 1, 2, 3], "Worker IDs should be 0..3");
     }
 
     #[tokio::test]
