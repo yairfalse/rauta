@@ -96,10 +96,20 @@ async fn main() -> Result<()> {
 
     // Determine bind address from environment variable or default
     let bind_addr = env::var("RAUTA_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-    let server = ProxyServer::new(bind_addr.clone(), router)
+
+    // Use per-core workers for lock-free performance (Stage 2!)
+    let num_cpus = num_cpus::get();
+    info!(
+        "🔥 Initializing per-core workers (lock-free mode): {} workers",
+        num_cpus
+    );
+    let server = ProxyServer::new_with_workers(bind_addr.clone(), router, num_cpus)
         .map_err(|e| anyhow::anyhow!("Failed to create server: {}", e))?;
 
-    info!("🚀 HTTP proxy server listening on {}", bind_addr);
+    info!(
+        "🚀 HTTP proxy server listening on {} (per-core workers enabled)",
+        bind_addr
+    );
     if !k8s_mode {
         info!("📋 Routes configured:");
         info!("   GET /api/*       -> 127.0.0.1:9090 (Python backend)");

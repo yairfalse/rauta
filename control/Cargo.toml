@@ -9,6 +9,7 @@ common = { path = "../common", default-features = false, features = ["serde"] }
 tokio = { version = "1.41", features = ["full"] }
 anyhow = "1.0"
 thiserror = "1.0"
+num_cpus = "1.16"
 
 # eBPF (Aya framework) - Stage 2 only (disabled for Stage 1 pure Rust)
 # aya = "0.13"
