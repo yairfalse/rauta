@@ -43,10 +43,10 @@ lazy_static! {
         histogram
     };
 
-    /// HTTP request counter
+    /// HTTP request counter with per-worker distribution
     static ref HTTP_REQUESTS_TOTAL: IntCounterVec = {
-        let opts = Opts::new("http_requests_total", "Total number of HTTP requests");
-        let counter = IntCounterVec::new(opts, &["method", "path", "status"])
+        let opts = Opts::new("http_requests_total", "Total number of HTTP requests (with per-worker distribution)");
+        let counter = IntCounterVec::new(opts, &["method", "path", "status", "worker_id"])
             .expect("Failed to create HTTP request counter");
         METRICS_REGISTRY
             .register(Box::new(counter.clone()))
@@ -756,11 +756,14 @@ async fn handle_request(
             // Use route pattern (not actual path) to prevent cardinality explosion
             let method_str = method_to_str(&method);
             let route_pattern = &route_match.pattern;
+            let worker_label = worker_index
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "none".to_string());
             match &result {
                 Ok(resp) => {
                     let status_str = status_to_str(resp.status().as_u16());
                     HTTP_REQUESTS_TOTAL
-                        .with_label_values(&[method_str, route_pattern, status_str])
+                        .with_label_values(&[method_str, route_pattern, status_str, &worker_label])
                         .inc();
                     HTTP_REQUEST_DURATION
                         .with_label_values(&[method_str, route_pattern, status_str])
@@ -768,7 +771,7 @@ async fn handle_request(
                 }
                 Err(e) => {
                     HTTP_REQUESTS_TOTAL
-                        .with_label_values(&[method_str, route_pattern, "500"])
+                        .with_label_values(&[method_str, route_pattern, "500", &worker_label])
                         .inc();
                     HTTP_REQUEST_DURATION
                         .with_label_values(&[method_str, route_pattern, "500"])
@@ -794,7 +797,7 @@ async fn handle_request(
             // Record 404 metrics (use constant to prevent cardinality explosion)
             let method_str = method_to_str(&method);
             HTTP_REQUESTS_TOTAL
-                .with_label_values(&[method_str, "not_found", "404"])
+                .with_label_values(&[method_str, "not_found", "404", "none"])
                 .inc();
             HTTP_REQUEST_DURATION
                 .with_label_values(&[method_str, "not_found", "404"])
