@@ -43,10 +43,10 @@ lazy_static! {
         histogram
     };
 
-    /// HTTP request counter
+    /// HTTP request counter with per-worker distribution
     static ref HTTP_REQUESTS_TOTAL: IntCounterVec = {
-        let opts = Opts::new("http_requests_total", "Total number of HTTP requests");
-        let counter = IntCounterVec::new(opts, &["method", "path", "status"])
+        let opts = Opts::new("http_requests_total", "Total number of HTTP requests (with per-worker distribution)");
+        let counter = IntCounterVec::new(opts, &["method", "path", "status", "worker_id"])
             .expect("Failed to create HTTP request counter");
         METRICS_REGISTRY
             .register(Box::new(counter.clone()))
@@ -56,11 +56,41 @@ lazy_static! {
 }
 
 use crate::proxy::backend_pool::{gather_pool_metrics, BackendConnectionPools, PoolError};
+use crate::proxy::worker::Worker;
 
 /// Production-grade HTTP/2 backend connection pools
 /// NOTE: Arc<Mutex> is temporary until Stage 2 per-core workers
 /// In Stage 2, each worker will own their BackendConnectionPools (no lock!)
 type BackendPools = Arc<Mutex<BackendConnectionPools>>;
+
+/// Per-core workers (lock-free architecture)
+/// Workers stored in immutable Vec - selection is lock-free!
+/// Each worker has Mutex<BackendConnectionPools> - per-worker locking only
+type Workers = Arc<Vec<Worker>>;
+
+/// Worker selector for round-robin distribution
+/// In production, this would use CPU affinity, but round-robin is simpler for now
+struct WorkerSelector {
+    counter: std::sync::atomic::AtomicUsize,
+    num_workers: usize,
+}
+
+impl WorkerSelector {
+    fn new(num_workers: usize) -> Self {
+        Self {
+            counter: std::sync::atomic::AtomicUsize::new(0),
+            num_workers,
+        }
+    }
+
+    /// Select next worker (round-robin)
+    fn select(&self) -> usize {
+        let current = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        current % self.num_workers
+    }
+}
 
 /// Protocol detection cache - tracks which backends support HTTP/2
 type ProtocolCache = Arc<Mutex<HashMap<String, bool>>>; // true = HTTP/2, false = HTTP/1.1
@@ -72,16 +102,21 @@ pub struct ProxyServer {
     client: Client<HttpConnector, Full<Bytes>>,
     backend_pools: BackendPools,
     protocol_cache: ProtocolCache,
+    #[allow(dead_code)] // Used in tests; will be used in request handling path
+    workers: Option<Workers>, // None = legacy mode, Some = per-core workers (lock-free!)
+    #[allow(dead_code)] // Used when workers are enabled
+    worker_selector: Option<Arc<WorkerSelector>>, // Round-robin worker selection
 }
 
 impl ProxyServer {
-    /// Create new proxy server
+    /// Create new proxy server (legacy method - use new_with_workers for better performance)
+    #[allow(dead_code)]
     pub fn new(bind_addr: String, router: Arc<Router>) -> Result<Self, String> {
         // Create HTTP client with connection pooling
         let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
 
-        // Create production-grade HTTP/2 backend connection pools
-        let backend_pools = Arc::new(Mutex::new(BackendConnectionPools::new()));
+        // Create production-grade HTTP/2 backend connection pools (shared, non-worker mode)
+        let backend_pools = Arc::new(Mutex::new(BackendConnectionPools::new(0)));
 
         // Create protocol detection cache
         let protocol_cache = Arc::new(Mutex::new(HashMap::new()));
@@ -92,6 +127,41 @@ impl ProxyServer {
             client,
             backend_pools,
             protocol_cache,
+            workers: None, // Legacy mode (Arc<Mutex> pools)
+            worker_selector: None,
+        })
+    }
+
+    /// Create new proxy server with per-core workers (lock-free!)
+    ///
+    /// Each worker owns its own BackendConnectionPools, eliminating Arc<Mutex> contention.
+    /// This is the Stage 2 architecture for 150K+ rps performance.
+    #[allow(dead_code)] // Will be used when we switch to per-core mode
+    pub fn new_with_workers(
+        bind_addr: String,
+        router: Arc<Router>,
+        num_workers: usize,
+    ) -> Result<Self, String> {
+        // Create HTTP client with connection pooling
+        let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+
+        // Create per-core workers (each owns its BackendConnectionPools!)
+        let mut workers = Vec::with_capacity(num_workers);
+        for id in 0..num_workers {
+            workers.push(Worker::new(id, router.clone()));
+        }
+
+        // Create protocol detection cache (still shared across workers)
+        let protocol_cache = Arc::new(Mutex::new(HashMap::new()));
+
+        Ok(Self {
+            bind_addr,
+            router,
+            client,
+            backend_pools: Arc::new(Mutex::new(BackendConnectionPools::new(0))), // Not used in worker mode
+            protocol_cache,
+            workers: Some(Arc::new(workers)), // Immutable Vec - lock-free selection!
+            worker_selector: Some(Arc::new(WorkerSelector::new(num_workers))),
         })
     }
 
@@ -123,6 +193,8 @@ impl ProxyServer {
             let client = self.client.clone();
             let backend_pools = self.backend_pools.clone();
             let protocol_cache = self.protocol_cache.clone();
+            let workers = self.workers.clone();
+            let worker_selector = self.worker_selector.clone();
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
@@ -132,8 +204,19 @@ impl ProxyServer {
                     let client = client.clone();
                     let backend_pools = backend_pools.clone();
                     let protocol_cache = protocol_cache.clone();
+                    let workers = workers.clone();
+                    let worker_selector = worker_selector.clone();
                     async move {
-                        handle_request(req, router, client, backend_pools, protocol_cache).await
+                        handle_request(
+                            req,
+                            router,
+                            client,
+                            backend_pools,
+                            protocol_cache,
+                            workers,
+                            worker_selector,
+                        )
+                        .await
                     }
                 });
 
@@ -165,6 +248,8 @@ impl ProxyServer {
             let client = self.client.clone();
             let backend_pools = self.backend_pools.clone();
             let protocol_cache = self.protocol_cache.clone();
+            let workers = self.workers.clone();
+            let worker_selector = self.worker_selector.clone();
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
@@ -174,8 +259,19 @@ impl ProxyServer {
                     let client = client.clone();
                     let backend_pools = backend_pools.clone();
                     let protocol_cache = protocol_cache.clone();
+                    let workers = workers.clone();
+                    let worker_selector = worker_selector.clone();
                     async move {
-                        handle_request(req, router, client, backend_pools, protocol_cache).await
+                        handle_request(
+                            req,
+                            router,
+                            client,
+                            backend_pools,
+                            protocol_cache,
+                            workers,
+                            worker_selector,
+                        )
+                        .await
                     }
                 });
 
@@ -217,6 +313,7 @@ fn is_hop_by_hop_header(name: &str) -> bool {
 }
 
 /// Forward request to backend server
+#[allow(clippy::too_many_arguments)] // Workers integration requires additional parameters
 async fn forward_to_backend(
     req: Request<hyper::body::Incoming>,
     backend: common::Backend,
@@ -224,6 +321,8 @@ async fn forward_to_backend(
     request_id: &str,
     backend_pools: BackendPools,
     protocol_cache: ProtocolCache,
+    workers: Option<Workers>,
+    worker_index: Option<usize>,
 ) -> Result<Response<Full<Bytes>>, String> {
     let request_start = Instant::now();
 
@@ -286,18 +385,68 @@ async fn forward_to_backend(
     let backend_host = format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port);
     backend_req_builder = backend_req_builder.header("Host", backend_host);
 
-    let backend_req = backend_req_builder
-        .body(Full::new(body_bytes))
-        .map_err(|e| {
-            error!(
-                request_id = %request_id,
-                error.message = %e,
-                error.type = "backend_request_build",
-                backend_uri = %backend_uri,
-                "Failed to build backend request"
-            );
-            format!("Failed to build backend request: {}", e)
-        })?;
+    // Check protocol cache BEFORE cloning body (optimization: avoid clone on hot path)
+    let backend_key = format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port);
+    let protocol_cached = {
+        let cache = protocol_cache.lock().await;
+        cache.get(&backend_key).copied()
+    };
+
+    // Optimization: Only clone body if protocol is UNKNOWN (first request to backend)
+    // - Known HTTP/1.1: No clone needed, won't retry
+    // - Known HTTP/2: No clone needed, failures are errors (not protocol issues)
+    // - Unknown: Clone needed, might need HTTP/1.1 fallback
+    let (backend_req, use_http2, body_for_fallback) = match protocol_cached {
+        Some(true) => {
+            // Cached as HTTP/2 - no clone needed (99% of requests after warmup)
+            let req = backend_req_builder
+                .body(Full::new(body_bytes))
+                .map_err(|e| {
+                    error!(
+                        request_id = %request_id,
+                        error.message = %e,
+                        error.type = "backend_request_build",
+                        backend_uri = %backend_uri,
+                        "Failed to build backend request"
+                    );
+                    format!("Failed to build backend request: {}", e)
+                })?;
+            (req, true, None)
+        }
+        Some(false) => {
+            // Cached as HTTP/1.1 - no clone needed
+            let req = backend_req_builder
+                .body(Full::new(body_bytes))
+                .map_err(|e| {
+                    error!(
+                        request_id = %request_id,
+                        error.message = %e,
+                        error.type = "backend_request_build",
+                        backend_uri = %backend_uri,
+                        "Failed to build backend request"
+                    );
+                    format!("Failed to build backend request: {}", e)
+                })?;
+            (req, false, None)
+        }
+        None => {
+            // Unknown protocol - clone for potential fallback (first request only)
+            let body_for_http2 = body_bytes.clone();
+            let req = backend_req_builder
+                .body(Full::new(body_for_http2))
+                .map_err(|e| {
+                    error!(
+                        request_id = %request_id,
+                        error.message = %e,
+                        error.type = "backend_request_build",
+                        backend_uri = %backend_uri,
+                        "Failed to build backend request"
+                    );
+                    format!("Failed to build backend request: {}", e)
+                })?;
+            (req, true, Some(body_bytes)) // Default to HTTP/2, keep body for fallback
+        }
+    };
 
     info!(
         request_id = %request_id,
@@ -306,23 +455,50 @@ async fn forward_to_backend(
         network.peer.port = backend.port,
         url.full = %backend_uri,
         http.request.method = %method_str,
+        protocol_cached = ?protocol_cached,
         "Sending request to backend"
     );
 
-    // Try HTTP/2 first (with production connection pool), fallback to HTTP/1.1
-    let backend_key = format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port);
-    let use_http2 = {
-        let cache = protocol_cache.lock().await;
-        cache.get(&backend_key).copied()
-    };
-
     let backend_connect_start = Instant::now();
     let backend_resp = match use_http2 {
-        Some(true) => {
+        true => {
             // Backend is known to support HTTP/2, use production connection pool
             debug!(request_id = %request_id, "Using HTTP/2 connection pool for backend {}", backend_key);
 
-            let mut sender = {
+            let mut sender = if let (Some(workers_arc), Some(idx)) = (workers, worker_index) {
+                // Worker path: Lock-free worker selection + per-worker pool lock
+                debug!(
+                    request_id = %request_id,
+                    worker_index = idx,
+                    "Using per-core worker connection pool (lock-free selection)"
+                );
+
+                // Lock-free worker selection - just array indexing!
+                let worker = &workers_arc[idx];
+
+                // Per-worker lock (only contends with requests to same worker)
+                worker
+                    .get_backend_connection(backend)
+                    .await
+                    .map_err(|e| match e {
+                        PoolError::CircuitBreakerOpen => {
+                            error!(
+                                request_id = %request_id,
+                                backend = %backend_key,
+                                worker_index = idx,
+                                "Circuit breaker open for backend"
+                            );
+                            "Circuit breaker open".to_string()
+                        }
+                        _ => format!("Failed to get HTTP/2 connection from worker: {}", e),
+                    })?
+            } else {
+                // Legacy path: Shared pools with Arc<Mutex> (slower)
+                debug!(
+                    request_id = %request_id,
+                    "Using legacy shared connection pool"
+                );
+
                 let mut pools = backend_pools.lock().await;
                 let pool = pools.get_or_create_pool(backend);
                 pool.get_connection().await.map_err(|e| match e {
@@ -338,25 +514,66 @@ async fn forward_to_backend(
                 })?
             };
 
-            sender.send_request(backend_req).await.map_err(|e| {
-                error!(
-                    request_id = %request_id,
-                    error.message = %e,
-                    error.type = "http2_request",
-                    "HTTP/2 request failed"
-                );
-                format!("HTTP/2 request failed: {}", e)
-            })?
-        }
-        Some(false) | None => {
-            // Backend uses HTTP/1.1 (cached or unknown)
-            debug!(request_id = %request_id, "Using HTTP/1.1 for backend {}", backend_key);
+            match sender.send_request(backend_req).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    // HTTP/2 failed - check if we can fallback
+                    if let Some(fallback_body) = body_for_fallback {
+                        // Protocol was unknown, we have body for retry
+                        warn!(
+                            request_id = %request_id,
+                            error.message = %e,
+                            backend = %backend_key,
+                            "HTTP/2 failed (unknown backend), falling back to HTTP/1.1"
+                        );
 
-            // Cache as HTTP/1.1 if unknown
-            if use_http2.is_none() {
-                let mut cache = protocol_cache.lock().await;
-                cache.insert(backend_key.clone(), false);
+                        // Cache as HTTP/1.1 for future requests
+                        {
+                            let mut cache = protocol_cache.lock().await;
+                            cache.insert(backend_key.clone(), false);
+                        }
+
+                        // Retry with HTTP/1.1 using fallback body
+                        let method = hyper::Method::from_bytes(method_str.as_bytes())
+                            .map_err(|e| format!("Invalid method: {}", e))?;
+
+                        let fallback_req = Request::builder()
+                            .method(method)
+                            .uri(&backend_uri)
+                            .header(
+                                "Host",
+                                format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port),
+                            )
+                            .body(Full::new(fallback_body))
+                            .map_err(|e| format!("Failed to build fallback request: {}", e))?;
+
+                        client.request(fallback_req).await.map_err(|e| {
+                            error!(
+                                request_id = %request_id,
+                                error.message = %e,
+                                error.type = "backend_connection",
+                                "HTTP/1.1 fallback also failed"
+                            );
+                            format!("Backend connection failed: {}", e)
+                        })?
+                    } else {
+                        // Backend was cached as HTTP/2 but request failed
+                        // No fallback available (body was moved), return error
+                        error!(
+                            request_id = %request_id,
+                            error.message = %e,
+                            error.type = "backend_connection",
+                            backend = %backend_key,
+                            "HTTP/2 request failed for cached HTTP/2 backend (no fallback)"
+                        );
+                        return Err(format!("HTTP/2 backend connection failed: {}", e));
+                    }
+                }
             }
+        }
+        false => {
+            // Backend uses HTTP/1.1 (explicitly cached as HTTP/1.1 only)
+            debug!(request_id = %request_id, "Using HTTP/1.1 for backend {} (cached)", backend_key);
 
             client.request(backend_req).await.map_err(|e| {
                 error!(
@@ -486,6 +703,8 @@ async fn handle_request(
     client: Client<HttpConnector, Full<Bytes>>,
     backend_pools: BackendPools,
     protocol_cache: ProtocolCache,
+    workers: Option<Workers>,
+    worker_selector: Option<Arc<WorkerSelector>>,
 ) -> Result<Response<Full<Bytes>>, String> {
     // Generate or extract request ID
     let request_id = req
@@ -566,12 +785,16 @@ async fn handle_request(
 
     match route_match {
         Some(route_match) => {
+            // Select worker for this request (lock-free round-robin)
+            let worker_index = worker_selector.as_ref().map(|selector| selector.select());
+
             info!(
                 request_id = %request_id,
                 stage = "route_matched",
                 route.pattern = %route_match.pattern,
                 network.peer.address = %ipv4_to_string(route_match.backend.ipv4),
                 network.peer.port = route_match.backend.port,
+                worker_index = ?worker_index,
                 "Route matched, forwarding to backend"
             );
 
@@ -582,6 +805,8 @@ async fn handle_request(
                 &request_id,
                 backend_pools,
                 protocol_cache,
+                workers,
+                worker_index,
             )
             .await;
             let duration = start.elapsed();
@@ -590,11 +815,14 @@ async fn handle_request(
             // Use route pattern (not actual path) to prevent cardinality explosion
             let method_str = method_to_str(&method);
             let route_pattern = &route_match.pattern;
+            let worker_label = worker_index
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "none".to_string());
             match &result {
                 Ok(resp) => {
                     let status_str = status_to_str(resp.status().as_u16());
                     HTTP_REQUESTS_TOTAL
-                        .with_label_values(&[method_str, route_pattern, status_str])
+                        .with_label_values(&[method_str, route_pattern, status_str, &worker_label])
                         .inc();
                     HTTP_REQUEST_DURATION
                         .with_label_values(&[method_str, route_pattern, status_str])
@@ -602,7 +830,7 @@ async fn handle_request(
                 }
                 Err(e) => {
                     HTTP_REQUESTS_TOTAL
-                        .with_label_values(&[method_str, route_pattern, "500"])
+                        .with_label_values(&[method_str, route_pattern, "500", &worker_label])
                         .inc();
                     HTTP_REQUEST_DURATION
                         .with_label_values(&[method_str, route_pattern, "500"])
@@ -628,7 +856,7 @@ async fn handle_request(
             // Record 404 metrics (use constant to prevent cardinality explosion)
             let method_str = method_to_str(&method);
             HTTP_REQUESTS_TOTAL
-                .with_label_values(&[method_str, "not_found", "404"])
+                .with_label_values(&[method_str, "not_found", "404", "none"])
                 .inc();
             HTTP_REQUEST_DURATION
                 .with_label_values(&[method_str, "not_found", "404"])
@@ -722,7 +950,7 @@ mod tests {
         let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_addr = backend_listener.local_addr().unwrap();
 
-        // Backend responds with "Hello from backend"
+        // Backend responds with "Hello from backend" (HTTP/2 support)
         tokio::spawn(async move {
             let (stream, _) = backend_listener.accept().await.unwrap();
             let io = TokioIo::new(stream);
@@ -736,7 +964,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         // Wait for backend to start
@@ -806,7 +1037,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -876,7 +1110,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -971,7 +1208,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1057,7 +1297,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1144,7 +1387,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1231,7 +1477,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1322,7 +1571,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1555,7 +1807,10 @@ mod tests {
                 )
             });
 
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // Use HTTP/2 for mock backend to match production behavior
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1613,6 +1868,41 @@ mod tests {
         let body = String::from_utf8(body_bytes.to_vec()).unwrap();
 
         assert_eq!(body, "Hello from HTTP/1.1 backend");
+    }
+
+    #[tokio::test]
+    async fn test_server_with_workers() {
+        // GREEN: Test per-core worker architecture
+        //
+        // This test verifies that ProxyServer can be created with workers
+        // and that each worker owns its own BackendConnectionPools (no Arc<Mutex>!)
+
+        let router = crate::proxy::router::Router::new();
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(127, 0, 0, 1)),
+            9999,
+            100,
+        )];
+        router
+            .add_route(HttpMethod::GET, "/test", backends)
+            .unwrap();
+
+        // Create server with 4 workers (simulating 4 CPU cores)
+        let server =
+            ProxyServer::new_with_workers("127.0.0.1:8080".to_string(), Arc::new(router), 4);
+
+        assert!(server.is_ok());
+
+        let server = server.unwrap();
+        assert!(server.workers.is_some(), "Workers should be initialized");
+
+        // Verify we have 4 workers (no lock needed - Arc<Vec<Worker>>!)
+        let workers = server.workers.unwrap();
+        assert_eq!(workers.len(), 4, "Should have 4 workers");
+
+        // Verify each worker has unique ID (lock-free access)
+        let worker_ids: Vec<_> = workers.iter().map(|w| w.id()).collect();
+        assert_eq!(worker_ids, vec![0, 1, 2, 3], "Worker IDs should be 0..3");
     }
 
     #[tokio::test]
