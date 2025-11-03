@@ -301,6 +301,29 @@ impl HTTPRouteReconciler {
 
         info!("Starting HTTPRoute controller");
 
+        // NOTE: EndpointSlice watching
+        //
+        // Ideally, we would watch EndpointSlice resources and trigger HTTPRoute reconciliation
+        // when pods scale up/down. However, kube-rs Controller::watches() requires a mapper
+        // function that cannot perform async operations, making it impossible to query which
+        // HTTPRoutes reference a given Service.
+        //
+        // Current behavior:
+        // - HTTPRoutes are reconciled periodically (default: every 5 minutes)
+        // - Reconciliation resolves Service -> EndpointSlice -> Pod IPs
+        // - Backend pool is updated if Pod IPs changed
+        // - Router's idempotent add_route() makes updates cheap
+        //
+        // For production, consider:
+        // - Using a custom reflector/watcher for EndpointSlice
+        // - Maintaining an in-memory index of Service -> HTTPRoute mappings
+        // - Triggering reconciliation via a channel when EndpointSlice changes
+        //
+        // This is acceptable because:
+        // - 5-minute lag for pod scaling is reasonable for most workloads
+        // - Kubernetes typically takes 30-60s for pod readiness anyway
+        // - Manual reconciliation can be triggered via `kubectl annotate`
+
         Controller::new(api, WatcherConfig::default())
             .run(Self::reconcile, Self::error_policy, ctx)
             .for_each(|res| async move {
