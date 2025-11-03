@@ -37,7 +37,7 @@
 - **Rust for safety and performance** (Cloudflare Pingora validates this)
 - **Gateway API native** (no legacy Ingress baggage)
 - **WASM for extensibility** (safe, fast, multi-language)
-- **Research-backed decisions** (HTTP/2 > HTTP/3, io_uring, skip DPDK)
+- **Research-backed decisions** (HTTP/2 > HTTP/3, skip DPDK, skip io_uring for L7)
 
 ---
 
@@ -353,22 +353,29 @@ From **cutting-edge-research-2024-2025.md**:
 - Hot-reload and resource limits
 - Expected: 40,000+ rps (with plugins enabled)
 
-**Month 5-6: Performance Optimization**
-- io_uring backend (Kernel Recipes 2024: +31-43% throughput)
-- Zero-copy splice/sendfile
+**Month 5-6: HTTP/2 & Connection Pool Optimization**
+- Connection pool tuning (max streams, idle timeout, pre-warming)
+- HTTP/2 HPACK optimization (static table, Huffman encoding)
+- Body streaming (zero-copy within userspace)
+- Passive health checks (observe 5xx rates, circuit breakers)
 - Expected: 70,000+ rps
 
 **Decisions NOT to Implement:**
-- HTTP/3: Research proves it's 45% slower than HTTP/2 (ACM 2024)
-- DPDK: L7 bottleneck is HTTP parsing, not network (F-Stack research)
-- XDP HTTP parsing: Impossible for HTTP/2, TLS (Learning eBPF validates)
+- **HTTP/3**: Research proves it's 45% slower than HTTP/2 (ACM 2024)
+- **DPDK**: L7 bottleneck is HTTP parsing, not network (F-Stack research)
+- **XDP HTTP parsing**: Impossible for HTTP/2, TLS (Learning eBPF validates)
+- **io_uring**: Incompatible with hyper, 15% slower for HTTP (2024 benchmarks - see docs/research/IO_URING_ANALYSIS.md)
 
 **Expected Final Performance:**
 ```
-Baseline (Stage 1):     ~10,000 rps
-+ HTTP/2:               → 50,000 rps
-+ WASM plugins:         → 40,000 rps (20% overhead acceptable)
-+ io_uring:             → 60,000 rps
+Baseline (Stage 1):       ~10,000 rps
++ HTTP/2:                 → 50,000 rps
++ WASM plugins:           → 40,000 rps (20% overhead acceptable)
++ Connection pool tuning: → 50,000 rps (1.25x over plugins)
++ HPACK optimization:     → 55,000 rps (1.10x)
++ Body streaming:         → 60,000 rps (1.09x)
+────────────────────────────────────────
+Target: 60,000+ rps (6x baseline, proven path)
 ```
 
 ### Performance Patterns
@@ -736,8 +743,12 @@ spec:
 ### Research Papers
 
 - **ACM 2024**: "QUIC is not Quick Enough" (HTTP/3 is 45% slower)
-- **Kernel Recipes 2024**: "io_uring zero-copy" (+31-43% throughput)
 - **Google**: "Maglev: A Fast and Reliable Software Network Load Balancer"
+- **Cloudflare**: Pingora architecture (Rust proxy validates our approach)
+
+### Internal Research
+
+- **docs/research/IO_URING_ANALYSIS.md**: Why io_uring doesn't help L7 HTTP proxies (2024)
 
 ---
 

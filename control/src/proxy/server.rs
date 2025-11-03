@@ -2,7 +2,7 @@
 
 use crate::apis::metrics::CONTROLLER_METRICS_REGISTRY;
 use crate::proxy::router::Router;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
@@ -313,6 +313,7 @@ fn is_hop_by_hop_header(name: &str) -> bool {
 }
 
 /// Forward request to backend server
+/// Returns BoxBody to support zero-copy streaming for HTTP/2 (hot path)
 #[allow(clippy::too_many_arguments)] // Workers integration requires additional parameters
 async fn forward_to_backend(
     req: Request<hyper::body::Incoming>,
@@ -323,35 +324,51 @@ async fn forward_to_backend(
     protocol_cache: ProtocolCache,
     workers: Option<Workers>,
     worker_index: Option<usize>,
-) -> Result<Response<Full<Bytes>>, String> {
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, String> {
     let request_start = Instant::now();
 
     // Read the incoming request body
     let (parts, body) = req.into_parts();
-    let body_read_start = Instant::now();
-    let body_bytes = body
-        .collect()
-        .await
-        .map_err(|e| {
-            error!(
-                request_id = %request_id,
-                error.message = %e,
-                error.type = "request_body_read",
-                elapsed_us = body_read_start.elapsed().as_micros() as u64,
-                "Failed to read request body"
-            );
-            format!("Failed to read request body: {}", e)
-        })?
-        .to_bytes();
 
-    let body_read_duration = body_read_start.elapsed();
-    info!(
-        request_id = %request_id,
-        stage = "request_body_read",
-        body_size_bytes = body_bytes.len(),
-        elapsed_us = body_read_duration.as_micros() as u64,
-        "Request body read complete"
-    );
+    // Fast path: GET/HEAD requests have no body, skip collection
+    let body_bytes = if parts.method == hyper::Method::GET
+        || parts.method == hyper::Method::HEAD
+        || parts.method == hyper::Method::DELETE
+    {
+        debug!(
+            request_id = %request_id,
+            method = %parts.method,
+            "Fast path: skipping body read for bodiless method"
+        );
+        Bytes::new() // Empty body, zero allocation
+    } else {
+        // Slow path: POST/PUT/PATCH may have body
+        let body_read_start = Instant::now();
+        let bytes = body
+            .collect()
+            .await
+            .map_err(|e| {
+                error!(
+                    request_id = %request_id,
+                    error.message = %e,
+                    error.type = "request_body_read",
+                    elapsed_us = body_read_start.elapsed().as_micros() as u64,
+                    "Failed to read request body"
+                );
+                format!("Failed to read request body: {}", e)
+            })?
+            .to_bytes();
+
+        let body_read_duration = body_read_start.elapsed();
+        info!(
+            request_id = %request_id,
+            stage = "request_body_read",
+            body_size_bytes = bytes.len(),
+            elapsed_us = body_read_duration.as_micros() as u64,
+            "Request body read complete"
+        );
+        bytes
+    };
 
     // Build backend URI with path and query parameters
     let path_and_query = parts
@@ -603,34 +620,9 @@ async fn forward_to_backend(
         "Backend responded"
     );
 
-    // Stream response body from backend
+    // Zero-copy body streaming (Phase 2: HPACK + Body Streaming)
+    // HTTP/2 responses stream directly without buffering
     let (mut parts, body) = backend_resp.into_parts();
-    let response_read_start = Instant::now();
-    let body_bytes = body
-        .collect()
-        .await
-        .map_err(|e| {
-            error!(
-                request_id = %request_id,
-                error.message = %e,
-                error.type = "backend_response_read",
-                network.peer.address = %ipv4_to_string(backend.ipv4),
-                network.peer.port = backend.port,
-                elapsed_us = response_read_start.elapsed().as_micros() as u64,
-                "Failed to read backend response"
-            );
-            format!("Failed to read backend response: {}", e)
-        })?
-        .to_bytes();
-
-    let response_read_duration = response_read_start.elapsed();
-    info!(
-        request_id = %request_id,
-        stage = "backend_response_body_read",
-        body_size_bytes = body_bytes.len(),
-        elapsed_us = response_read_duration.as_micros() as u64,
-        "Response body read complete"
-    );
 
     // Filter out hop-by-hop headers from backend response (RFC 2616 Section 13.5.1)
     let headers_to_remove: Vec<_> = parts
@@ -652,13 +644,12 @@ async fn forward_to_backend(
         network.peer.address = %ipv4_to_string(backend.ipv4),
         network.peer.port = backend.port,
         timing.total_us = total_duration.as_micros() as u64,
-        timing.body_read_us = body_read_duration.as_micros() as u64,
         timing.backend_us = backend_connect_duration.as_micros() as u64,
-        timing.response_read_us = response_read_duration.as_micros() as u64,
-        "Request forwarded successfully"
+        "Request forwarding (body streaming)"
     );
 
-    Ok(Response::from_parts(parts, Full::new(body_bytes)))
+    // Box the body for type erasure (zero-copy streaming for HTTP/2)
+    Ok(Response::from_parts(parts, body.boxed()))
 }
 
 /// Convert HttpMethod to static string (zero allocations)
@@ -697,6 +688,7 @@ fn status_to_str(status: u16) -> &'static str {
 }
 
 /// Handle incoming HTTP request
+/// Returns BoxBody to support zero-copy streaming for HTTP/2 responses
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
     router: Arc<Router>,
@@ -705,7 +697,7 @@ async fn handle_request(
     protocol_cache: ProtocolCache,
     workers: Option<Workers>,
     worker_selector: Option<Arc<WorkerSelector>>,
-) -> Result<Response<Full<Bytes>>, String> {
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, String> {
     // Generate or extract request ID
     let request_id = req
         .headers()
@@ -745,10 +737,11 @@ async fn handle_request(
             return Ok(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .header("Content-Type", "text/plain")
-                .body(Full::new(Bytes::from(format!(
-                    "Failed to encode metrics: {}",
-                    e
-                ))))
+                .body(
+                    Full::new(Bytes::from(format!("Failed to encode metrics: {}", e)))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
                 .unwrap());
         }
 
@@ -762,7 +755,11 @@ async fn handle_request(
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", encoder.format_type())
-            .body(Full::new(Bytes::from(buffer)))
+            .body(
+                Full::new(Bytes::from(buffer))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
             .unwrap());
     }
 
@@ -874,7 +871,11 @@ async fn handle_request(
             Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .header("X-Request-ID", request_id)
-                .body(Full::new(Bytes::from("Not Found")))
+                .body(
+                    Full::new(Bytes::from("Not Found"))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
                 .unwrap())
         }
     }

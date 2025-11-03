@@ -55,6 +55,9 @@ uuid = { version = "1.0", features = ["v4", "fast-rng"] }
 # Networking
 libc = "0.2"
 
+# Performance: jemalloc allocator (better for async workloads)
+tikv-jemallocator = "0.6"
+
 [build-dependencies]
 # Note: aya-build is the correct package for build scripts, not aya-gen
 # We don't need this currently as we're not generating bindings

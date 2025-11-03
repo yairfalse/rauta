@@ -37,6 +37,21 @@ lazy_static! {
         gauge
     };
 
+    /// Max concurrent streams configured per connection (Gauge)
+    /// Phase 1: Tracks SETTINGS_MAX_CONCURRENT_STREAMS value (RFC 7540)
+    static ref POOL_MAX_CONCURRENT_STREAMS: IntGaugeVec = {
+        let opts = Opts::new(
+            "http2_pool_max_concurrent_streams",
+            "Max concurrent streams configured per HTTP/2 connection (RFC 7540 Section 6.5.2)"
+        );
+        let gauge = IntGaugeVec::new(opts, &["backend", "worker_id"])
+            .expect("Failed to create http2_pool_max_concurrent_streams gauge");
+        POOL_METRICS_REGISTRY
+            .register(Box::new(gauge.clone()))
+            .expect("Failed to register http2_pool_max_concurrent_streams gauge");
+        gauge
+    };
+
     /// Total HTTP/2 connections created per backend and worker (Counter)
     static ref POOL_CONNECTIONS_CREATED: IntCounterVec = {
         let opts = Opts::new(
@@ -117,6 +132,12 @@ pub struct Http2Pool {
     // Connection limits
     max_connections: usize,    // Max concurrent connections (default: 4)
     max_streams_per_conn: u32, // Learned from SETTINGS frame
+
+    // Round-robin load distribution (Phase 1 optimization)
+    next_conn_index: usize, // Tracks next connection to use for round-robin
+
+    // HPACK compression (Phase 2: RFC 7541)
+    header_table_size: u32, // SETTINGS_HEADER_TABLE_SIZE (default 4096, optimized 8192)
 
     // Health tracking
     health_state: HealthState,
@@ -206,6 +227,8 @@ impl BackendConnectionPools {
     }
 
     /// Get or create pool for backend
+    /// NOTE: This returns a pool that may not be pre-warmed yet.
+    /// For best performance, call `prewarm_pool()` after getting the pool.
     pub fn get_or_create_pool(&mut self, backend: Backend) -> &mut Http2Pool {
         let key = BackendKey::from(backend);
         let worker_id = self.worker_id; // Capture for closure
@@ -219,21 +242,95 @@ impl BackendConnectionPools {
             Http2Pool::new(backend, worker_id)
         })
     }
+
+    /// Pre-warm pool for a specific backend (call after get_or_create_pool)
+    pub async fn prewarm_pool(&mut self, backend: Backend) -> Result<(), PoolError> {
+        let key = BackendKey::from(backend);
+        if let Some(pool) = self.pools.get_mut(&key) {
+            // Only prewarm if connections haven't been created yet
+            if pool.connections.is_empty() {
+                pool.prewarm().await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Http2Pool {
     pub fn new(backend: Backend, worker_id: usize) -> Self {
+        let max_streams_per_conn = 500; // RFC 7540 Section 6.5.2 - high limit for HTTP/2 multiplexing
+        let header_table_size = 8192; // RFC 7541 - doubled from default 4096 for proxy use
+
+        // Set max_concurrent_streams metric
+        let backend_label = format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port);
+        let worker_label = worker_id.to_string();
+        POOL_MAX_CONCURRENT_STREAMS
+            .with_label_values(&[&backend_label, &worker_label])
+            .set(max_streams_per_conn as i64);
+
         Self {
             backend,
             worker_id,
             connections: Vec::new(),
-            max_connections: 4,        // Start conservative
-            max_streams_per_conn: 100, // Default, will be updated from SETTINGS
+            max_connections: 4, // 4 connections * 500 streams = 2000 concurrent requests per worker
+            max_streams_per_conn,
+            next_conn_index: 0, // Round-robin starts at first connection
+            header_table_size,  // HPACK compression (Phase 2)
             health_state: HealthState::Healthy,
             consecutive_failures: 0,
             last_success: Instant::now(),
             metrics: PoolMetrics::default(),
         }
+    }
+
+    /// Pre-warm connections (create all max_connections upfront)
+    /// Call this after pool creation to avoid lazy connection establishment
+    pub async fn prewarm(&mut self) -> Result<(), PoolError> {
+        info!(
+            backend_ip = %ipv4_to_string(self.backend.ipv4),
+            backend_port = self.backend.port,
+            worker_id = self.worker_id,
+            target_connections = self.max_connections,
+            "Pre-warming HTTP/2 connection pool"
+        );
+
+        for i in 0..self.max_connections {
+            match self.create_connection().await {
+                Ok(conn) => {
+                    debug!(
+                        backend_ip = %ipv4_to_string(self.backend.ipv4),
+                        backend_port = self.backend.port,
+                        worker_id = self.worker_id,
+                        connection_num = i + 1,
+                        total = self.max_connections,
+                        "Pre-warmed connection"
+                    );
+                    self.connections.push(conn);
+                }
+                Err(e) => {
+                    warn!(
+                        backend_ip = %ipv4_to_string(self.backend.ipv4),
+                        backend_port = self.backend.port,
+                        worker_id = self.worker_id,
+                        connection_num = i + 1,
+                        error = %e,
+                        "Failed to pre-warm connection, continuing with partial pool"
+                    );
+                    // Don't fail completely - partial pool is better than nothing
+                    break;
+                }
+            }
+        }
+
+        info!(
+            backend_ip = %ipv4_to_string(self.backend.ipv4),
+            backend_port = self.backend.port,
+            worker_id = self.worker_id,
+            connections_created = self.connections.len(),
+            "Pre-warming complete"
+        );
+
+        Ok(())
     }
 
     /// Get available connection or create new one
@@ -274,13 +371,23 @@ impl Http2Pool {
                 .set(after_cleanup as i64);
         }
 
-        // 3. Find connection that is ready for requests
+        // 3. Find connection that is ready for requests using round-robin
         let mut conn_index = None;
-        for (i, conn) in self.connections.iter_mut().enumerate() {
-            if conn.state == ConnectionState::Active && conn.sender.is_ready() {
-                conn.last_used = Instant::now();
-                conn_index = Some(i);
-                break;
+        let num_conns = self.connections.len();
+
+        if num_conns > 0 {
+            // Try connections in round-robin order starting from next_conn_index
+            for i in 0..num_conns {
+                let idx = (self.next_conn_index + i) % num_conns;
+                let conn = &mut self.connections[idx];
+
+                if conn.state == ConnectionState::Active && conn.sender.is_ready() {
+                    conn.last_used = Instant::now();
+                    conn_index = Some(idx);
+                    // Update round-robin index for next request
+                    self.next_conn_index = (idx + 1) % num_conns;
+                    break;
+                }
             }
         }
 
@@ -337,8 +444,14 @@ impl Http2Pool {
 
         let io = TokioIo::new(stream);
 
-        // HTTP/2 handshake
-        let (sender, conn) = http2::handshake(TokioExecutor::new(), io)
+        // HTTP/2 handshake with Builder
+        // RFC 7540 Section 6.5.2: SETTINGS_MAX_CONCURRENT_STREAMS
+        // RFC 7541: SETTINGS_HEADER_TABLE_SIZE (HPACK compression)
+        let (sender, conn) = http2::Builder::new(TokioExecutor::new())
+            .max_concurrent_streams(self.max_streams_per_conn)
+            .header_table_size(self.header_table_size)
+            .adaptive_window(true) // Let hyper tune flow control windows automatically
+            .handshake(io)
             .await
             .map_err(|e| {
                 self.record_failure();
@@ -473,17 +586,50 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
-    /// RED: Test that pool metrics are exposed to Prometheus
-    /// FIXME: Flaky test - metrics not initialized without successful connection
+    /// GREEN: Test that pool metrics are exposed to Prometheus
+    /// Verifies that http2_pool_connections_created_total is exported with backend labels
     #[tokio::test]
-    #[ignore]
     async fn test_pool_metrics_exposed() {
-        let backend = Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 9001, 100);
+        // Create a real HTTP/2 backend server for testing
+        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+
+        // Spawn HTTP/2 backend server
+        tokio::spawn(async move {
+            let (stream, _) = backend_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+
+            let service = hyper::service::service_fn(
+                |_req: hyper::Request<hyper::body::Incoming>| async move {
+                    Ok::<_, hyper::Error>(
+                        hyper::Response::builder()
+                            .status(hyper::StatusCode::OK)
+                            .body(Full::new(Bytes::from("test")))
+                            .unwrap(),
+                    )
+                },
+            );
+
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
+        });
+
+        // Wait for server to be ready
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Create backend pointing to test server
+        let backend_ip = match backend_addr.ip() {
+            std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
+            _ => panic!("Expected IPv4 address"),
+        };
+        let backend = Backend::new(backend_ip, backend_addr.port(), 100);
         let mut pools = BackendConnectionPools::new(0); // Test worker 0
         let pool = pools.get_or_create_pool(backend);
 
-        // Trigger some metrics
-        let _conn_result = pool.get_connection().await;
+        // Trigger some metrics (connection should succeed)
+        let conn_result = pool.get_connection().await;
+        assert!(conn_result.is_ok(), "Connection should succeed");
 
         // Collect metrics
         let metrics_output = gather_pool_metrics().expect("Should gather metrics");
@@ -491,14 +637,12 @@ mod tests {
         // Should have http2_pool_connections_created_total metric
         assert!(
             metrics_output.contains("http2_pool_connections_created_total"),
-            "Should export connections_created_total metric"
+            "Missing metric"
         );
 
-        // Should have backend label (127.0.0.1:9001)
-        assert!(
-            metrics_output.contains("backend=\"127.0.0.1:9001\""),
-            "Should include backend label"
-        );
+        // Should have backend label (127.0.0.1:<port>)
+        let label = format!("backend=\"127.0.0.1:{}\"", backend_addr.port());
+        assert!(metrics_output.contains(&label), "Missing label");
     }
 
     /// RED: Test that failed connections are counted
@@ -519,16 +663,13 @@ mod tests {
         // Should have http2_pool_connections_failed_total metric
         assert!(
             metrics_output.contains("http2_pool_connections_failed_total"),
-            "Should export connections_failed_total metric"
+            "Missing metric"
         );
 
         // Check value is at least 1 (with worker_id label)
-        assert!(
-            metrics_output.contains(
-                "http2_pool_connections_failed_total{backend=\"127.0.0.1:1\",worker_id=\"0\"} 1"
-            ),
-            "Should count connection failure"
-        );
+        let expected =
+            "http2_pool_connections_failed_total{backend=\"127.0.0.1:1\",worker_id=\"0\"} 1";
+        assert!(metrics_output.contains(expected), "Missing count");
     }
 
     /// RED: Test that active connections are tracked as gauge
@@ -547,12 +688,9 @@ mod tests {
 
         // Get current active connections (should be 0)
         let metrics_before = gather_pool_metrics().expect("Should gather metrics");
-        assert!(
-            metrics_before.contains(
-                "http2_pool_connections_active{backend=\"127.0.0.1:9001\",worker_id=\"0\"} 0"
-            ),
-            "Should show 0 active connections initially"
-        );
+        let expected =
+            "http2_pool_connections_active{backend=\"127.0.0.1:9001\",worker_id=\"0\"} 0";
+        assert!(metrics_before.contains(expected), "Missing initial count");
     }
 
     /// RED: Test that queued requests are counted
@@ -567,10 +705,7 @@ mod tests {
 
         // Try to get connection (should queue)
         let result = pool.get_connection().await;
-        assert!(
-            matches!(result, Err(PoolError::NoCapacity)),
-            "Should fail with NoCapacity"
-        );
+        assert!(matches!(result, Err(PoolError::NoCapacity)), "Wrong error");
 
         // Collect metrics
         let metrics_output = gather_pool_metrics().expect("Should gather metrics");
@@ -578,7 +713,51 @@ mod tests {
         // Should have http2_pool_requests_queued_total metric
         assert!(
             metrics_output.contains("http2_pool_requests_queued_total"),
-            "Should export requests_queued_total metric"
+            "Missing metric"
         );
+    }
+
+    /// RED: Test that max_concurrent_streams is configured to 500 (Phase 1: Connection Pool Tuning)
+    /// Per RFC 7540 Section 6.5.2 and HTTP2_OPTIMIZATION_ROADMAP.md
+    /// This test will FAIL until we implement http2::Builder with max_concurrent_streams(500)
+    #[tokio::test]
+    async fn test_max_concurrent_streams_configured() {
+        let backend = Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 9001, 100);
+        let mut pools = BackendConnectionPools::new(0);
+        let pool = pools.get_or_create_pool(backend);
+
+        // Verify pool is configured for 500 streams per connection (not default 100)
+        assert_eq!(pool.max_streams_per_conn, 500, "Wrong stream limit");
+    }
+
+    /// RED: Test that pool uses round-robin selection across multiple connections
+    /// Phase 1: Multi-connection pooling with round-robin load distribution
+    /// This test will FAIL until we add next_conn_index field to Http2Pool
+    #[tokio::test]
+    async fn test_round_robin_connection_selection() {
+        let backend = Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 9001, 100);
+        let mut pools = BackendConnectionPools::new(0);
+        let pool = pools.get_or_create_pool(backend);
+
+        // Verify pool supports multiple connections for load distribution
+        assert!(pool.max_connections >= 2, "Need >= 2 connections");
+
+        // Access next_conn_index field (will fail to compile until added)
+        let _initial_index = pool.next_conn_index;
+        assert_eq!(_initial_index, 0, "Wrong initial index");
+    }
+
+    /// RED: Test that HPACK header table size is configured for compression
+    /// Phase 2: HPACK optimization per RFC 7541
+    /// Default is 4096 bytes - we should increase it for better compression
+    #[tokio::test]
+    async fn test_hpack_header_table_size() {
+        let backend = Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 9001, 100);
+        let mut pools = BackendConnectionPools::new(0);
+        let pool = pools.get_or_create_pool(backend);
+
+        // Pool should track HPACK header table size
+        // RFC 7541 default is 4096, we optimize to 8192 for proxy use
+        assert_eq!(pool.header_table_size, 8192, "Wrong HPACK table size");
     }
 }
