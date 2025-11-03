@@ -386,6 +386,7 @@ impl Http2Pool {
         let (sender, conn) = http2::Builder::new(TokioExecutor::new())
             .max_concurrent_streams(self.max_streams_per_conn)
             .header_table_size(self.header_table_size)
+            .adaptive_window(true) // Let hyper tune flow control windows automatically
             .handshake(io)
             .await
             .map_err(|e| {

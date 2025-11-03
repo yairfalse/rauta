@@ -8,6 +8,9 @@ use std::sync::Arc;
 use tokio::signal;
 use tracing::{info, warn};
 
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod apis;
 mod config;
 mod error;

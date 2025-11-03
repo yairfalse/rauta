@@ -329,30 +329,46 @@ async fn forward_to_backend(
 
     // Read the incoming request body
     let (parts, body) = req.into_parts();
-    let body_read_start = Instant::now();
-    let body_bytes = body
-        .collect()
-        .await
-        .map_err(|e| {
-            error!(
-                request_id = %request_id,
-                error.message = %e,
-                error.type = "request_body_read",
-                elapsed_us = body_read_start.elapsed().as_micros() as u64,
-                "Failed to read request body"
-            );
-            format!("Failed to read request body: {}", e)
-        })?
-        .to_bytes();
 
-    let body_read_duration = body_read_start.elapsed();
-    info!(
-        request_id = %request_id,
-        stage = "request_body_read",
-        body_size_bytes = body_bytes.len(),
-        elapsed_us = body_read_duration.as_micros() as u64,
-        "Request body read complete"
-    );
+    // Fast path: GET/HEAD requests have no body, skip collection
+    let body_bytes = if parts.method == hyper::Method::GET
+        || parts.method == hyper::Method::HEAD
+        || parts.method == hyper::Method::DELETE
+    {
+        debug!(
+            request_id = %request_id,
+            method = %parts.method,
+            "Fast path: skipping body read for bodiless method"
+        );
+        Bytes::new() // Empty body, zero allocation
+    } else {
+        // Slow path: POST/PUT/PATCH may have body
+        let body_read_start = Instant::now();
+        let bytes = body
+            .collect()
+            .await
+            .map_err(|e| {
+                error!(
+                    request_id = %request_id,
+                    error.message = %e,
+                    error.type = "request_body_read",
+                    elapsed_us = body_read_start.elapsed().as_micros() as u64,
+                    "Failed to read request body"
+                );
+                format!("Failed to read request body: {}", e)
+            })?
+            .to_bytes();
+
+        let body_read_duration = body_read_start.elapsed();
+        info!(
+            request_id = %request_id,
+            stage = "request_body_read",
+            body_size_bytes = bytes.len(),
+            elapsed_us = body_read_duration.as_micros() as u64,
+            "Request body read complete"
+        );
+        bytes
+    };
 
     // Build backend URI with path and query parameters
     let path_and_query = parts
