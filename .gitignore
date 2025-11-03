@@ -37,11 +37,17 @@ logs/
 # Test artifacts
 test-results/
 coverage/
+*_test_output.txt
+load_test_results.txt
+loadtest_output.txt
+loadtest_workers.txt
 
 # Temporary files
 tmp/
 temp/
 *.tmp
+*.pid
+*.py  # Temporary Python scripts (use Rust examples instead)
 
 # BPF CO-RE (BTF)
 .btf/
