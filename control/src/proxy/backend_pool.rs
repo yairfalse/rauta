@@ -227,6 +227,8 @@ impl BackendConnectionPools {
     }
 
     /// Get or create pool for backend
+    /// NOTE: This returns a pool that may not be pre-warmed yet.
+    /// For best performance, call `prewarm_pool()` after getting the pool.
     pub fn get_or_create_pool(&mut self, backend: Backend) -> &mut Http2Pool {
         let key = BackendKey::from(backend);
         let worker_id = self.worker_id; // Capture for closure
@@ -240,11 +242,23 @@ impl BackendConnectionPools {
             Http2Pool::new(backend, worker_id)
         })
     }
+
+    /// Pre-warm pool for a specific backend (call after get_or_create_pool)
+    pub async fn prewarm_pool(&mut self, backend: Backend) -> Result<(), PoolError> {
+        let key = BackendKey::from(backend);
+        if let Some(pool) = self.pools.get_mut(&key) {
+            // Only prewarm if connections haven't been created yet
+            if pool.connections.is_empty() {
+                pool.prewarm().await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Http2Pool {
     pub fn new(backend: Backend, worker_id: usize) -> Self {
-        let max_streams_per_conn = 500; // RFC 7540 Section 6.5.2 - increased from 100 for Phase 1
+        let max_streams_per_conn = 500; // RFC 7540 Section 6.5.2 - high limit for HTTP/2 multiplexing
         let header_table_size = 8192; // RFC 7541 - doubled from default 4096 for proxy use
 
         // Set max_concurrent_streams metric
@@ -258,7 +272,7 @@ impl Http2Pool {
             backend,
             worker_id,
             connections: Vec::new(),
-            max_connections: 4, // Start conservative
+            max_connections: 4, // 4 connections * 250 streams = 1000 concurrent requests per worker
             max_streams_per_conn,
             next_conn_index: 0, // Round-robin starts at first connection
             header_table_size,  // HPACK compression (Phase 2)
@@ -267,6 +281,56 @@ impl Http2Pool {
             last_success: Instant::now(),
             metrics: PoolMetrics::default(),
         }
+    }
+
+    /// Pre-warm connections (create all max_connections upfront)
+    /// Call this after pool creation to avoid lazy connection establishment
+    pub async fn prewarm(&mut self) -> Result<(), PoolError> {
+        info!(
+            backend_ip = %ipv4_to_string(self.backend.ipv4),
+            backend_port = self.backend.port,
+            worker_id = self.worker_id,
+            target_connections = self.max_connections,
+            "Pre-warming HTTP/2 connection pool"
+        );
+
+        for i in 0..self.max_connections {
+            match self.create_connection().await {
+                Ok(conn) => {
+                    debug!(
+                        backend_ip = %ipv4_to_string(self.backend.ipv4),
+                        backend_port = self.backend.port,
+                        worker_id = self.worker_id,
+                        connection_num = i + 1,
+                        total = self.max_connections,
+                        "Pre-warmed connection"
+                    );
+                    self.connections.push(conn);
+                }
+                Err(e) => {
+                    warn!(
+                        backend_ip = %ipv4_to_string(self.backend.ipv4),
+                        backend_port = self.backend.port,
+                        worker_id = self.worker_id,
+                        connection_num = i + 1,
+                        error = %e,
+                        "Failed to pre-warm connection, continuing with partial pool"
+                    );
+                    // Don't fail completely - partial pool is better than nothing
+                    break;
+                }
+            }
+        }
+
+        info!(
+            backend_ip = %ipv4_to_string(self.backend.ipv4),
+            backend_port = self.backend.port,
+            worker_id = self.worker_id,
+            connections_created = self.connections.len(),
+            "Pre-warming complete"
+        );
+
+        Ok(())
     }
 
     /// Get available connection or create new one
