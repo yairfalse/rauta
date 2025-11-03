@@ -272,7 +272,7 @@ impl Http2Pool {
             backend,
             worker_id,
             connections: Vec::new(),
-            max_connections: 4, // 4 connections * 250 streams = 1000 concurrent requests per worker
+            max_connections: 4, // 4 connections * 500 streams = 2000 concurrent requests per worker
             max_streams_per_conn,
             next_conn_index: 0, // Round-robin starts at first connection
             header_table_size,  // HPACK compression (Phase 2)

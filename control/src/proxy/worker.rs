@@ -54,13 +54,10 @@ impl Worker {
         // Per-worker lock (only contends with requests to same worker)
         let mut pools = self.pools.lock().await;
 
-        // Get or create pool
-        let _pool = pools.get_or_create_pool(backend);
-
         // Pre-warm connections on first access (no-op if already warmed)
         pools.prewarm_pool(backend).await?;
 
-        // Now get connection from pre-warmed pool
+        // Get connection from pre-warmed pool
         let pool = pools.get_or_create_pool(backend);
         pool.get_connection().await
     }
