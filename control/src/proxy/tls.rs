@@ -270,4 +270,206 @@ mod tests {
         //
         // The test passes if this function compiles (which it does)
     }
+
+    /// RED: Test HTTPS server accepts TLS connections
+    #[tokio::test]
+    async fn test_https_server_with_tls_acceptor() {
+        init_crypto();
+
+        use hyper::body::Bytes;
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper::{Request, Response, StatusCode};
+        use hyper_util::rt::TokioIo;
+        use tokio::net::TcpListener;
+
+        // Load test certificate
+        let cert_pem = include_bytes!("../../../test_fixtures/tls/example.com.crt");
+        let key_pem = include_bytes!("../../../test_fixtures/tls/example.com.key");
+        let cert =
+            TlsCertificate::from_pem(cert_pem, key_pem).expect("Should parse test certificate");
+
+        // Create TLS acceptor
+        let server_config = cert.to_server_config().expect("Should build server config");
+        let acceptor = TlsAcceptor::from(server_config);
+
+        // Start HTTPS server
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+
+            // Perform TLS handshake
+            let tls_stream = acceptor.accept(stream).await.unwrap();
+            let io = TokioIo::new(tls_stream);
+
+            // Serve HTTP over TLS
+            let service = service_fn(|_req: Request<hyper::body::Incoming>| async move {
+                Ok::<_, hyper::Error>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(http_body_util::Full::new(Bytes::from("Hello over HTTPS")))
+                        .unwrap(),
+                )
+            });
+
+            let _ = http1::Builder::new().serve_connection(io, service).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Connect with TLS client (accept self-signed cert)
+        use rustls::pki_types::ServerName;
+        use rustls::ClientConfig;
+        use tokio_rustls::TlsConnector;
+
+        let mut root_cert_store = rustls::RootCertStore::empty();
+        root_cert_store.add_parsable_certificates(
+            rustls_pemfile::certs(&mut std::io::BufReader::new(&cert_pem[..]))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(root_cert_store)
+            .with_no_client_auth();
+
+        let connector = TlsConnector::from(Arc::new(client_config));
+
+        let stream = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+        let domain = ServerName::try_from("example.com").unwrap();
+        let tls_stream = connector.connect(domain, stream).await.unwrap();
+
+        // Make HTTPS request
+        let io = TokioIo::new(tls_stream);
+        let (mut request_sender, connection) =
+            hyper::client::conn::http1::handshake(io).await.unwrap();
+
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let req = Request::builder()
+            .uri("/test")
+            .body(http_body_util::Full::new(Bytes::new()))
+            .unwrap();
+
+        let response = request_sender.send_request(req).await.unwrap();
+
+        // Verify HTTPS response
+        assert_eq!(response.status(), StatusCode::OK);
+
+        use http_body_util::BodyExt;
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        assert_eq!(body, "Hello over HTTPS");
+    }
+
+    /// RED: Test SNI-based certificate selection
+    #[tokio::test]
+    async fn test_sni_based_certificate_selection() {
+        init_crypto();
+
+        use hyper::body::Bytes;
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper::{Request, Response, StatusCode};
+        use hyper_util::rt::TokioIo;
+        use tokio::net::TcpListener;
+
+        // Load test certificate for example.com
+        let cert_pem = include_bytes!("../../../test_fixtures/tls/example.com.crt");
+        let key_pem = include_bytes!("../../../test_fixtures/tls/example.com.key");
+        let cert =
+            TlsCertificate::from_pem(cert_pem, key_pem).expect("Should parse test certificate");
+
+        // Create SNI resolver with example.com cert
+        let mut resolver = SniResolver::new();
+        resolver
+            .add_cert("example.com".to_string(), cert.clone())
+            .expect("Should add certificate");
+
+        // Get acceptor for example.com
+        let acceptor = resolver
+            .get_acceptor("example.com")
+            .expect("Should have acceptor for example.com");
+
+        // Start HTTPS server with SNI resolver
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+
+            // Perform TLS handshake with SNI
+            let tls_stream = acceptor.accept(stream).await.unwrap();
+            let io = TokioIo::new(tls_stream);
+
+            // Serve HTTP over TLS
+            let service = service_fn(|_req: Request<hyper::body::Incoming>| async move {
+                Ok::<_, hyper::Error>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(http_body_util::Full::new(Bytes::from(
+                            "Hello from example.com",
+                        )))
+                        .unwrap(),
+                )
+            });
+
+            let _ = http1::Builder::new().serve_connection(io, service).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Connect with TLS client requesting example.com via SNI
+        use rustls::pki_types::ServerName;
+        use rustls::ClientConfig;
+        use tokio_rustls::TlsConnector;
+
+        let mut root_cert_store = rustls::RootCertStore::empty();
+        root_cert_store.add_parsable_certificates(
+            rustls_pemfile::certs(&mut std::io::BufReader::new(&cert_pem[..]))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(root_cert_store)
+            .with_no_client_auth();
+
+        let connector = TlsConnector::from(Arc::new(client_config));
+
+        let stream = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+        let domain = ServerName::try_from("example.com").unwrap(); // SNI hostname
+        let tls_stream = connector.connect(domain, stream).await.unwrap();
+
+        // Make HTTPS request
+        let io = TokioIo::new(tls_stream);
+        let (mut request_sender, connection) =
+            hyper::client::conn::http1::handshake(io).await.unwrap();
+
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let req = Request::builder()
+            .uri("/test")
+            .header("Host", "example.com")
+            .body(http_body_util::Full::new(Bytes::new()))
+            .unwrap();
+
+        let response = request_sender.send_request(req).await.unwrap();
+
+        // Verify SNI-based routing worked
+        assert_eq!(response.status(), StatusCode::OK);
+
+        use http_body_util::BodyExt;
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        assert_eq!(body, "Hello from example.com");
+    }
 }
