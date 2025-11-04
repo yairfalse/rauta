@@ -30,6 +30,20 @@ vmlinux.h
 .env
 .env.local
 
+# TLS Certificates (IMPORTANT: Prevent committing real certificates)
+# NOTE: test_fixtures/tls/*.{key,crt,pem} are explicitly tracked for testing
+*.key
+*.crt
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+# But allow test fixtures (already in git)
+!test_fixtures/**/*.key
+!test_fixtures/**/*.crt
+!test_fixtures/**/*.pem
+
 # Logs
 *.log
 logs/

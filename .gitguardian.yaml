@@ -1,0 +1,10 @@
+# GitGuardian configuration
+# https://docs.gitguardian.com/internal-repositories-monitoring/integrations/git_hooks/pre_commit
+
+# Ignore test fixtures (self-signed certificates for local development)
+paths-ignore:
+  - test_fixtures/**/*.key
+  - test_fixtures/**/*.crt
+  - test_fixtures/**/*.pem
+
+# These are self-signed certificates for testing, not production secrets
