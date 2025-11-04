@@ -101,37 +101,119 @@ impl TlsCertificate {
 /// SNI-based certificate resolver
 ///
 /// Routes incoming TLS connections to the correct certificate based on SNI hostname.
+/// Uses rustls::server::ResolvesServerCertUsingSni for dynamic SNI resolution.
 #[allow(dead_code)] // Used in tests and future HTTPS server
-#[derive(Default)]
 pub struct SniResolver {
-    /// Map of hostname -> TLS config
-    configs: std::collections::HashMap<String, Arc<ServerConfig>>,
+    /// Rustls built-in SNI resolver (wrapped in Arc for sharing)
+    inner: Arc<std::sync::Mutex<rustls::server::ResolvesServerCertUsingSni>>,
+    /// Track hostnames for has_cert() checks
+    hostnames: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 #[allow(dead_code)] // Used in tests and future HTTPS server
 impl SniResolver {
     /// Create a new SNI resolver
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(
+                rustls::server::ResolvesServerCertUsingSni::new(),
+            )),
+            hostnames: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        }
     }
 
     /// Add a certificate for a hostname
     pub fn add_cert(&mut self, hostname: String, cert: TlsCertificate) -> Result<(), io::Error> {
-        let config = cert.to_server_config()?;
-        self.configs.insert(hostname, config);
+        use rustls::pki_types::CertificateDer;
+        use rustls::sign::CertifiedKey;
+
+        // Parse certificate chain
+        let mut cert_reader = BufReader::new(&cert.cert_chain[..]);
+        let certs: Vec<CertificateDer> = certs(&mut cert_reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // Parse private key
+        let mut key_reader = BufReader::new(&cert.private_key[..]);
+        let key = private_key(&mut key_reader)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "No private key found"))?;
+
+        // Build signing key
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // Create CertifiedKey
+        let certified_key = CertifiedKey::new(certs, signing_key);
+
+        // Add to resolver
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .add(&hostname, certified_key)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let mut hostnames = self.hostnames.lock().unwrap();
+        hostnames.insert(hostname);
         Ok(())
     }
 
     /// Get TLS acceptor for a hostname (exact match only for now)
+    /// DEPRECATED: Use to_server_config() instead for dynamic SNI resolution
     pub fn get_acceptor(&self, hostname: &str) -> Option<TlsAcceptor> {
-        self.configs
-            .get(hostname)
-            .map(|config| TlsAcceptor::from(Arc::clone(config)))
+        // This is deprecated - we should use to_server_config() for dynamic SNI
+        // For backwards compatibility with existing tests, we build a single-cert config
+        let hostnames = self.hostnames.lock().unwrap();
+        if !hostnames.contains(hostname) {
+            return None;
+        }
+        drop(hostnames);
+
+        // Build a ServerConfig with the cert resolver
+        match self.to_server_config() {
+            Ok(config) => Some(TlsAcceptor::from(config)),
+            Err(_) => None,
+        }
+    }
+
+    /// Build ServerConfig with dynamic SNI resolution
+    pub fn to_server_config(&self) -> Result<Arc<ServerConfig>, io::Error> {
+        // Clone the Arc to share the resolver across connections
+        let resolver = Arc::clone(&self.inner);
+
+        // Wrap in a newtype that implements ResolvesServerCert
+        #[derive(Debug)]
+        struct SniResolverWrapper {
+            inner: Arc<std::sync::Mutex<rustls::server::ResolvesServerCertUsingSni>>,
+        }
+
+        impl rustls::server::ResolvesServerCert for SniResolverWrapper {
+            fn resolve(
+                &self,
+                client_hello: rustls::server::ClientHello,
+            ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+                let inner = self.inner.lock().unwrap();
+                inner.resolve(client_hello)
+            }
+        }
+
+        let wrapper = SniResolverWrapper { inner: resolver };
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(wrapper));
+
+        Ok(Arc::new(config))
     }
 
     /// Check if a hostname has a certificate configured
     pub fn has_cert(&self, hostname: &str) -> bool {
-        self.configs.contains_key(hostname)
+        let hostnames = self.hostnames.lock().unwrap();
+        hostnames.contains(hostname)
+    }
+}
+
+impl Default for SniResolver {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -365,6 +447,161 @@ mod tests {
         let body = String::from_utf8(body_bytes.to_vec()).unwrap();
 
         assert_eq!(body, "Hello over HTTPS");
+    }
+
+    /// RED: Test dynamic SNI resolution with multiple hostnames
+    #[tokio::test]
+    async fn test_dynamic_sni_resolution_multiple_hosts() {
+        init_crypto();
+
+        use hyper::body::Bytes;
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper::{Request, Response, StatusCode};
+        use hyper_util::rt::TokioIo;
+        use tokio::net::TcpListener;
+
+        // Load certificates for example.com and test.com
+        let example_cert_pem = include_bytes!("../../../test_fixtures/tls/example.com.crt");
+        let example_key_pem = include_bytes!("../../../test_fixtures/tls/example.com.key");
+        let example_cert = TlsCertificate::from_pem(example_cert_pem, example_key_pem)
+            .expect("Should parse example.com certificate");
+
+        let test_cert_pem = include_bytes!("../../../test_fixtures/tls/test.com.crt");
+        let test_key_pem = include_bytes!("../../../test_fixtures/tls/test.com.key");
+        let test_cert = TlsCertificate::from_pem(test_cert_pem, test_key_pem)
+            .expect("Should parse test.com certificate");
+
+        // Create SNI resolver with both certificates
+        let mut resolver = SniResolver::new();
+        resolver
+            .add_cert("example.com".to_string(), example_cert)
+            .expect("Should add example.com cert");
+        resolver
+            .add_cert("test.com".to_string(), test_cert)
+            .expect("Should add test.com cert");
+
+        // Build ServerConfig with cert resolver (this will fail - need to refactor)
+        let server_config = resolver
+            .to_server_config()
+            .expect("Should build ServerConfig with dynamic SNI");
+
+        let acceptor = TlsAcceptor::from(server_config);
+
+        // Start HTTPS server with dynamic SNI
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let acceptor_clone = acceptor.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let acceptor = acceptor_clone.clone();
+
+                tokio::spawn(async move {
+                    let tls_stream = acceptor.accept(stream).await.unwrap();
+                    let io = TokioIo::new(tls_stream);
+
+                    let service = service_fn(|req: Request<hyper::body::Incoming>| async move {
+                        // Echo the Host header to verify which cert was used
+                        let host = req
+                            .headers()
+                            .get("host")
+                            .and_then(|h| h.to_str().ok())
+                            .unwrap_or("unknown");
+                        Ok::<_, hyper::Error>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(http_body_util::Full::new(Bytes::from(format!(
+                                    "Hello from {}",
+                                    host
+                                ))))
+                                .unwrap(),
+                        )
+                    });
+
+                    let _ = http1::Builder::new().serve_connection(io, service).await;
+                });
+            }
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Test 1: Connect to example.com
+        use rustls::pki_types::ServerName;
+        use rustls::ClientConfig;
+        use tokio_rustls::TlsConnector;
+
+        let mut root_cert_store = rustls::RootCertStore::empty();
+        root_cert_store.add_parsable_certificates(
+            rustls_pemfile::certs(&mut std::io::BufReader::new(&example_cert_pem[..]))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+        root_cert_store.add_parsable_certificates(
+            rustls_pemfile::certs(&mut std::io::BufReader::new(&test_cert_pem[..]))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(root_cert_store)
+            .with_no_client_auth();
+
+        let connector = TlsConnector::from(Arc::new(client_config));
+
+        // Test example.com
+        let stream = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+        let domain = ServerName::try_from("example.com").unwrap();
+        let tls_stream = connector.connect(domain, stream).await.unwrap();
+
+        let io = TokioIo::new(tls_stream);
+        let (mut request_sender, connection) =
+            hyper::client::conn::http1::handshake(io).await.unwrap();
+
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let req = Request::builder()
+            .uri("/test")
+            .header("Host", "example.com")
+            .body(http_body_util::Full::new(Bytes::new()))
+            .unwrap();
+
+        let response = request_sender.send_request(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        use http_body_util::BodyExt;
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert_eq!(body, "Hello from example.com");
+
+        // Test 2: Connect to test.com (should get different cert)
+        let stream2 = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+        let domain2 = ServerName::try_from("test.com").unwrap();
+        let tls_stream2 = connector.connect(domain2, stream2).await.unwrap();
+
+        let io2 = TokioIo::new(tls_stream2);
+        let (mut request_sender2, connection2) =
+            hyper::client::conn::http1::handshake(io2).await.unwrap();
+
+        tokio::spawn(async move {
+            let _ = connection2.await;
+        });
+
+        let req2 = Request::builder()
+            .uri("/test")
+            .header("Host", "test.com")
+            .body(http_body_util::Full::new(Bytes::new()))
+            .unwrap();
+
+        let response2 = request_sender2.send_request(req2).await.unwrap();
+        assert_eq!(response2.status(), StatusCode::OK);
+
+        let body_bytes2 = response2.into_body().collect().await.unwrap().to_bytes();
+        let body2 = String::from_utf8(body_bytes2.to_vec()).unwrap();
+        assert_eq!(body2, "Hello from test.com");
     }
 
     /// RED: Test SNI-based certificate selection

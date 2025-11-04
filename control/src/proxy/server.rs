@@ -226,6 +226,7 @@ impl ProxyServer {
     }
 
     /// Start serving HTTPS requests with TLS termination
+    /// Uses dynamic SNI resolution to serve multiple hostnames
     #[allow(dead_code)]
     pub async fn serve_https(
         self,
@@ -239,6 +240,13 @@ impl ProxyServer {
 
         info!("HTTPS proxy server listening on {}", self.bind_addr);
 
+        // Build ServerConfig with dynamic SNI resolution
+        let server_config = sni_resolver
+            .to_server_config()
+            .map_err(|e| format!("Failed to build TLS config: {}", e))?;
+
+        let acceptor = TlsAcceptor::from(server_config);
+
         loop {
             let (stream, _) = listener
                 .accept()
@@ -251,16 +259,12 @@ impl ProxyServer {
             let protocol_cache = self.protocol_cache.clone();
             let workers = self.workers.clone();
             let worker_selector = self.worker_selector.clone();
-
-            // Get TLS acceptor for the SNI hostname
-            // For now, we'll use a fixed hostname - SNI extraction requires rustls ResolvesServerCert
-            let acceptor: TlsAcceptor = sni_resolver
-                .get_acceptor("example.com")
-                .ok_or_else(|| "No TLS certificate configured".to_string())?;
+            let acceptor_clone = acceptor.clone();
 
             tokio::spawn(async move {
-                // Perform TLS handshake
-                let tls_stream = match acceptor.accept(stream).await {
+                // Perform TLS handshake with dynamic SNI resolution
+                // The SNI hostname is automatically extracted from ClientHello
+                let tls_stream = match acceptor_clone.accept(stream).await {
                     Ok(s) => s,
                     Err(e) => {
                         error!("TLS handshake failed: {}", e);
