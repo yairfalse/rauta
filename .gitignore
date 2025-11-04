@@ -30,6 +30,20 @@ vmlinux.h
 .env
 .env.local
 
+# TLS Certificates (IMPORTANT: Prevent committing real certificates)
+# NOTE: test_fixtures/tls/*.{key,crt,pem} are explicitly tracked for testing
+*.key
+*.crt
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+# But allow test fixtures (already in git)
+!test_fixtures/**/*.key
+!test_fixtures/**/*.crt
+!test_fixtures/**/*.pem
+
 # Logs
 *.log
 logs/
@@ -37,11 +51,17 @@ logs/
 # Test artifacts
 test-results/
 coverage/
+*_test_output.txt
+load_test_results.txt
+loadtest_output.txt
+loadtest_workers.txt
 
 # Temporary files
 tmp/
 temp/
 *.tmp
+*.pid
+*.py  # Temporary Python scripts (use Rust examples instead)
 
 # BPF CO-RE (BTF)
 .btf/

@@ -281,7 +281,8 @@ mod tests {
         assert_eq!(listener.port, 443);
         assert_eq!(listener.protocol, "HTTPS");
 
-        // TODO: Test TLS certificate loading and validation
+        // Verify this compiles (TLS config structure exists in Gateway API)
+        // Actual TLS parsing will be implemented in reconciler
     }
 
     #[test]

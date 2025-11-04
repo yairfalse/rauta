@@ -58,6 +58,11 @@ libc = "0.2"
 # Performance: jemalloc allocator (better for async workloads)
 tikv-jemallocator = "0.6"
 
+# TLS termination
+rustls = { version = "0.23", features = ["ring"] }  # Use ring crypto provider
+tokio-rustls = "0.26"
+rustls-pemfile = "2.1"
+
 [build-dependencies]
 # Note: aya-build is the correct package for build scripts, not aya-gen
 # We don't need this currently as we're not generating bindings
