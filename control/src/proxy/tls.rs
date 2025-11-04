@@ -292,6 +292,33 @@ pub async fn load_cert_from_secret(
     TlsCertificate::from_pem(&cert_data.0, &key_data.0)
 }
 
+/// Parse certificate from Secret data (synchronous helper)
+///
+/// Used by Secret watchers that already have the Secret object.
+/// Expects Secret.data with keys:
+/// - `tls.crt`: Certificate chain (PEM format)
+/// - `tls.key`: Private key (PEM format)
+#[allow(dead_code)] // Used in gateway controller
+pub fn parse_cert_from_secret_data(
+    secret: &k8s_openapi::api::core::v1::Secret,
+) -> Result<TlsCertificate, io::Error> {
+    // Get certificate and key from Secret data
+    let data = secret
+        .data
+        .as_ref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Secret has no data"))?;
+
+    let cert_data = data
+        .get("tls.crt")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Secret missing tls.crt"))?;
+
+    let key_data = data
+        .get("tls.key")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Secret missing tls.key"))?;
+
+    TlsCertificate::from_pem(&cert_data.0, &key_data.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
