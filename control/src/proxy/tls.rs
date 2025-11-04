@@ -122,8 +122,8 @@ impl SniResolver {
         }
     }
 
-    /// Add a certificate for a hostname
-    pub fn add_cert(&mut self, hostname: String, cert: TlsCertificate) -> Result<(), io::Error> {
+    /// Helper to parse a TlsCertificate and return a CertifiedKey
+    fn parse_certified_key(cert: &TlsCertificate) -> Result<rustls::sign::CertifiedKey, io::Error> {
         use rustls::pki_types::CertificateDer;
         use rustls::sign::CertifiedKey;
 
@@ -144,7 +144,13 @@ impl SniResolver {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // Create CertifiedKey
-        let certified_key = CertifiedKey::new(certs, signing_key);
+        Ok(CertifiedKey::new(certs, signing_key))
+    }
+
+    /// Add a certificate for a hostname
+    pub fn add_cert(&mut self, hostname: String, cert: TlsCertificate) -> Result<(), io::Error> {
+        // Use the helper to parse and create CertifiedKey
+        let certified_key = Self::parse_certified_key(&cert)?;
 
         // Add to resolver
         let mut inner = self.inner.lock().unwrap();
@@ -164,27 +170,8 @@ impl SniResolver {
     /// - New connections get new ServerConfig with updated certificate
     /// - No service restart required
     pub fn update_cert(&mut self, hostname: String, cert: TlsCertificate) -> Result<(), io::Error> {
-        use rustls::pki_types::CertificateDer;
-        use rustls::sign::CertifiedKey;
-
-        // Parse certificate chain
-        let mut cert_reader = BufReader::new(&cert.cert_chain[..]);
-        let certs: Vec<CertificateDer> = certs(&mut cert_reader)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        // Parse private key
-        let mut key_reader = BufReader::new(&cert.private_key[..]);
-        let key = private_key(&mut key_reader)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "No private key found"))?;
-
-        // Build signing key
-        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        // Create CertifiedKey
-        let certified_key = CertifiedKey::new(certs, signing_key);
+        // Use the helper to parse and create CertifiedKey
+        let certified_key = Self::parse_certified_key(&cert)?;
 
         // Update resolver (this replaces existing cert for hostname)
         let mut inner = self.inner.lock().unwrap();

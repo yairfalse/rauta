@@ -248,10 +248,13 @@ impl ProxyServer {
         let acceptor = TlsAcceptor::from(server_config);
 
         loop {
-            let (stream, _) = listener
-                .accept()
-                .await
-                .map_err(|e| format!("Failed to accept connection: {}", e))?;
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    error!("Failed to accept connection: {}", e);
+                    continue;
+                }
+            };
 
             let router = self.router.clone();
             let client = self.client.clone();
