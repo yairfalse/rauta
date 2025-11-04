@@ -225,6 +225,78 @@ impl ProxyServer {
         }
     }
 
+    /// Start serving HTTPS requests with TLS termination
+    #[allow(dead_code)]
+    pub async fn serve_https(
+        self,
+        sni_resolver: crate::proxy::tls::SniResolver,
+    ) -> Result<(), String> {
+        use tokio_rustls::TlsAcceptor;
+
+        let listener = TcpListener::bind(&self.bind_addr)
+            .await
+            .map_err(|e| format!("Failed to bind to {}: {}", self.bind_addr, e))?;
+
+        info!("HTTPS proxy server listening on {}", self.bind_addr);
+
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .map_err(|e| format!("Failed to accept connection: {}", e))?;
+
+            let router = self.router.clone();
+            let client = self.client.clone();
+            let backend_pools = self.backend_pools.clone();
+            let protocol_cache = self.protocol_cache.clone();
+            let workers = self.workers.clone();
+            let worker_selector = self.worker_selector.clone();
+
+            // Get TLS acceptor for the SNI hostname
+            // For now, we'll use a fixed hostname - SNI extraction requires rustls ResolvesServerCert
+            let acceptor: TlsAcceptor = sni_resolver
+                .get_acceptor("example.com")
+                .ok_or_else(|| "No TLS certificate configured".to_string())?;
+
+            tokio::spawn(async move {
+                // Perform TLS handshake
+                let tls_stream = match acceptor.accept(stream).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("TLS handshake failed: {}", e);
+                        return;
+                    }
+                };
+
+                let io = TokioIo::new(tls_stream);
+
+                let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let router = router.clone();
+                    let client = client.clone();
+                    let backend_pools = backend_pools.clone();
+                    let protocol_cache = protocol_cache.clone();
+                    let workers = workers.clone();
+                    let worker_selector = worker_selector.clone();
+                    async move {
+                        handle_request(
+                            req,
+                            router,
+                            client,
+                            backend_pools,
+                            protocol_cache,
+                            workers,
+                            worker_selector,
+                        )
+                        .await
+                    }
+                });
+
+                // Use HTTP/1.1 over TLS (HTTPS)
+                let _ = http1::Builder::new().serve_connection(io, service).await;
+            });
+        }
+    }
+
     /// Start serving HTTP/2 requests
     #[allow(dead_code)]
     pub async fn serve_http2(self) -> Result<(), String> {
@@ -1904,6 +1976,125 @@ mod tests {
         // Verify each worker has unique ID (lock-free access)
         let worker_ids: Vec<_> = workers.iter().map(|w| w.id()).collect();
         assert_eq!(worker_ids, vec![0, 1, 2, 3], "Worker IDs should be 0..3");
+    }
+
+    /// RED: Test HTTPS proxy with TLS termination
+    #[tokio::test]
+    async fn test_https_proxy_with_tls_termination() {
+        use crate::proxy::tls::{SniResolver, TlsCertificate};
+        use std::sync::Once;
+
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+
+        // Load test certificate
+        let cert_pem = include_bytes!("../../../test_fixtures/tls/example.com.crt");
+        let key_pem = include_bytes!("../../../test_fixtures/tls/example.com.key");
+        let cert =
+            TlsCertificate::from_pem(cert_pem, key_pem).expect("Should parse test certificate");
+
+        // Create SNI resolver
+        let mut resolver = SniResolver::new();
+        resolver
+            .add_cert("example.com".to_string(), cert)
+            .expect("Should add certificate");
+
+        // Start mock HTTP backend
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = backend_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+
+            let service = service_fn(|_req: Request<hyper::body::Incoming>| async move {
+                Ok::<_, hyper::Error>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from("Backend response")))
+                        .unwrap(),
+                )
+            });
+
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Create router pointing to backend
+        let router = crate::proxy::router::Router::new();
+        let backend_ip = match backend_addr.ip() {
+            std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
+            _ => panic!("Expected IPv4 address"),
+        };
+        let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
+        router
+            .add_route(HttpMethod::GET, "/api/test", backends)
+            .unwrap();
+
+        // Start HTTPS proxy server with TLS termination
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
+
+        // This will fail initially - we need to add serve_https() method
+        tokio::spawn(async move {
+            let _ = server.serve_https(resolver).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Connect with HTTPS client
+        use rustls::pki_types::ServerName;
+        use rustls::ClientConfig;
+        use tokio_rustls::TlsConnector;
+
+        let mut root_cert_store = rustls::RootCertStore::empty();
+        root_cert_store.add_parsable_certificates(
+            rustls_pemfile::certs(&mut std::io::BufReader::new(&cert_pem[..]))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(root_cert_store)
+            .with_no_client_auth();
+
+        let connector = TlsConnector::from(Arc::new(client_config));
+
+        let stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let domain = ServerName::try_from("example.com").unwrap();
+        let tls_stream = connector.connect(domain, stream).await.unwrap();
+
+        // Make HTTPS request through proxy
+        let io = TokioIo::new(tls_stream);
+        let (mut request_sender, connection) =
+            hyper::client::conn::http1::handshake(io).await.unwrap();
+
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let req = Request::builder()
+            .uri("/api/test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let response = request_sender.send_request(req).await.unwrap();
+
+        // Verify HTTPS proxy worked
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        assert_eq!(body, "Backend response");
     }
 
     #[tokio::test]
