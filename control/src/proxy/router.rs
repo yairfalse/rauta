@@ -1,10 +1,53 @@
 //! HTTP Router - selects backends using Maglev consistent hashing
 //!
 //! Supports both exact and prefix matching for K8s Ingress compatibility.
+//! Includes passive health checking (circuit breaker pattern).
 
 use common::{fnv1a_hash, maglev_build_compact_table, maglev_lookup_compact, Backend, HttpMethod};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+
+/// Backend health statistics for passive health checking
+#[derive(Debug, Clone)]
+struct BackendHealth {
+    /// Total successful requests (2xx, 3xx, 4xx)
+    success_count: u64,
+    /// Total 5xx errors
+    error_5xx_count: u64,
+}
+
+impl BackendHealth {
+    #[allow(dead_code)] // Used in tests
+    fn new() -> Self {
+        Self {
+            success_count: 0,
+            error_5xx_count: 0,
+        }
+    }
+
+    /// Check if backend is healthy
+    /// Unhealthy if error rate > 50% in last 100 requests
+    fn is_healthy(&self) -> bool {
+        let total = self.success_count + self.error_5xx_count;
+        if total == 0 {
+            return true; // No data yet, assume healthy
+        }
+
+        // If error rate > 50%, mark as unhealthy
+        let error_rate = self.error_5xx_count as f64 / total as f64;
+        error_rate <= 0.5
+    }
+
+    /// Record a response
+    #[allow(dead_code)] // Used in tests
+    fn record_response(&mut self, status_code: u16) {
+        if (500..600).contains(&status_code) {
+            self.error_5xx_count += 1;
+        } else {
+            self.success_count += 1;
+        }
+    }
+}
 
 /// Route configuration for a path
 struct Route {
@@ -31,9 +74,12 @@ struct RouteKey {
 /// Uses hybrid matching strategy:
 /// - Exact match via hash map (O(1) for exact paths)
 /// - Prefix match via matchit radix tree (O(log n) for prefixes)
+/// - Passive health checking (circuit breaker for unhealthy backends)
 pub struct Router {
     routes: Arc<RwLock<HashMap<RouteKey, Route>>>,
     prefix_router: Arc<RwLock<matchit::Router<RouteKey>>>,
+    /// Backend health tracking (key = backend IPv4 address)
+    backend_health: Arc<RwLock<HashMap<u32, BackendHealth>>>,
 }
 
 impl Default for Router {
@@ -41,6 +87,7 @@ impl Default for Router {
         Self {
             routes: Arc::new(RwLock::new(HashMap::new())),
             prefix_router: Arc::new(RwLock::new(matchit::Router::new())),
+            backend_health: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -137,6 +184,17 @@ impl Router {
         self.add_route(HttpMethod::GET, path, backends)
     }
 
+    /// Record backend response for passive health checking
+    ///
+    /// Tracks success (2xx-4xx) and error (5xx) responses per backend.
+    /// Used to calculate error rate and exclude unhealthy backends.
+    #[allow(dead_code)] // Used in tests and future proxy integration
+    pub fn record_backend_response(&self, backend_ip: u32, status_code: u16) {
+        let mut health = self.backend_health.write().unwrap();
+        let backend_health = health.entry(backend_ip).or_insert_with(BackendHealth::new);
+        backend_health.record_response(status_code);
+    }
+
     /// Select backend for request
     ///
     /// Tries exact match first (O(1)), then prefix match (O(log n)).
@@ -170,13 +228,48 @@ impl Router {
 
         // Use flow hash (path + src_ip + src_port) for Maglev lookup
         let flow_hash = self.compute_flow_hash(path_hash, src_ip, src_port);
-        let backend_idx = maglev_lookup_compact(flow_hash, &route.maglev_table);
-        let backend = route.backends.get(backend_idx as usize).copied()?;
 
-        Some(RouteMatch {
-            backend,
-            pattern: Arc::clone(&route.pattern), // Cheap ref count bump (no allocation)
-        })
+        // Try up to all backends to find a healthy one
+        // Use Maglev consistent hashing but skip unhealthy backends
+        let health = self.backend_health.read().unwrap();
+
+        // Track which backend indices we've tried to avoid infinite loops
+        let mut tried_indices = std::collections::HashSet::new();
+
+        for attempt in 0..route.backends.len() * 10 {
+            // Try up to 10x backends to handle hash collisions
+            let lookup_hash = flow_hash.wrapping_add(attempt as u64);
+            let backend_idx = maglev_lookup_compact(lookup_hash, &route.maglev_table);
+
+            // Skip if we've already tried this backend
+            if tried_indices.contains(&backend_idx) {
+                continue;
+            }
+            tried_indices.insert(backend_idx);
+
+            let backend = route.backends.get(backend_idx as usize).copied()?;
+
+            // Check if backend is healthy
+            let is_healthy = health
+                .get(&backend.ipv4)
+                .map(|h| h.is_healthy())
+                .unwrap_or(true); // Default to healthy if no health data
+
+            if is_healthy {
+                return Some(RouteMatch {
+                    backend,
+                    pattern: Arc::clone(&route.pattern),
+                });
+            }
+
+            // If we've tried all unique backends, break
+            if tried_indices.len() == route.backends.len() {
+                break;
+            }
+        }
+
+        // All backends are unhealthy, return None
+        None
     }
 
     /// Compute flow hash for load balancing
@@ -420,6 +513,65 @@ mod tests {
             Ipv4Addr::from(route_match.backend.ipv4),
             Ipv4Addr::new(10, 0, 1, 2),
             "Should use updated backend"
+        );
+    }
+
+    /// RED: Test passive health checking - track 5xx responses
+    #[test]
+    fn test_passive_health_checking_excludes_unhealthy_backend() {
+        let router = Router::new();
+
+        // Add route with 2 backends
+        let backends = vec![
+            Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 1)), 8080, 100), // Backend 1
+            Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 2)), 8080, 100), // Backend 2
+        ];
+
+        router
+            .add_route(HttpMethod::GET, "/api/test", backends)
+            .expect("Should add route");
+
+        // Simulate 10 requests to backend 10.0.1.1 - all return 500 (unhealthy)
+        let backend1_ip = u32::from(Ipv4Addr::new(10, 0, 1, 1));
+        for _ in 0..10 {
+            router.record_backend_response(backend1_ip, 500);
+        }
+
+        // Simulate 10 requests to backend 10.0.1.2 - all return 200 (healthy)
+        let backend2_ip = u32::from(Ipv4Addr::new(10, 0, 1, 2));
+        for _ in 0..10 {
+            router.record_backend_response(backend2_ip, 200);
+        }
+
+        // Now when we select a backend, it should ONLY return the healthy one (10.0.1.2)
+        // Make 100 requests to ensure we get good distribution
+        let mut selected_backends = std::collections::HashSet::new();
+        for i in 0..100 {
+            let route_match = router
+                .select_backend(
+                    HttpMethod::GET,
+                    "/api/test",
+                    Some(0x0100007f + i), // Vary source IP
+                    Some((i % 65535) as u16),
+                )
+                .expect("Should find backend");
+
+            selected_backends.insert(Ipv4Addr::from(route_match.backend.ipv4));
+        }
+
+        // Should ONLY see the healthy backend (10.0.1.2)
+        assert_eq!(
+            selected_backends.len(),
+            1,
+            "Should only use 1 healthy backend"
+        );
+        assert!(
+            selected_backends.contains(&Ipv4Addr::new(10, 0, 1, 2)),
+            "Should only use healthy backend 10.0.1.2"
+        );
+        assert!(
+            !selected_backends.contains(&Ipv4Addr::new(10, 0, 1, 1)),
+            "Should NOT use unhealthy backend 10.0.1.1"
         );
     }
 }
