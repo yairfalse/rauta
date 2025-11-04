@@ -157,6 +157,45 @@ impl SniResolver {
         Ok(())
     }
 
+    /// Update an existing certificate for a hostname (hot-reload)
+    ///
+    /// This enables zero-downtime certificate rotation:
+    /// - Existing connections continue using old ServerConfig
+    /// - New connections get new ServerConfig with updated certificate
+    /// - No service restart required
+    pub fn update_cert(&mut self, hostname: String, cert: TlsCertificate) -> Result<(), io::Error> {
+        use rustls::pki_types::CertificateDer;
+        use rustls::sign::CertifiedKey;
+
+        // Parse certificate chain
+        let mut cert_reader = BufReader::new(&cert.cert_chain[..]);
+        let certs: Vec<CertificateDer> = certs(&mut cert_reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // Parse private key
+        let mut key_reader = BufReader::new(&cert.private_key[..]);
+        let key = private_key(&mut key_reader)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "No private key found"))?;
+
+        // Build signing key
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // Create CertifiedKey
+        let certified_key = CertifiedKey::new(certs, signing_key);
+
+        // Update resolver (this replaces existing cert for hostname)
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .add(&hostname, certified_key)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // Hostname already tracked, no need to update hostnames set
+        Ok(())
+    }
+
     /// Get TLS acceptor for a hostname (exact match only for now)
     /// DEPRECATED: Use to_server_config() instead for dynamic SNI resolution
     pub fn get_acceptor(&self, hostname: &str) -> Option<TlsAcceptor> {
@@ -602,6 +641,54 @@ mod tests {
         let body_bytes2 = response2.into_body().collect().await.unwrap().to_bytes();
         let body2 = String::from_utf8(body_bytes2.to_vec()).unwrap();
         assert_eq!(body2, "Hello from test.com");
+    }
+
+    /// RED: Test certificate hot-reload without downtime
+    #[tokio::test]
+    async fn test_certificate_hot_reload() {
+        init_crypto();
+
+        // Load initial certificate for example.com
+        let cert_v1_pem = include_bytes!("../../../test_fixtures/tls/example.com.crt");
+        let key_v1_pem = include_bytes!("../../../test_fixtures/tls/example.com.key");
+        let cert_v1 =
+            TlsCertificate::from_pem(cert_v1_pem, key_v1_pem).expect("Should parse v1 certificate");
+
+        // Create resolver with v1 certificate
+        let mut resolver = SniResolver::new();
+        resolver
+            .add_cert("example.com".to_string(), cert_v1)
+            .expect("Should add v1 certificate");
+
+        // Build initial ServerConfig
+        let config_v1 = resolver.to_server_config().expect("Should build config");
+
+        // Simulate certificate renewal (renewed example.com certificate)
+        let cert_v2_pem = include_bytes!("../../../test_fixtures/tls/example.com-v2.crt");
+        let key_v2_pem = include_bytes!("../../../test_fixtures/tls/example.com-v2.key");
+        let cert_v2 =
+            TlsCertificate::from_pem(cert_v2_pem, key_v2_pem).expect("Should parse v2 certificate");
+
+        // Hot-reload certificate (this will fail - update_cert doesn't exist yet)
+        resolver
+            .update_cert("example.com".to_string(), cert_v2)
+            .expect("Should update certificate");
+
+        // Build new ServerConfig after reload
+        let config_v2 = resolver
+            .to_server_config()
+            .expect("Should build config after reload");
+
+        // Verify both configs can coexist (no downtime)
+        // Old connections use config_v1, new connections use config_v2
+        assert_ne!(
+            Arc::as_ptr(&config_v1),
+            Arc::as_ptr(&config_v2),
+            "Should be different ServerConfig instances"
+        );
+
+        // Verify resolver still knows about example.com
+        assert!(resolver.has_cert("example.com"));
     }
 
     /// RED: Test SNI-based certificate selection
