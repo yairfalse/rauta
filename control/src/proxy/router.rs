@@ -188,7 +188,7 @@ impl Router {
     ///
     /// Tracks success (2xx-4xx) and error (5xx) responses per backend.
     /// Used to calculate error rate and exclude unhealthy backends.
-    #[allow(dead_code)] // Used in tests and future proxy integration
+    /// Record backend response for passive health checking
     pub fn record_backend_response(&self, backend_ip: u32, status_code: u16) {
         let mut health = self.backend_health.write().unwrap();
         let backend_health = health.entry(backend_ip).or_insert_with(BackendHealth::new);
