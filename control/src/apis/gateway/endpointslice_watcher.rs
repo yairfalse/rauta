@@ -97,7 +97,24 @@ pub async fn watch_endpointslices(
                     .unwrap_or_else(|| "default".to_string());
                 let name = endpointslice.name_any();
                 debug!("EndpointSlice deleted: {}/{}", namespace, name);
-                // TODO: Handle backend removal when all EndpointSlices for a service are gone
+
+                // Remove the deleted EndpointSlice from service_slices
+                let service_name = endpointslice
+                    .labels()
+                    .get("kubernetes.io/service-name")
+                    .cloned()
+                    .unwrap_or_default();
+                let service_key = format!("{}/{}", namespace, service_name);
+                if let Some(slices) = service_slices.get_mut(&service_key) {
+                    slices.remove(&name);
+                    // If no EndpointSlices remain for this service, remove backends from router
+                    if slices.is_empty() {
+                        debug!("All EndpointSlices for service {} deleted; removing backends from router", service_key);
+                        router.remove_backends_for_service(&service_key);
+                        service_slices.remove(&service_key);
+                        service_routes.remove(&service_key);
+                    }
+                }
             }
             Ok(watcher::Event::Init) => {
                 debug!("EndpointSlice watcher initialized");
