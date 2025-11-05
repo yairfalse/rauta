@@ -172,8 +172,24 @@ async fn handle_endpointslice_apply(
         .or_default()
         .insert(name.clone(), endpointslice.clone());
 
+    // Determine the target port from the EndpointSlice
+    let target_port = endpointslice.ports.as_ref()
+        .and_then(|ports| {
+            // Prefer port named "http", else take the first port
+            ports.iter().find(|p| p.name.as_deref() == Some("http"))
+                .or_else(|| ports.get(0))
+                .and_then(|p| p.port)
+        })
+        .unwrap_or_else(|| {
+            warn!(
+                "Could not determine target port from EndpointSlice {}/{}; defaulting to 8080",
+                namespace, name
+            );
+            8080
+        });
+
     // Aggregate backends from ALL EndpointSlices for this Service
-    let all_backends = aggregate_backends_for_service(service_slices, &service_key, 8080);
+    let all_backends = aggregate_backends_for_service(service_slices, &service_key, target_port);
 
     if all_backends.is_empty() {
         warn!(
