@@ -236,8 +236,8 @@ impl Router {
         // Track which backend indices we've tried to avoid infinite loops
         let mut tried_indices = std::collections::HashSet::new();
 
-        for attempt in 0..route.backends.len() * 10 {
-            // Try up to 10x backends to handle hash collisions
+        for attempt in 0..route.backends.len() {
+            // Try up to all backends to handle hash collisions
             let lookup_hash = flow_hash.wrapping_add(attempt as u64);
             let backend_idx = maglev_lookup_compact(lookup_hash, &route.maglev_table);
 
