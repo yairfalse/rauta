@@ -545,4 +545,60 @@ mod tests {
             "Backend should be marked as draining"
         );
     }
+
+    #[test]
+    fn test_router_weighted_backends_canary_deployment() {
+        // RED: Test weighted backends for canary deployments
+        // Use case: 90% traffic to stable, 10% to canary
+        // Maglev supports this by repeating backends in permutation based on weight
+
+        let router = Router::new();
+
+        // 90% stable, 10% canary
+        let stable_backend = Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 1)), 8080, 90);
+        let canary_backend = Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 2)), 8080, 10);
+
+        let backends = vec![stable_backend, canary_backend];
+
+        router
+            .add_route(HttpMethod::GET, "/api/users", backends)
+            .expect("Add route should succeed");
+
+        // Test distribution over 1000 requests
+        let mut distribution = std::collections::HashMap::new();
+        for i in 0..1000 {
+            let src_ip = Some(0x0a000001 + i);
+            let src_port = Some((50000 + (i % 60000)) as u16);
+
+            let route_match = router
+                .select_backend(HttpMethod::GET, "/api/users", src_ip, src_port)
+                .expect("Should find backend");
+
+            *distribution.entry(route_match.backend.ipv4).or_insert(0) += 1;
+        }
+
+        // Check distribution matches weights (within 10% variance for 1000 samples)
+        let stable_count = distribution.get(&stable_backend.ipv4).copied().unwrap_or(0);
+        let canary_count = distribution.get(&canary_backend.ipv4).copied().unwrap_or(0);
+
+        let stable_pct = (stable_count as f64) / 1000.0;
+        let canary_pct = (canary_count as f64) / 1000.0;
+
+        assert!(
+            (0.80..=1.00).contains(&stable_pct),
+            "Stable should get 80-100% of traffic (got {:.1}%)",
+            stable_pct * 100.0
+        );
+        assert!(
+            (0.00..=0.20).contains(&canary_pct),
+            "Canary should get 0-20% of traffic (got {:.1}%)",
+            canary_pct * 100.0
+        );
+
+        println!(
+            "Weighted distribution: stable={:.1}%, canary={:.1}%",
+            stable_pct * 100.0,
+            canary_pct * 100.0
+        );
+    }
 }
