@@ -4,48 +4,48 @@
 //! Includes passive health checking (circuit breaker pattern).
 
 use common::{fnv1a_hash, maglev_build_compact_table, maglev_lookup_compact, Backend, HttpMethod};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
 /// Backend health statistics for passive health checking
 #[derive(Debug, Clone)]
 struct BackendHealth {
-    /// Total successful requests (2xx, 3xx, 4xx)
-    success_count: u64,
-    /// Total 5xx errors
-    error_5xx_count: u64,
+    /// Sliding window of last 100 request results: true = 5xx error, false = success
+    window: VecDeque<bool>,
 }
+
+const WINDOW_SIZE: usize = 100;
 
 impl BackendHealth {
     #[allow(dead_code)] // Used in tests
     fn new() -> Self {
         Self {
-            success_count: 0,
-            error_5xx_count: 0,
+            window: VecDeque::with_capacity(WINDOW_SIZE),
         }
     }
 
     /// Check if backend is healthy
     /// Unhealthy if error rate > 50% in last 100 requests
     fn is_healthy(&self) -> bool {
-        let total = self.success_count + self.error_5xx_count;
+        let total = self.window.len();
         if total == 0 {
             return true; // No data yet, assume healthy
         }
 
         // If error rate > 50%, mark as unhealthy
-        let error_rate = self.error_5xx_count as f64 / total as f64;
+        let error_count = self.window.iter().filter(|&&is_error| is_error).count();
+        let error_rate = error_count as f64 / total as f64;
         error_rate <= 0.5
     }
 
     /// Record a response
     #[allow(dead_code)] // Used in tests
     fn record_response(&mut self, status_code: u16) {
-        if (500..600).contains(&status_code) {
-            self.error_5xx_count += 1;
-        } else {
-            self.success_count += 1;
+        let is_error = (500..600).contains(&status_code);
+        if self.window.len() == WINDOW_SIZE {
+            self.window.pop_front();
         }
+        self.window.push_back(is_error);
     }
 }
 
