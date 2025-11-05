@@ -34,7 +34,7 @@
 //! 4. Zero-downtime: existing connections continue, new requests use new backends
 
 use crate::proxy::router::Router;
-use common::Backend;
+use common::{Backend, HttpMethod};
 use futures::StreamExt;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::watcher;
@@ -107,10 +107,13 @@ pub async fn watch_endpointslices(
                 let service_key = format!("{}/{}", namespace, service_name);
                 if let Some(slices) = service_slices.get_mut(&service_key) {
                     slices.remove(&name);
-                    // If no EndpointSlices remain for this service, remove backends from router
+                    // If no EndpointSlices remain for this service, clean up tracking
                     if slices.is_empty() {
-                        debug!("All EndpointSlices for service {} deleted; removing backends from router", service_key);
-                        router.remove_backends_for_service(&service_key);
+                        debug!(
+                            "All EndpointSlices for service {} deleted; cleaning up tracking",
+                            service_key
+                        );
+                        // Note: We don't remove routes from router here - routes persist until explicitly updated
                         service_slices.remove(&service_key);
                         service_routes.remove(&service_key);
                     }
@@ -173,11 +176,15 @@ async fn handle_endpointslice_apply(
         .insert(name.clone(), endpointslice.clone());
 
     // Determine the target port from the EndpointSlice
-    let target_port = endpointslice.ports.as_ref()
+    let target_port = endpointslice
+        .ports
+        .as_ref()
         .and_then(|ports| {
             // Prefer port named "http", else take the first port
-            ports.iter().find(|p| p.name.as_deref() == Some("http"))
-                .or_else(|| ports.get(0))
+            ports
+                .iter()
+                .find(|p| p.name.as_deref() == Some("http"))
+                .or_else(|| ports.first())
                 .and_then(|p| p.port)
         })
         .unwrap_or_else(|| {
@@ -189,7 +196,8 @@ async fn handle_endpointslice_apply(
         });
 
     // Aggregate backends from ALL EndpointSlices for this Service
-    let all_backends = aggregate_backends_for_service(service_slices, &service_key, target_port);
+    let all_backends =
+        aggregate_backends_for_service(service_slices, &service_key, target_port as u16);
 
     if all_backends.is_empty() {
         warn!(
@@ -210,9 +218,10 @@ async fn handle_endpointslice_apply(
     );
 
     // Update Router for all routes that use this service
+    // Note: Gateway API HTTPRoute doesn't specify method, so we use GET (matches all methods in router)
     if let Some(routes) = service_routes.get(&service_key) {
         for route_path in routes {
-            router.update_route_backends(route_path, all_backends.clone())?;
+            router.update_route_backends(HttpMethod::GET, route_path, all_backends.clone())?;
             info!(
                 "Updated route '{}' with {} backends from service {}",
                 route_path,

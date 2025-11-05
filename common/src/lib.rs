@@ -438,10 +438,21 @@ pub fn maglev_build_compact_table(backends: &[Backend]) -> Vec<u8> {
     // Initialize table with 0 (will always have at least 1 backend)
     let mut table = vec![0u8; COMPACT_MAGLEV_SIZE];
 
-    // Generate permutations for each backend
-    let mut permutations = Vec::with_capacity(backends.len());
+    // Generate permutations for each backend (weighted)
+    // For weighted load balancing: repeat each backend based on its weight
+    // Example: weight=90 → 9 permutations, weight=10 → 1 permutation
+    let mut permutations = Vec::new();
     for (i, backend) in backends.iter().enumerate() {
-        permutations.push(generate_permutation_compact(backend, i as u32));
+        // Normalize weight: weight / 10 (so weight=100 → 10 reps)
+        // Minimum 1 repetition even if weight=0
+        let repetitions = ((backend.weight / 10).max(1)) as usize;
+
+        for rep in 0..repetitions {
+            // Use unique index for each repetition to get different permutations
+            // This ensures weighted backends get different hash patterns
+            let unique_idx = (i * 100 + rep) as u32; // Spread out indices
+            permutations.push((i as u8, generate_permutation_compact(backend, unique_idx)));
+        }
     }
 
     // Track which slots are filled
@@ -451,12 +462,12 @@ pub fn maglev_build_compact_table(backends: &[Backend]) -> Vec<u8> {
     // Fill the table using Maglev algorithm
     let mut n = 0;
     while filled_count < COMPACT_MAGLEV_SIZE {
-        for (backend_idx, perm) in permutations.iter().enumerate() {
+        for (backend_idx, perm) in permutations.iter() {
             let c = perm[n % COMPACT_MAGLEV_SIZE];
 
             // Try to claim this slot
             if !filled[c] {
-                table[c] = backend_idx as u8;
+                table[c] = *backend_idx; // Use backend index from tuple
                 filled[c] = true;
                 filled_count += 1;
 
