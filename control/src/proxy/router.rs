@@ -179,9 +179,9 @@ impl Router {
     ///
     /// This is an alias for add_route() since add_route() already handles updates.
     /// Exists for clarity when the intent is to update backends (vs adding a new route).
-    pub fn update_route_backends(&self, path: &str, backends: Vec<Backend>) -> Result<(), String> {
-        // Assume GET method for now (will be extended when we track method per route)
-        self.add_route(HttpMethod::GET, path, backends)
+    pub fn update_route_backends(&self, method: HttpMethod, path: &str, backends: Vec<Backend>) -> Result<(), String> {
+        // Update backends for the specified HTTP method and path
+        self.add_route(method, path, backends)
     }
 
     /// Record backend response for passive health checking
