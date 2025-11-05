@@ -3,8 +3,31 @@
 //! Supports both exact and prefix matching for K8s Ingress compatibility.
 
 use common::{fnv1a_hash, maglev_build_compact_table, maglev_lookup_compact, Backend, HttpMethod};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+/// Backend draining state (for graceful removal)
+#[derive(Debug, Clone)]
+struct BackendDraining {
+    /// When this backend should be force-removed
+    #[allow(dead_code)] // Used in cleanup_expired_draining_backends
+    deadline: Instant,
+}
+
+impl BackendDraining {
+    #[allow(dead_code)] // Used in drain_backend()
+    fn new(drain_timeout: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + drain_timeout,
+        }
+    }
+
+    #[allow(dead_code)] // Will be used in future EndpointSlice integration
+    fn is_expired(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+}
 
 /// Route configuration for a path
 struct Route {
@@ -34,6 +57,8 @@ struct RouteKey {
 pub struct Router {
     routes: Arc<RwLock<HashMap<RouteKey, Route>>>,
     prefix_router: Arc<RwLock<matchit::Router<RouteKey>>>,
+    /// Backends marked for draining (graceful removal)
+    draining_backends: Arc<RwLock<HashMap<u32, BackendDraining>>>,
 }
 
 impl Default for Router {
@@ -41,6 +66,7 @@ impl Default for Router {
         Self {
             routes: Arc::new(RwLock::new(HashMap::new())),
             prefix_router: Arc::new(RwLock::new(matchit::Router::new())),
+            draining_backends: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -128,6 +154,35 @@ impl Router {
         Ok(())
     }
 
+    /// Mark backend for draining (graceful removal)
+    ///
+    /// When EndpointSlice removes a backend, don't immediately remove it.
+    /// Instead mark as draining to allow existing connections to finish.
+    /// After drain_timeout, the backend will be excluded from routing.
+    ///
+    /// This implements Google's Maglev pattern: "rolling restart of machines
+    /// to upgrade Maglevs in a cluster, draining traffic from each one a few
+    /// moments beforehand"
+    #[allow(dead_code)] // Used in tests and future EndpointSlice integration
+    pub fn drain_backend(&self, backend_ip: u32, drain_timeout: Duration) {
+        let mut draining = self.draining_backends.write().unwrap();
+        draining.insert(backend_ip, BackendDraining::new(drain_timeout));
+    }
+
+    /// Check if backend is marked for draining
+    #[allow(dead_code)] // Used in tests
+    pub fn is_backend_draining(&self, backend_ip: u32) -> bool {
+        let draining = self.draining_backends.read().unwrap();
+        draining.contains_key(&backend_ip)
+    }
+
+    /// Clean up expired draining backends
+    #[allow(dead_code)] // Will be used in EndpointSlice watcher integration
+    fn cleanup_expired_draining_backends(&self) {
+        let mut draining = self.draining_backends.write().unwrap();
+        draining.retain(|_ip, state| !state.is_expired());
+    }
+
     /// Select backend for request
     ///
     /// Tries exact match first (O(1)), then prefix match (O(log n)).
@@ -161,13 +216,38 @@ impl Router {
 
         // Use flow hash (path + src_ip + src_port) for Maglev lookup
         let flow_hash = self.compute_flow_hash(path_hash, src_ip, src_port);
-        let backend_idx = maglev_lookup_compact(flow_hash, &route.maglev_table);
-        let backend = route.backends.get(backend_idx as usize).copied()?;
 
-        Some(RouteMatch {
-            backend,
-            pattern: Arc::clone(&route.pattern), // Cheap ref count bump (no allocation)
-        })
+        // Try up to all backends to find a non-draining one
+        let draining = self.draining_backends.read().unwrap();
+        let mut tried_indices = HashSet::new();
+
+        for attempt in 0..route.backends.len() * 10 {
+            let lookup_hash = flow_hash.wrapping_add(attempt as u64);
+            let backend_idx = maglev_lookup_compact(lookup_hash, &route.maglev_table);
+
+            if tried_indices.contains(&backend_idx) {
+                continue;
+            }
+            tried_indices.insert(backend_idx);
+
+            let backend = route.backends.get(backend_idx as usize).copied()?;
+
+            // Check if backend is draining
+            if draining.contains_key(&backend.ipv4) {
+                // Skip draining backends for NEW connections
+                if tried_indices.len() == route.backends.len() {
+                    break; // All backends tried
+                }
+                continue;
+            }
+
+            return Some(RouteMatch {
+                backend,
+                pattern: Arc::clone(&route.pattern),
+            });
+        }
+
+        None // All backends draining
     }
 
     /// Compute flow hash for load balancing
@@ -411,6 +491,58 @@ mod tests {
             Ipv4Addr::from(route_match.backend.ipv4),
             Ipv4Addr::new(10, 0, 1, 2),
             "Should use updated backend"
+        );
+    }
+
+    #[test]
+    fn test_router_connection_draining() {
+        // RED: Test graceful backend removal (Google Maglev pattern)
+        // When EndpointSlice removes a backend, don't immediately remove it.
+        // Instead: mark as draining for 30s to allow existing connections to finish.
+        use std::time::Duration;
+
+        let router = Router::new();
+
+        // Add route with 2 backends
+        let backends = vec![
+            Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 1)), 8080, 100),
+            Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 2)), 8080, 100),
+        ];
+        router
+            .add_route(HttpMethod::GET, "/api/users", backends)
+            .expect("Add route should succeed");
+
+        // Mark first backend for draining (30 second grace period)
+        let backend_to_drain = u32::from(Ipv4Addr::new(10, 0, 1, 1));
+        router.drain_backend(backend_to_drain, Duration::from_secs(30));
+
+        // NEW connections should NOT go to draining backend
+        // Try 100 times to ensure we don't get the draining backend
+        for i in 0..100 {
+            let src_ip = Some(0x0a000001 + i); // Vary IP to test distribution
+            let src_port = Some((50000 + i) as u16);
+
+            let route_match = router
+                .select_backend(HttpMethod::GET, "/api/users", src_ip, src_port)
+                .expect("Should find backend");
+
+            assert_ne!(
+                route_match.backend.ipv4, backend_to_drain,
+                "New connections should NOT go to draining backend (attempt {})",
+                i
+            );
+            assert_eq!(
+                Ipv4Addr::from(route_match.backend.ipv4),
+                Ipv4Addr::new(10, 0, 1, 2),
+                "Should route to healthy backend only"
+            );
+        }
+
+        // Verify draining backend is still in routes (not removed yet)
+        // This allows existing connections to finish gracefully
+        assert!(
+            router.is_backend_draining(backend_to_drain),
+            "Backend should be marked as draining"
         );
     }
 }
