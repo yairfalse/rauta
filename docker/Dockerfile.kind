@@ -1,0 +1,30 @@
+# RAUTA Gateway Controller - kind deployment
+# Uses pre-built binary from local target/ directory
+
+FROM ubuntu:22.04
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create rauta user
+RUN useradd -m -s /bin/bash rauta
+
+# Copy pre-built binary from local build (Linux ARM64)
+COPY target/aarch64-unknown-linux-gnu/release/control /usr/local/bin/control
+
+# Set ownership
+RUN chown rauta:rauta /usr/local/bin/control && \
+    chmod +x /usr/local/bin/control
+
+# Switch to rauta user
+USER rauta
+WORKDIR /home/rauta
+
+# Expose ports
+EXPOSE 80 443 9090
+
+# Run control plane
+ENTRYPOINT ["/usr/local/bin/control"]

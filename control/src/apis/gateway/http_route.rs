@@ -54,8 +54,56 @@ impl HTTPRouteReconciler {
         namespace: &str,
         service_port: u32,
     ) -> Result<Vec<Backend>, kube::Error> {
+        use k8s_openapi::api::core::v1::Service;
         use k8s_openapi::api::discovery::v1::EndpointSlice;
         use kube::api::ListParams;
+
+        // Fetch the Service to resolve service_port -> targetPort
+        let service_api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let service = service_api.get(service_name).await?;
+
+        // Find the target port for the given service port
+        let target_port = if let Some(spec) = &service.spec {
+            if let Some(ports) = &spec.ports {
+                ports
+                    .iter()
+                    .find(|p| p.port == service_port as i32)
+                    .map(|p| {
+                        // targetPort can be a number or a name
+                        match &p.target_port {
+                            Some(
+                                k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                                    port,
+                                ),
+                            ) => *port as u16,
+                            Some(
+                                k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::String(
+                                    name,
+                                ),
+                            ) => {
+                                // For named ports, we'd need to look at the Pod spec
+                                // For now, fall back to service_port
+                                warn!(
+                                    "Named targetPort '{}' not yet supported, using service port",
+                                    name
+                                );
+                                service_port as u16
+                            }
+                            None => service_port as u16, // Default to service port
+                        }
+                    })
+                    .unwrap_or(service_port as u16)
+            } else {
+                service_port as u16
+            }
+        } else {
+            service_port as u16
+        };
+
+        info!(
+            "Service {}/{} port {} -> targetPort {}",
+            namespace, service_name, service_port, target_port
+        );
 
         let endpointslice_api: Api<EndpointSlice> = Api::namespaced(self.client.clone(), namespace);
 
@@ -71,7 +119,7 @@ impl HTTPRouteReconciler {
                 // Merge backends from all EndpointSlices, matching the target port
                 for endpointslice in endpointslice_list.items {
                     let slice_backends =
-                        parse_endpointslice_to_backends(&endpointslice, service_port as u16);
+                        parse_endpointslice_to_backends(&endpointslice, target_port);
                     backends.extend(slice_backends);
                 }
 
@@ -144,36 +192,85 @@ impl HTTPRouteReconciler {
 
                 // Extract backends
                 if let Some(backend_refs) = &rule.backend_refs {
-                    let mut backends = Vec::new();
+                    // First pass: resolve all services and collect weights
+                    let mut resolved_services = Vec::new();
+                    let mut total_weight = 0i32;
 
-                    // Resolve each backend Service to Pod IPs via EndpointSlice
                     for backend_ref in backend_refs {
                         let service_name = &backend_ref.name;
                         let port = backend_ref.port.unwrap_or(80) as u32;
+                        let weight = backend_ref.weight.unwrap_or(1);
 
                         info!(
-                            "  - Resolving backend Service: {}/{}:{}",
-                            namespace, service_name, port
+                            "  - Resolving backend Service: {}/{}:{} (weight: {})",
+                            namespace, service_name, port, weight
                         );
 
-                        // Resolve Service to Pod IPs
                         match ctx
                             .resolve_service_endpoints(service_name, &namespace, port)
                             .await
                         {
                             Ok(service_backends) => {
                                 info!("    -> Resolved to {} Pod IPs", service_backends.len());
-                                backends.extend(service_backends);
+                                resolved_services.push((service_backends, weight));
+                                total_weight += weight;
                             }
                             Err(e) => {
                                 warn!(
                                     "Failed to resolve service {}/{}: {}",
                                     namespace, service_name, e
                                 );
-                                // Continue with other backends even if this one fails
                             }
                         }
                     }
+
+                    // Second pass: build weighted backend list
+                    // Strategy: Interleave backends proportionally to avoid truncation bias
+                    const MAX_MAGLEV_BACKENDS: usize = 31;
+
+                    let mut backends = Vec::new();
+
+                    if total_weight > 0 {
+                        // First, calculate target slots for each service
+                        let mut service_targets = Vec::new();
+                        for (service_backends, weight) in &resolved_services {
+                            let pods_count = service_backends.len();
+                            let service_slots = ((*weight as f64 / total_weight as f64)
+                                * MAX_MAGLEV_BACKENDS as f64)
+                                .round() as usize;
+                            let replicas_per_pod =
+                                (service_slots as f64 / pods_count as f64).ceil().max(1.0) as usize;
+
+                            info!(
+                                "  - Service weight {} gets {} slots, {} replicas per pod ({} pods)",
+                                weight, service_slots, replicas_per_pod, pods_count
+                            );
+
+                            service_targets.push((service_backends.clone(), replicas_per_pod));
+                        }
+
+                        // Interleave backends round-robin across services to avoid truncation bias
+                        let max_replicas =
+                            service_targets.iter().map(|(_, r)| *r).max().unwrap_or(0);
+                        for replica_round in 0..max_replicas {
+                            for (service_backends, replicas_per_pod) in &service_targets {
+                                if replica_round < *replicas_per_pod {
+                                    backends.extend(service_backends.clone());
+                                }
+                            }
+                        }
+
+                        // Trim to exactly MAX_MAGLEV_BACKENDS if we went over
+                        if backends.len() > MAX_MAGLEV_BACKENDS {
+                            backends.truncate(MAX_MAGLEV_BACKENDS);
+                        }
+                    }
+
+                    info!(
+                        "  - Final backend count: {} (max: {})",
+                        backends.len(),
+                        MAX_MAGLEV_BACKENDS
+                    );
 
                     if !backends.is_empty() {
                         let backend_count = backends.len();

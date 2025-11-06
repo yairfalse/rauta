@@ -1,0 +1,17 @@
+# Fast Rust HTTP/2 Backend for Benchmarking
+# Uses pre-built binary (cross-compiled)
+
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Copy pre-built backend binary (Linux ARM64)
+COPY target/aarch64-unknown-linux-gnu/release/examples/http2_backend /usr/local/bin/backend
+
+RUN chmod +x /usr/local/bin/backend
+
+EXPOSE 8080
+
+ENV BACKEND_PORT=8080
+
+CMD ["/usr/local/bin/backend"]

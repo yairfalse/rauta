@@ -15,12 +15,17 @@ use tokio::net::TcpListener;
 async fn handle_request(
     _req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>, String> {
+    let version = std::env::var("BACKEND_VERSION").unwrap_or_else(|_| "v1".to_string());
+
+    let body = format!(
+        r#"{{"status":"ok","version":"{}","backend":"rust-http2"}}"#,
+        version
+    );
+
     let response = Response::builder()
         .status(200)
         .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(
-            r#"{"status":"ok","backend":"dual-protocol"}"#,
-        )))
+        .body(Full::new(Bytes::from(body)))
         .map_err(|e| format!("Failed to build response: {}", e))?;
 
     Ok(response)
@@ -34,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse::<u16>()
         .unwrap_or(8082);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
 
     println!("Backend server listening on http://{}", addr);
