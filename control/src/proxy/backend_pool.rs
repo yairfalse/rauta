@@ -130,7 +130,7 @@ pub struct Http2Pool {
     connections: Vec<Http2Connection>,
 
     // Connection limits
-    max_connections: usize,    // Max concurrent connections (default: 4)
+    max_connections: usize, // Max concurrent connections (optimized: 8, was 4)
     max_streams_per_conn: u32, // Learned from SETTINGS frame
 
     // Round-robin load distribution (Phase 1 optimization)
@@ -272,7 +272,7 @@ impl Http2Pool {
             backend,
             worker_id,
             connections: Vec::new(),
-            max_connections: 4, // 4 connections * 500 streams = 2000 concurrent requests per worker
+            max_connections: 8, // 8 connections * 500 streams = 4000 concurrent requests per worker
             max_streams_per_conn,
             next_conn_index: 0, // Round-robin starts at first connection
             header_table_size,  // HPACK compression (Phase 2)
@@ -759,5 +759,22 @@ mod tests {
         // Pool should track HPACK header table size
         // RFC 7541 default is 4096, we optimize to 8192 for proxy use
         assert_eq!(pool.header_table_size, 8192, "Wrong HPACK table size");
+    }
+
+    /// RED: Test that pool size is increased to 8 connections for higher concurrency
+    /// Phase 3: Connection pool size optimization (4 → 8 connections per backend)
+    /// Expected impact: +15-20% throughput by reducing queueing under high load
+    #[tokio::test]
+    async fn test_pool_size_increased_to_8_connections() {
+        let backend = Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 9001, 100);
+        let mut pools = BackendConnectionPools::new(0);
+        let pool = pools.get_or_create_pool(backend);
+
+        // Pool should support 8 concurrent connections per backend (up from 4)
+        // With 500 streams per connection: 8 × 500 = 4000 concurrent requests per worker
+        assert_eq!(
+            pool.max_connections, 8,
+            "Pool should have 8 connections for higher concurrency"
+        );
     }
 }
