@@ -220,7 +220,9 @@ impl ProxyServer {
                     }
                 });
 
-                let _ = http1::Builder::new().serve_connection(io, service).await;
+                if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+                    debug!("Error serving connection: {}", e);
+                }
             });
         }
     }

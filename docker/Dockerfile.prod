@@ -69,22 +69,11 @@ RUN cd cli && cargo build --release
 # ============================================
 FROM ubuntu:22.04
 
-# Install runtime dependencies
+# Install runtime dependencies (minimal for Gateway controller)
 RUN apt-get update && apt-get install -y \
-    iproute2 \
-    iputils-ping \
+    ca-certificates \
     curl \
-    tcpdump \
-    iperf3 \
-    wrk \
-    python3 \
-    python3-pip \
-    bpftool \
-    linux-tools-generic \
     && rm -rf /var/lib/apt/lists/*
-
-# Install httpbin for realistic HTTP testing
-RUN pip3 install httpbin gunicorn
 
 # Create rauta user
 RUN useradd -m -s /bin/bash rauta

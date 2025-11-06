@@ -1,0 +1,27 @@
+# kind cluster configuration for RAUTA testing
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: rauta-test
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      # HTTP port mapping
+      - containerPort: 80
+        hostPort: 8080
+        protocol: TCP
+      # HTTPS port mapping
+      - containerPort: 443
+        hostPort: 8443
+        protocol: TCP
+      # Prometheus metrics
+      - containerPort: 9090
+        hostPort: 9090
+        protocol: TCP
+  - role: worker
+  - role: worker

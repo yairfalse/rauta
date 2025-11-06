@@ -26,6 +26,11 @@ use apis::gateway::http_route::HTTPRouteReconciler;
 /// Pure Rust userspace HTTP proxy (no eBPF yet)
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize rustls crypto provider (needed for Kubernetes TLS client)
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok(); // Ignore error if already installed
+
     tracing_subscriber::fmt::init();
 
     info!("🦀 RAUTA Stage 1: Pure Rust Ingress Controller");

@@ -1,0 +1,71 @@
+# RAUTA Gateway Controller - Minimal Build
+#
+# Multi-stage Docker build for Gateway API controller only (no BPF)
+# Optimized for kind deployment and testing
+
+# ============================================
+# Build stage - Compile control plane only
+# ============================================
+FROM rust:1.83-bookworm AS builder
+
+# Install minimal build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /rauta
+
+# Copy workspace manifests
+COPY Cargo.toml Cargo.toml
+COPY common/Cargo.toml common/Cargo.toml
+COPY control/Cargo.toml control/Cargo.toml
+
+# Create dummy source files to cache dependencies
+RUN mkdir -p common/src control/src && \
+    echo "pub fn dummy() {}" > common/src/lib.rs && \
+    echo "fn main() {}" > control/src/main.rs
+
+# Build dependencies (this layer will be cached)
+RUN cd control && cargo build --release || true
+
+# Remove dummy files
+RUN rm -rf common/src control/src
+
+# Copy actual source code
+COPY common/ common/
+COPY control/ control/
+
+# Build release binary
+RUN cd control && cargo build --release --bin control
+
+# ============================================
+# Runtime stage - Minimal image
+# ============================================
+FROM ubuntu:22.04
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create rauta user
+RUN useradd -m -s /bin/bash rauta
+
+# Copy binary from builder
+COPY --from=builder /rauta/target/release/control /usr/local/bin/control
+
+# Set ownership
+RUN chown rauta:rauta /usr/local/bin/control
+
+# Switch to rauta user
+USER rauta
+WORKDIR /home/rauta
+
+# Expose ports
+EXPOSE 80 443 9090
+
+# Run control plane
+ENTRYPOINT ["/usr/local/bin/control"]
