@@ -876,17 +876,35 @@ async fn handle_request(
                 "Route matched, forwarding to backend"
             );
 
-            let result = forward_to_backend(
-                req,
-                route_match.backend,
-                client,
-                &request_id,
-                backend_pools,
-                protocol_cache,
-                workers,
-                worker_index,
+            // Wrap backend request with 30s timeout (prevent hanging on slow backends)
+            let request_timeout = tokio::time::Duration::from_secs(30);
+            let result = tokio::time::timeout(
+                request_timeout,
+                forward_to_backend(
+                    req,
+                    route_match.backend,
+                    client,
+                    &request_id,
+                    backend_pools,
+                    protocol_cache,
+                    workers,
+                    worker_index,
+                ),
             )
             .await;
+
+            // Convert timeout error to proper response
+            let result = match result {
+                Ok(res) => res,
+                Err(_elapsed) => {
+                    warn!(
+                        request_id = %request_id,
+                        timeout_secs = 30,
+                        "Request timeout - backend took too long"
+                    );
+                    Err("Request timeout after 30s".to_string())
+                }
+            };
             let duration = start.elapsed();
 
             // Record metrics (zero-allocation with static strings)
@@ -2373,5 +2391,102 @@ mod tests {
             "Expected <10% errors after health checking, got {}/100",
             error_count
         );
+    }
+
+    /// RED: Test that slow backends timeout after 30 seconds
+    /// Production requirement: Don't wait forever for slow backends
+    /// Expected: Request should timeout with 504 Gateway Timeout
+    #[tokio::test]
+    async fn test_request_timeout_on_slow_backend() {
+        use std::time::Instant;
+
+        // Create a slow backend that delays 35 seconds (exceeds 30s timeout)
+        let slow_backend = tokio::spawn(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            tokio::spawn(async move {
+                loop {
+                    if let Ok((stream, _)) = listener.accept().await {
+                        tokio::spawn(async move {
+                            let io = TokioIo::new(stream);
+                            let service = service_fn(|_req| async {
+                                // Sleep for 35 seconds (longer than 30s timeout)
+                                tokio::time::sleep(tokio::time::Duration::from_secs(35)).await;
+
+                                Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("slow"))))
+                            });
+
+                            let _ = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(io, service)
+                                .await;
+                        });
+                    }
+                }
+            });
+
+            addr
+        })
+        .await
+        .unwrap();
+
+        // Create router pointing to slow backend
+        let router = Arc::new(Router::new());
+
+        // Convert IP address to u32
+        let ip_u32 = match slow_backend.ip() {
+            std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
+            std::net::IpAddr::V6(_) => panic!("IPv6 not supported in test"),
+        };
+
+        let backend = common::Backend::new(ip_u32, slow_backend.port(), 100);
+        router
+            .add_route(common::HttpMethod::GET, "/slow", vec![backend])
+            .unwrap();
+
+        // Start proxy server
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), router).unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Make request to slow backend
+        let client = Client::builder(TokioExecutor::new()).build_http();
+        let uri = format!("http://{}/slow", proxy_addr);
+        let req = Request::builder()
+            .uri(uri)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let start = Instant::now();
+        let result = client.request(req).await;
+        let elapsed = start.elapsed();
+
+        // Should timeout within ~30 seconds (not 35+)
+        assert!(
+            elapsed.as_secs() <= 32,
+            "Request should timeout in ~30s, took {:?}",
+            elapsed
+        );
+
+        // Should return 504 Gateway Timeout (or error)
+        match result {
+            Ok(response) => {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Should return 504 Gateway Timeout for slow backend"
+                );
+            }
+            Err(_) => {
+                // Connection error is also acceptable (timeout closed connection)
+            }
+        }
     }
 }
