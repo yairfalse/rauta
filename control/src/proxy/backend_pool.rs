@@ -436,11 +436,18 @@ impl Http2Pool {
             "Creating new HTTP/2 connection"
         );
 
-        // Connect TCP
-        let stream = TcpStream::connect(&backend_addr).await.map_err(|e| {
-            self.record_failure();
-            PoolError::ConnectionFailed(e.to_string())
-        })?;
+        // Connect TCP with timeout (5 seconds - fail fast on dead backends)
+        let connect_timeout = Duration::from_secs(5);
+        let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(&backend_addr))
+            .await
+            .map_err(|_| {
+                self.record_failure();
+                PoolError::ConnectionFailed("Connection timeout after 5s".to_string())
+            })?
+            .map_err(|e| {
+                self.record_failure();
+                PoolError::ConnectionFailed(e.to_string())
+            })?;
 
         let io = TokioIo::new(stream);
 
@@ -775,6 +782,34 @@ mod tests {
         assert_eq!(
             pool.max_connections, 8,
             "Pool should have 8 connections for higher concurrency"
+        );
+    }
+
+    /// RED: Test that connection timeout fails fast on unreachable backend
+    /// Production systems MUST NOT hang forever on dead backends
+    /// Expected: Connection attempt should timeout within 5 seconds
+    #[tokio::test]
+    async fn test_connection_timeout_on_dead_backend() {
+        use std::time::Instant;
+
+        // Use a non-routable IP (TEST-NET-1 from RFC 5737)
+        // This will cause connection to hang without timeout
+        let backend = Backend::new(u32::from(Ipv4Addr::new(192, 0, 2, 1)), 9999, 100);
+        let mut pools = BackendConnectionPools::new(0);
+        let pool = pools.get_or_create_pool(backend);
+
+        let start = Instant::now();
+        let result = pool.get_connection().await;
+        let elapsed = start.elapsed();
+
+        // Should fail (not hang forever)
+        assert!(result.is_err(), "Connection to dead backend should fail");
+
+        // Should fail FAST (within 5 seconds, not 30+ seconds)
+        assert!(
+            elapsed.as_secs() <= 6,
+            "Connection timeout should be ~5s, got {:?}",
+            elapsed
         );
     }
 }
