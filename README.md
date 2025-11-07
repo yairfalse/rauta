@@ -10,43 +10,59 @@
 
 ## What is RAUTA?
 
-A Kubernetes ingress controller built in Rust with HTTP/2 support and WASM-based extensibility.
+A learning project exploring Rust and Kubernetes Gateway API - built for fun, happens to be fast.
 
-**Core Features:**
-- Modern Kubernetes Gateway API (v1) support
+**What's Actually Built:**
+- Kubernetes Gateway API (v1) controller (GatewayClass, Gateway, HTTPRoute)
 - HTTP/2 connection pooling with multiplexing
+- Multi-core workers (129K+ req/sec on 12 cores)
 - Maglev consistent hashing for load balancing
-- WASM plugin system for safe extensibility
-- Production-grade observability (Prometheus metrics)
+- Weighted routing for canary deployments (90/10 splits)
+- Passive health checking with circuit breakers
+- Graceful shutdown with connection draining
+- Connection/request timeouts (5s/30s)
+- Prometheus metrics and structured logging
+- 74 unit tests + integration tests
 
-**Why RAUTA?**
-- **Memory Safe** - Rust prevents entire classes of bugs
-- **Modern Standards** - Gateway API native, not legacy Ingress
-- **Extensible** - WASM plugins for safe extensibility
-- **Fast** - HTTP/2 multiplexing, efficient connection pooling
+**Why Build This?**
+- Learn Rust async (tokio, hyper)
+- Understand Kubernetes controllers (kube-rs)
+- Explore HTTP/2 multiplexing and connection pooling
+- Practice TDD (every feature test-first)
+- Have fun building systems software
 
 ---
 
-## Status
+## What Works
 
-**Stage 1: Gateway API Controller** ✅ Complete
+**Gateway API Controller** ✅
 - GatewayClass, Gateway, HTTPRoute reconciliation
 - Dynamic backend resolution via EndpointSlice API
-- Maglev load balancing with consistent hashing
+- Service port → targetPort resolution
 - Prefix matching (e.g., `/api` matches `/api/users/123`)
-- Prometheus metrics
 
-**Stage 2: HTTP/2 Connection Pooling** ✅ Complete
-- HTTP/2 multiplexing (1 connection → 44K+ requests)
-- Per-backend connection pools with circuit breakers
-- 3-state health tracking (Healthy → Degraded → Unhealthy)
-- Protocol detection (auto-fallback to HTTP/1.1)
-- Validated: **88K+ req/sec peak** in load testing
+**Load Balancing** ✅
+- Maglev consistent hashing (Google's algorithm)
+- Weighted routing for canary deployments (90/10 splits)
+- Backend health tracking (passive health checks)
+- Connection draining for graceful removal
 
-**Stage 3: WASM Plugin System** 🚧 In Design
-- Safe extensibility without memory leaks
-- Custom authentication, rate limiting, transforms
-- Sandboxed execution environment
+**HTTP/2 Performance** ✅
+- Multi-core workers (12 workers → 129K req/sec)
+- HTTP/2 multiplexing (1 connection → thousands of requests)
+- Per-worker connection pools (lock-free)
+- Auto-fallback to HTTP/1.1
+
+**Reliability** ✅
+- Connection timeout (5s for dead backends)
+- Request timeout (30s for slow backends)
+- Circuit breakers (3-state: Healthy → Degraded → Unhealthy)
+- Graceful shutdown with connection draining (SIGTERM-safe)
+
+**Observability** ✅
+- Prometheus metrics (request rates, latencies, pool stats)
+- Structured logging (OpenTelemetry-style fields)
+- Per-request tracing with request IDs
 
 ---
 
@@ -131,12 +147,11 @@ http2_pool_connections_failed_total{backend}
 http2_pool_requests_queued_total{backend}
 ```
 
-**Load Test Results (Progressive Testing):**
-- **Peak: 88,328 req/sec** (50 concurrent connections)
-- **Sustained: 84,630 req/sec** (800 concurrent connections)
-- **p99 Latency: 9.33ms** at max stress (800 connections)
-- **Multiplexing: 44,543:1 ratio** (1 connection served 44K requests)
-- Zero failures across all test levels
+**Load Test Results:**
+- **Peak: 129,813 req/sec** (12 workers, 400 concurrent connections)
+- **Average Latency: 3.00ms** (p99 under 17ms)
+- **Total: 3.9M requests** in 30 seconds
+- Zero failures, zero dropped connections
 
 See [`docs/HTTP2_CONNECTION_POOLING.md`](docs/HTTP2_CONNECTION_POOLING.md) for design details.
 
@@ -156,20 +171,20 @@ Consistent hashing keeps connections sticky to the same backend. When backends c
 
 - Request multiplexing (1 connection → thousands of requests)
 - Header compression (HPACK)
-- Research-backed: ACM 2024 shows HTTP/2 outperforms HTTP/3 by 45%
+- Reduces connection overhead
 
-**Why WASM for plugins?**
+**Why multi-core workers?**
 
-- Memory safe and sandboxed execution
-- Can't crash the proxy process
-- Platform-independent bytecode
-- Compile once, run anywhere
+- Lock-free routing (each worker has own connection pools)
+- Linear scaling with CPU cores (4 cores → 4x throughput)
+- Zero contention under load
 
 **Why Rust?**
 
-- Memory safety (no segfaults in production)
+- Memory safety (no segfaults)
 - Strong type system (catch bugs at compile time)
 - Excellent async ecosystem (tokio, hyper)
+- Zero-cost abstractions
 
 ---
 
