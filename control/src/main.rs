@@ -17,6 +17,7 @@ mod error;
 mod proxy;
 mod routes;
 
+use apis::gateway::endpointslice_watcher::watch_endpointslices;
 use apis::gateway::gateway::GatewayReconciler;
 use apis::gateway::gateway_class::GatewayClassReconciler;
 use apis::gateway::http_route::HTTPRouteReconciler;
@@ -89,7 +90,16 @@ async fn main() -> Result<()> {
                     }
                 }));
 
-                info!("✅ Gateway API controllers started");
+                // Spawn EndpointSlice watcher (dynamic backend discovery)
+                let es_client = client.clone();
+                let es_router = router.clone();
+                controller_handles.push(tokio::spawn(async move {
+                    if let Err(e) = watch_endpointslices(es_client, es_router).await {
+                        tracing::error!("EndpointSlice watcher error: {}", e);
+                    }
+                }));
+
+                info!("✅ Gateway API controllers started (including EndpointSlice watcher)");
             }
             Err(e) => {
                 warn!("Failed to create Kubernetes client: {}", e);
