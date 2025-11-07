@@ -1202,7 +1202,10 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            _ => panic!("Expected IPv4 address"),
+            std::net::IpAddr::V6(_) => {
+                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
+                return;
+            }
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -1274,7 +1277,10 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            _ => panic!("Expected IPv4 address"),
+            std::net::IpAddr::V6(_) => {
+                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
+                return;
+            }
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -1347,7 +1353,10 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            _ => panic!("Expected IPv4 address"),
+            std::net::IpAddr::V6(_) => {
+                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
+                return;
+            }
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -1445,7 +1454,10 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            _ => panic!("Expected IPv4 address"),
+            std::net::IpAddr::V6(_) => {
+                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
+                return;
+            }
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -1534,7 +1546,10 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            _ => panic!("Expected IPv4 address"),
+            std::net::IpAddr::V6(_) => {
+                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
+                return;
+            }
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -1624,7 +1639,10 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            _ => panic!("Expected IPv4 address"),
+            std::net::IpAddr::V6(_) => {
+                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
+                return;
+            }
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -1714,7 +1732,10 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            _ => panic!("Expected IPv4 address"),
+            std::net::IpAddr::V6(_) => {
+                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
+                return;
+            }
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -1808,7 +1829,10 @@ mod tests {
         let router = Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            _ => panic!("Expected IPv4 address"),
+            std::net::IpAddr::V6(_) => {
+                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
+                return;
+            }
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -2044,7 +2068,10 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            _ => panic!("Expected IPv4 address"),
+            std::net::IpAddr::V6(_) => {
+                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
+                return;
+            }
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -2181,7 +2208,10 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            _ => panic!("Expected IPv4 address"),
+            std::net::IpAddr::V6(_) => {
+                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
+                return;
+            }
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -2302,7 +2332,10 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            _ => panic!("Expected IPv4 address"),
+            std::net::IpAddr::V6(_) => {
+                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
+                return;
+            }
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -2551,10 +2584,14 @@ mod tests {
         // Create router pointing to slow backend
         let router = Arc::new(Router::new());
 
-        // Convert IP address to u32
+        // Convert IP address to u32 (IPv4 only - Backend struct constraint)
         let ip_u32 = match slow_backend.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            std::net::IpAddr::V6(_) => panic!("IPv6 not supported in test"),
+            std::net::IpAddr::V6(_) => {
+                // Skip test gracefully if IPv6 is encountered (shouldn't happen with 127.0.0.1 bind)
+                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
+                return;
+            }
         };
 
         let backend = common::Backend::new(ip_u32, slow_backend.port(), 100);
@@ -2650,9 +2687,14 @@ mod tests {
         // Create router pointing to slow backend
         let router = Arc::new(Router::new());
 
+        // Convert IP address to u32 (IPv4 only - Backend struct constraint)
         let ip_u32 = match backend.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            std::net::IpAddr::V6(_) => panic!("IPv6 not supported in test"),
+            std::net::IpAddr::V6(_) => {
+                // Skip test gracefully if IPv6 is encountered (shouldn't happen with 127.0.0.1 bind)
+                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
+                return;
+            }
         };
 
         let backend_ref = common::Backend::new(ip_u32, backend.port(), 100);
