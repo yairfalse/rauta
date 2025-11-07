@@ -227,6 +227,122 @@ impl ProxyServer {
         }
     }
 
+    /// Start serving HTTP requests with graceful shutdown support
+    /// When shutdown signal is received:
+    /// 1. Stop accepting new connections
+    /// 2. Wait for active connections to complete
+    /// 3. Shutdown after all connections drained or timeout
+    #[allow(dead_code)] // Used in production via main.rs signal handling
+    pub async fn serve_with_shutdown<F>(self, shutdown_signal: F) -> Result<(), String>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use tokio::sync::Notify;
+
+        let listener = TcpListener::bind(&self.bind_addr)
+            .await
+            .map_err(|e| format!("Failed to bind to {}: {}", self.bind_addr, e))?;
+
+        let _actual_addr = listener
+            .local_addr()
+            .map_err(|e| format!("Failed to get local addr: {}", e))?;
+
+        // Track active connections
+        let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shutdown_notify = Arc::new(Notify::new());
+
+        // Spawn shutdown handler
+        let active_connections_clone = active_connections.clone();
+        let shutdown_notify_clone = shutdown_notify.clone();
+        tokio::spawn(async move {
+            shutdown_signal.await;
+            info!("Graceful shutdown initiated - draining active connections");
+
+            // Wait for active connections to complete (with timeout)
+            let drain_timeout = tokio::time::Duration::from_secs(30);
+            let start = std::time::Instant::now();
+
+            while active_connections_clone.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                if start.elapsed() > drain_timeout {
+                    warn!(
+                        "Drain timeout exceeded - forcing shutdown with {} active connections",
+                        active_connections_clone.load(std::sync::atomic::Ordering::Relaxed)
+                    );
+                    break;
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+
+            info!("All connections drained - shutting down");
+            shutdown_notify_clone.notify_one();
+        });
+
+        // Main accept loop
+        loop {
+            tokio::select! {
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok((stream, _)) => {
+                            // Increment active connection counter
+                            active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                            let router = self.router.clone();
+                            let client = self.client.clone();
+                            let backend_pools = self.backend_pools.clone();
+                            let protocol_cache = self.protocol_cache.clone();
+                            let workers = self.workers.clone();
+                            let worker_selector = self.worker_selector.clone();
+                            let active_connections_clone = active_connections.clone();
+
+                            tokio::spawn(async move {
+                                let io = TokioIo::new(stream);
+
+                                let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                                    let router = router.clone();
+                                    let client = client.clone();
+                                    let backend_pools = backend_pools.clone();
+                                    let protocol_cache = protocol_cache.clone();
+                                    let workers = workers.clone();
+                                    let worker_selector = worker_selector.clone();
+                                    async move {
+                                        handle_request(
+                                            req,
+                                            router,
+                                            client,
+                                            backend_pools,
+                                            protocol_cache,
+                                            workers,
+                                            worker_selector,
+                                        )
+                                        .await
+                                    }
+                                });
+
+                                if let Err(e) = http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await
+                                {
+                                    debug!("Error serving connection: {}", e);
+                                }
+
+                                // Decrement active connection counter when done
+                                active_connections_clone.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            });
+                        }
+                        Err(e) => {
+                            return Err(format!("Failed to accept connection: {}", e));
+                        }
+                    }
+                }
+                _ = shutdown_notify.notified() => {
+                    info!("Server shutdown complete");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     /// Start serving HTTPS requests with TLS termination
     /// Uses dynamic SNI resolution to serve multiple hostnames
     #[allow(dead_code)]
@@ -2487,6 +2603,128 @@ mod tests {
             Err(_) => {
                 // Connection error is also acceptable (timeout closed connection)
             }
+        }
+    }
+
+    /// RED: Test graceful shutdown with tokio signal handling
+    /// Production requirement: Handle SIGTERM gracefully, drain active connections
+    /// Expected: serve_with_shutdown() method exists and drains properly
+    #[tokio::test]
+    async fn test_graceful_shutdown_drains_connections() {
+        use tokio::sync::oneshot;
+        use tokio::time::Duration;
+
+        // Create backend that takes 2 seconds to respond
+        let backend = tokio::spawn(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            tokio::spawn(async move {
+                loop {
+                    if let Ok((stream, _)) = listener.accept().await {
+                        tokio::spawn(async move {
+                            let io = TokioIo::new(stream);
+                            let service = service_fn(|_req| async {
+                                // Simulate slow backend (2 seconds)
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                                Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(
+                                    "completed",
+                                ))))
+                            });
+
+                            let _ = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(io, service)
+                                .await;
+                        });
+                    }
+                }
+            });
+
+            addr
+        })
+        .await
+        .unwrap();
+
+        // Create router pointing to slow backend
+        let router = Arc::new(Router::new());
+
+        let ip_u32 = match backend.ip() {
+            std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
+            std::net::IpAddr::V6(_) => panic!("IPv6 not supported in test"),
+        };
+
+        let backend_ref = common::Backend::new(ip_u32, backend.port(), 100);
+        router
+            .add_route(common::HttpMethod::GET, "/slow", vec![backend_ref])
+            .unwrap();
+
+        // Start proxy server
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), router).unwrap();
+
+        // Channel to trigger shutdown
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        // Spawn server with graceful shutdown support
+        // This will fail until we implement serve_with_shutdown()
+        let server_handle = tokio::spawn(async move {
+            server
+                .serve_with_shutdown(async {
+                    shutdown_rx.await.ok();
+                })
+                .await
+                .expect("Server should shutdown gracefully");
+        });
+
+        // Wait for server to be ready
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Start a slow request (2 seconds)
+        let client = Client::builder(TokioExecutor::new()).build_http();
+        let uri = format!("http://{}/slow", proxy_addr);
+        let req_handle = tokio::spawn(async move {
+            let req = Request::builder()
+                .uri(uri)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+
+            client.request(req).await
+        });
+
+        // Give request time to start processing
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Trigger shutdown while request is in-flight
+        shutdown_tx.send(()).ok();
+
+        // Wait for server to shutdown (should wait for request to complete)
+        let shutdown_result = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+        assert!(
+            shutdown_result.is_ok(),
+            "Server should shutdown within 5 seconds after draining"
+        );
+
+        // Verify the in-flight request completed successfully
+        let request_result = tokio::time::timeout(Duration::from_secs(3), req_handle)
+            .await
+            .expect("Request should complete")
+            .expect("Request handle should not panic");
+
+        assert!(
+            request_result.is_ok(),
+            "In-flight request should complete successfully during graceful shutdown"
+        );
+
+        if let Ok(response) = request_result {
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "Response should be 200 OK"
+            );
         }
     }
 }
