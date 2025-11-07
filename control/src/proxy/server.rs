@@ -174,6 +174,8 @@ impl ProxyServer {
     }
 
     /// Start serving HTTP requests
+    /// NOTE: Production code should use serve_with_shutdown() instead for graceful shutdown
+    #[allow(dead_code)] // Used in tests; production uses serve_with_shutdown()
     pub async fn serve(self) -> Result<(), String> {
         let listener = TcpListener::bind(&self.bind_addr)
             .await

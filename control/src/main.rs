@@ -125,23 +125,57 @@ async fn main() -> Result<()> {
     info!("");
     info!("Press Ctrl-C to exit.");
 
-    // Run server with graceful shutdown
-    tokio::select! {
-        result = server.serve() => {
-            if let Err(e) = result {
-                tracing::error!("Server error: {}", e);
-            }
+    // Run server with graceful shutdown (SIGTERM + Ctrl-C)
+    run_with_signal_handling(server, controller_handles).await
+}
+
+/// Run server with proper signal handling for graceful shutdown
+/// Handles both SIGTERM (Kubernetes) and Ctrl-C (local development)
+async fn run_with_signal_handling(
+    server: ProxyServer,
+    controller_handles: Vec<tokio::task::JoinHandle<()>>,
+) -> Result<()> {
+    // Create shutdown signal that triggers on SIGTERM or Ctrl-C
+    let shutdown_signal = async {
+        let ctrl_c = async {
+            signal::ctrl_c()
+                .await
+                .expect("Failed to install Ctrl-C handler");
+        };
+
+        #[cfg(unix)]
+        let terminate = async {
+            signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("Failed to install SIGTERM handler")
+                .recv()
+                .await;
+        };
+
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => {
+                info!("Ctrl-C received, initiating graceful shutdown");
+            },
+            _ = terminate => {
+                info!("SIGTERM received, initiating graceful shutdown");
+            },
         }
-        _ = signal::ctrl_c() => {
-            info!("Shutdown signal received");
-        }
+    };
+
+    // Run server with graceful shutdown support
+    if let Err(e) = server.serve_with_shutdown(shutdown_signal).await {
+        tracing::error!("Server error: {}", e);
     }
 
     // Cleanup: abort controller tasks
+    info!("Shutting down Kubernetes controllers");
     for handle in controller_handles {
         handle.abort();
     }
 
+    info!("Shutdown complete");
     Ok(())
 }
 
