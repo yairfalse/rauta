@@ -190,17 +190,13 @@ Consistent hashing keeps connections sticky to the same backend. When backends c
 
 ## Technology Stack
 
-**Userspace:**
 - **tokio** - Async runtime
 - **hyper** - HTTP/1.1 and HTTP/2
 - **kube-rs** - Kubernetes API client
 - **gateway-api** - Official Gateway API CRD types
 - **matchit** - Radix tree for path matching
 - **prometheus** - Metrics
-
-**Future:**
-- **wasmtime** - WASM runtime for plugins
-- **io_uring** - Zero-copy I/O (Linux 5.7+)
+- **jemalloc** - Allocator optimized for async workloads
 
 ---
 
@@ -247,40 +243,49 @@ See `CLAUDE.md` for detailed guidelines.
 
 ---
 
-## Roadmap
+## What's Implemented
 
-**Completed:**
+**Core Routing:**
 - ✅ Gateway API controller (GatewayClass, Gateway, HTTPRoute)
 - ✅ EndpointSlice resolution for dynamic backends
-- ✅ Maglev load balancing
-- ✅ HTTP/2 connection pooling with circuit breakers
+- ✅ Maglev consistent hashing
+- ✅ Weighted routing (canary deployments)
+
+**Performance:**
+- ✅ Multi-core workers (lock-free, per-worker pools)
+- ✅ HTTP/2 connection pooling
+- ✅ Connection multiplexing
+
+**Reliability:**
+- ✅ Passive health checking
+- ✅ Circuit breakers (3-state)
+- ✅ Connection draining
+- ✅ Graceful shutdown
+- ✅ Connection/request timeouts
+
+**Observability:**
 - ✅ Prometheus metrics
-
-**In Progress:**
-- 🚧 WASM plugin system design
-- 🚧 TLS termination
-- 🚧 Per-core worker architecture (lock-free routing)
-
-**Future Exploration:**
-- io_uring zero-copy I/O
-- eBPF sockmap for service mesh mode
-- Multi-cluster routing
+- ✅ Structured logging
+- ✅ Request tracing
 
 ---
 
-## Contributing
+## Using This Code
 
-**How to help:**
-1. **Try it** - Deploy in a cluster, report issues
-2. **Review code** - Suggest improvements
-3. **Improve docs** - Make things clearer
-4. **Share ideas** - What features would be useful?
+This is a learning project, but the code is:
+- Well-tested (74 unit tests + integration tests)
+- Documented (see `docs/` directory)
+- Following Rust best practices
 
-**Before contributing:**
-- Read `CLAUDE.md` (project guidelines)
-- Follow TDD workflow (tests before code)
-- Keep commits small and focused
-- No TODOs in code (finish features or document why)
+**If you want to learn from it:**
+- Read `CLAUDE.md` for TDD workflow
+- Check `docs/` for design decisions
+- Tests show how features work
+
+**If you want to use it:**
+- It works! But it's a learning project
+- No guarantees, no roadmap
+- Use at your own risk
 
 ---
 
@@ -310,4 +315,4 @@ Apache 2.0 - Free and open source.
 
 ---
 
-**Fast. Safe. Extensible.** 🦀
+**Built for fun. Happens to be fast.** 🦀
