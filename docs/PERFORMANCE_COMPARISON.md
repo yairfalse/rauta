@@ -4,6 +4,8 @@
 
 This document compares RAUTA against established Kubernetes Gateway/Ingress implementations.
 
+> **⚠️ DISCLAIMER**: These benchmarks compare different gateways running in **different test environments** and are **not head-to-head comparisons**. Hardware, configuration, network conditions, and backend setups vary across tests. Results should be used for general architectural understanding, not direct performance claims. For accurate comparisons, run all gateways in identical conditions.
+
 ---
 
 ## Test Environment

@@ -54,7 +54,11 @@ echo ""
 
 # Step 3: Build RAUTA Docker image
 echo "🔨 Step 3: Building RAUTA Docker image..."
-cd $(git rev-parse --show-toplevel)
+if ! REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null); then
+    echo "❌ ERROR: Not in a git repository. Please run from within the rauta repo."
+    exit 1
+fi
+cd "$REPO_ROOT"
 docker build -t rauta:latest -f docker/Dockerfile.prod .
 echo "✅ Image built"
 echo ""
@@ -95,9 +99,9 @@ kubectl apply -f deploy/gateway-api.yaml
 echo "✅ Gateway API resources created"
 echo ""
 
-# Give RAUTA time to reconcile
-echo "⏳ Waiting for reconciliation..."
-sleep 5
+# Wait for Gateway to be ready
+echo "⏳ Waiting for Gateway to be ready..."
+kubectl wait --for=condition=Programmed --timeout=60s gateway/rauta-gateway -n rauta-system || echo "Warning: Gateway not ready yet"
 echo ""
 
 # Step 8: Show status
