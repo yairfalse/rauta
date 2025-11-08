@@ -265,7 +265,7 @@ fn aggregate_backends_for_service(
 
 /// Parse EndpointSlice to Backend list
 ///
-/// **IPv4-only limitation**: Due to eBPF Pod-compatible constraints in the `common::Backend`
+/// **IPv4-only limitation**: Due to eBPF POD-compatible constraints in the `common::Backend`
 /// struct (which stores IP as `u32`), only IPv4 addresses are supported. IPv6 addresses
 /// are logged as warnings and gracefully skipped without panicking.
 ///
@@ -311,8 +311,8 @@ fn parse_endpointslice_to_backends(
                     });
                 }
                 Err(_) => {
-                    // Check if it's IPv6 to provide a better warning message
-                    if address.parse::<std::net::Ipv6Addr>().is_ok() {
+                    // IPv6 addresses contain colons, IPv4 addresses do not
+                    if address.contains(':') {
                         warn!(
                             "IPv6 address {} not supported (Backend struct is IPv4-only for eBPF compatibility), skipping",
                             address

@@ -145,7 +145,7 @@ impl RouteKey {
 /// Backend server (IP + port)
 ///
 /// **IPv4-only limitation**: This struct stores IP addresses as `u32` to maintain
-/// Pod-compatible (Plain Old Data) constraints required for eBPF map usage.
+/// POD-compatible (Plain Old Data) constraints required for eBPF map usage.
 /// IPv6 addresses are not supported and will be gracefully skipped during
 /// EndpointSlice parsing with a warning logged.
 #[repr(C)]
