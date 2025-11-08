@@ -8,4 +8,3 @@ pub mod proxy;
 mod apis;
 mod config;
 mod error;
-mod routes;
