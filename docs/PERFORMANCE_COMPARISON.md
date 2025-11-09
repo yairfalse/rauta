@@ -6,6 +6,19 @@ This document compares RAUTA against established Kubernetes Gateway/Ingress impl
 
 ---
 
+## ⚠️ Benchmark Disclaimer
+
+**These are NOT head-to-head comparisons on identical hardware.**
+
+- RAUTA benchmarks are from local testing on Apple Silicon
+- Other gateway numbers are from public documentation/benchmarks on different hardware
+- Results show architectural differences, not definitive performance rankings
+- For accurate comparison, all gateways should be tested on the same infrastructure
+
+Use these numbers to understand relative capabilities, not as absolute performance metrics.
+
+---
+
 ## Test Environment
 
 **Infrastructure:**
