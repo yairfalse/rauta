@@ -264,6 +264,11 @@ fn aggregate_backends_for_service(
 }
 
 /// Parse EndpointSlice to Backend list
+///
+/// **IPv4-only limitation**: Due to eBPF POD-compatible constraints in the `common::Backend`
+/// struct (which stores IP as `u32`), only IPv4 addresses are supported. IPv6 addresses
+/// are logged as warnings and gracefully skipped without panicking.
+///
 /// (Reuse from http_route.rs)
 fn parse_endpointslice_to_backends(
     endpoint_slice: &EndpointSlice,
@@ -295,7 +300,7 @@ fn parse_endpointslice_to_backends(
             continue; // Skip non-ready endpoints
         }
 
-        // Parse IP addresses
+        // Parse IP addresses (IPv4 only - IPv6 not supported due to Backend struct constraint)
         for address in &endpoint.addresses {
             match address.parse::<std::net::Ipv4Addr>() {
                 Ok(ipv4) => {
@@ -305,8 +310,16 @@ fn parse_endpointslice_to_backends(
                         weight: 100, // Default weight
                     });
                 }
-                Err(e) => {
-                    warn!("Failed to parse IP address {}: {}", address, e);
+                Err(_) => {
+                    // IPv6 addresses contain colons, IPv4 addresses do not
+                    if address.contains(':') {
+                        warn!(
+                            "IPv6 address {} not supported (Backend struct is IPv4-only for eBPF compatibility), skipping",
+                            address
+                        );
+                    } else {
+                        warn!("Failed to parse IP address {}: invalid format", address);
+                    }
                 }
             }
         }
@@ -704,5 +717,86 @@ mod tests {
             backend_ips.contains(&std::net::Ipv4Addr::new(10, 0, 1, 6)),
             "Should have backend from slice 3"
         );
+    }
+
+    #[test]
+    fn test_ipv6_addresses_gracefully_skipped() {
+        // Test that IPv6 addresses are logged and skipped, not panicking
+        use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions};
+
+        let endpoint_slice = EndpointSlice {
+            address_type: "IPv6".to_string(), // Mixed address type
+            endpoints: vec![
+                Endpoint {
+                    addresses: vec!["2001:db8::1".to_string()], // IPv6 address
+                    conditions: Some(EndpointConditions {
+                        ready: Some(true),
+                        serving: None,
+                        terminating: None,
+                    }),
+                    deprecated_topology: None,
+                    hints: None,
+                    hostname: None,
+                    node_name: None,
+                    target_ref: None,
+                    zone: None,
+                },
+                Endpoint {
+                    addresses: vec!["10.0.1.1".to_string()], // IPv4 address (valid)
+                    conditions: Some(EndpointConditions {
+                        ready: Some(true),
+                        serving: None,
+                        terminating: None,
+                    }),
+                    deprecated_topology: None,
+                    hints: None,
+                    hostname: None,
+                    node_name: None,
+                    target_ref: None,
+                    zone: None,
+                },
+                Endpoint {
+                    addresses: vec!["::1".to_string()], // IPv6 localhost
+                    conditions: Some(EndpointConditions {
+                        ready: Some(true),
+                        serving: None,
+                        terminating: None,
+                    }),
+                    deprecated_topology: None,
+                    hints: None,
+                    hostname: None,
+                    node_name: None,
+                    target_ref: None,
+                    zone: None,
+                },
+            ],
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some("test-slice".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            ports: Some(vec![k8s_openapi::api::discovery::v1::EndpointPort {
+                app_protocol: None,
+                name: Some("http".to_string()),
+                port: Some(8080),
+                protocol: Some("TCP".to_string()),
+            }]),
+        };
+
+        // Parse backends - should only get IPv4 address, IPv6 should be skipped
+        let backends = parse_endpointslice_to_backends(&endpoint_slice, 8080);
+
+        // Should have exactly 1 backend (10.0.1.1), IPv6 addresses skipped
+        assert_eq!(
+            backends.len(),
+            1,
+            "Should only have IPv4 backend, IPv6 addresses skipped"
+        );
+        assert_eq!(
+            std::net::Ipv4Addr::from(backends[0].ipv4),
+            std::net::Ipv4Addr::new(10, 0, 1, 1),
+            "Should have IPv4 backend 10.0.1.1"
+        );
+        assert_eq!(backends[0].port, 8080, "Should have correct port");
     }
 }

@@ -143,10 +143,15 @@ impl RouteKey {
 }
 
 /// Backend server (IP + port)
+///
+/// **IPv4-only limitation**: This struct stores IP addresses as `u32` to maintain
+/// POD-compatible (Plain Old Data) constraints required for eBPF map usage.
+/// IPv6 addresses are not supported and will be gracefully skipped during
+/// EndpointSlice parsing with a warning logged.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Backend {
-    /// IPv4 address in network byte order
+    /// IPv4 address in network byte order (IPv6 not supported - see struct docs)
     pub ipv4: u32,
     /// Port in host byte order (will be converted to network order when used)
     pub port: u16,

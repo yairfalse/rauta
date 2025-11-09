@@ -36,13 +36,21 @@ def test_from_different_pods(num_requests=100):
     for i in range(num_requests):
         pod_name = pod_names[i % len(pod_names)]
 
-        result = subprocess.run(
-            ["kubectl", "exec", "-n", "demo", pod_name, "--",
-             "curl", "-s", "http://rauta.rauta-system.svc.cluster.local/api/test"],
-            capture_output=True,
-            text=True,
-            check=False
-        )
+        try:
+            result = subprocess.run(
+                ["kubectl", "exec", "-n", "demo", pod_name, "--",
+                 "curl", "-s", "http://rauta.rauta-system.svc.cluster.local/api/test"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10
+            )
+        except subprocess.TimeoutExpired:
+            print(f"\n  Warning: kubectl exec timed out for pod {pod_name}")
+            continue
+        except subprocess.SubprocessError as e:
+            print(f"\n  Warning: kubectl exec failed for pod {pod_name}: {e}")
+            continue
 
         if result.returncode == 0:
             output = result.stdout
@@ -89,5 +97,13 @@ def test_from_different_pods(num_requests=100):
         print("\n❌ FAIL: Distribution differs significantly from 90/10 split")
 
 if __name__ == "__main__":
-    num_requests = int(sys.argv[1]) if len(sys.argv) > 1 else 100
+    try:
+        num_requests = int(sys.argv[1]) if len(sys.argv) > 1 else 100
+        if num_requests <= 0:
+            print("ERROR: Number of requests must be positive")
+            sys.exit(1)
+    except ValueError:
+        print(f"ERROR: Invalid argument '{sys.argv[1]}'. Expected a positive integer.")
+        sys.exit(1)
+
     test_from_different_pods(num_requests)

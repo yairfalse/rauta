@@ -628,7 +628,10 @@ mod tests {
         // Create backend pointing to test server
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            _ => panic!("Expected IPv4 address"),
+            std::net::IpAddr::V6(_) => {
+                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
+                return;
+            }
         };
         let backend = Backend::new(backend_ip, backend_addr.port(), 100);
         let mut pools = BackendConnectionPools::new(0); // Test worker 0
