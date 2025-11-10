@@ -81,6 +81,8 @@ struct Route {
     header_matches: Vec<HeaderMatch>, // Gateway API header matching (empty = no header constraints)
     #[allow(dead_code)] // Used in GREEN phase
     method_matches: Option<Vec<HttpMethod>>, // Gateway API method matching (None = match all methods)
+    #[allow(dead_code)] // Used in GREEN phase for Feature 3
+    query_param_matches: Vec<QueryParamMatch>, // Gateway API query parameter matching (empty = no constraints)
 }
 
 /// Route match result (backend + pattern for metrics)
@@ -108,6 +110,27 @@ pub struct HeaderMatch {
     pub value: String,
     /// Match type (exact or regex)
     pub match_type: HeaderMatchType,
+}
+
+/// Query parameter match type for Gateway API conformance
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Used in tests during TDD implementation
+pub enum QueryParamMatchType {
+    /// Exact match (default)
+    Exact,
+    /// Regular expression match
+    RegularExpression,
+}
+
+/// Query parameter match configuration for routes
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryParamMatch {
+    /// Query parameter name
+    pub name: String,
+    /// Query parameter value to match
+    pub value: String,
+    /// Match type (exact or regex)
+    pub match_type: QueryParamMatchType,
 }
 
 /// Route lookup key
@@ -182,8 +205,9 @@ impl Router {
             pattern: Arc::from(path), // Convert to Arc<str> once during route setup
             backends,
             maglev_table,
-            header_matches: Vec::new(), // No header matching for basic routes
-            method_matches: None,       // No method constraints (match all methods)
+            header_matches: Vec::new(),      // No header matching for basic routes
+            method_matches: None,            // No method constraints (match all methods)
+            query_param_matches: Vec::new(), // No query param constraints
         };
 
         // Update routes HashMap (minimize write lock duration)
@@ -410,8 +434,9 @@ impl Router {
             pattern: Arc::from(path),
             backends,
             maglev_table,
-            header_matches,       // Store header matches for validation
-            method_matches: None, // No method constraints by default
+            header_matches,              // Store header matches for validation
+            method_matches: None,        // No method constraints by default
+            query_param_matches: Vec::new(), // No query param constraints
         };
 
         // Update routes HashMap
@@ -473,6 +498,7 @@ impl Router {
             maglev_table,
             header_matches: Vec::new(),           // No header constraints
             method_matches: Some(method_matches), // Store method constraints
+            query_param_matches: Vec::new(),      // No query param constraints
         };
 
         // Update routes HashMap
@@ -510,6 +536,19 @@ impl Router {
         }
 
         Ok(())
+    }
+
+    /// Add route with query parameter matching support (Gateway API conformance)
+    #[allow(dead_code)] // Used in tests
+    pub fn add_route_with_query_params(
+        &self,
+        _method: HttpMethod,
+        _path: &str,
+        _backends: Vec<Backend>,
+        _query_param_matches: Vec<QueryParamMatch>,
+    ) -> Result<(), String> {
+        // RED phase: Stub implementation
+        unimplemented!("add_route_with_query_params - RED phase")
     }
 
     /// Select backend with header matching support (Gateway API conformance)
@@ -591,6 +630,21 @@ impl Router {
         }
 
         None
+    }
+
+    /// Select backend with query parameter matching support (Gateway API conformance)
+    /// RED phase stub - will be implemented in GREEN phase
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn select_backend_with_query_params(
+        &self,
+        _method: HttpMethod,
+        _path: &str,
+        _query_params: Vec<(&str, &str)>,
+        _src_ip: Option<u32>,
+        _src_port: Option<u16>,
+    ) -> Option<RouteMatch> {
+        // RED phase: Stub implementation
+        unimplemented!("select_backend_with_query_params - RED phase")
     }
 }
 
@@ -1319,5 +1373,180 @@ mod tests {
                 method
             );
         }
+    }
+
+    // ============================================
+    // Feature 3: HTTPRoute Query Parameter Matching (Extended)
+    // ============================================
+
+    #[test]
+    fn test_query_param_match_exact() {
+        // RED: Test exact query parameter matching
+        // HTTPRoute spec: queryParams[].type = "Exact" (default)
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 3, 1)),
+            8080,
+            100,
+        )];
+
+        // Add route that ONLY matches requests with ?version=v1
+        let query_param_matches = vec![QueryParamMatch {
+            name: "version".to_string(),
+            value: "v1".to_string(),
+            match_type: QueryParamMatchType::Exact,
+        }];
+
+        router
+            .add_route_with_query_params(HttpMethod::GET, "/api/data", backends, query_param_matches)
+            .expect("Should add route with query param matching");
+
+        // Request WITH matching query param should succeed
+        let route_match = router
+            .select_backend_with_query_params(
+                HttpMethod::GET,
+                "/api/data",
+                vec![("version", "v1")],
+                None,
+                None,
+            )
+            .expect("Should match with correct query param");
+
+        assert_eq!(
+            Ipv4Addr::from(route_match.backend.ipv4),
+            Ipv4Addr::new(10, 0, 3, 1)
+        );
+
+        // Request WITHOUT matching query param should fail
+        let route_match = router.select_backend_with_query_params(
+            HttpMethod::GET,
+            "/api/data",
+            vec![("version", "v2")],
+            None,
+            None,
+        );
+
+        assert!(
+            route_match.is_none(),
+            "Should NOT match with incorrect query param value"
+        );
+    }
+
+    #[test]
+    fn test_query_param_match_regex() {
+        // RED: Test regex query parameter matching
+        // HTTPRoute spec: queryParams[].type = "RegularExpression"
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 3, 2)),
+            8080,
+            100,
+        )];
+
+        // Add route with regex: page matches digits only
+        let query_param_matches = vec![QueryParamMatch {
+            name: "page".to_string(),
+            value: r"^\d+$".to_string(),
+            match_type: QueryParamMatchType::RegularExpression,
+        }];
+
+        router
+            .add_route_with_query_params(HttpMethod::GET, "/api/list", backends, query_param_matches)
+            .expect("Should add route with regex query params");
+
+        // Requests WITH matching query params (page=1, page=99) should succeed
+        for page in &["1", "99", "12345"] {
+            let route_match = router
+                .select_backend_with_query_params(
+                    HttpMethod::GET,
+                    "/api/list",
+                    vec![("page", page)],
+                    None,
+                    None,
+                )
+                .unwrap_or_else(|| panic!("Should match page={}", page));
+
+            assert_eq!(
+                Ipv4Addr::from(route_match.backend.ipv4),
+                Ipv4Addr::new(10, 0, 3, 2)
+            );
+        }
+
+        // Request with non-numeric page should fail
+        let route_match = router.select_backend_with_query_params(
+            HttpMethod::GET,
+            "/api/list",
+            vec![("page", "abc")],
+            None,
+            None,
+        );
+
+        assert!(
+            route_match.is_none(),
+            "Should NOT match query param that doesn't match regex"
+        );
+    }
+
+    #[test]
+    fn test_query_param_match_multiple() {
+        // RED: Test multiple query parameter matching (AND logic)
+        // HTTPRoute spec: ALL queryParams must match
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 3, 3)),
+            8080,
+            100,
+        )];
+
+        // Add route requiring BOTH version=v1 AND format=json
+        let query_param_matches = vec![
+            QueryParamMatch {
+                name: "version".to_string(),
+                value: "v1".to_string(),
+                match_type: QueryParamMatchType::Exact,
+            },
+            QueryParamMatch {
+                name: "format".to_string(),
+                value: "json".to_string(),
+                match_type: QueryParamMatchType::Exact,
+            },
+        ];
+
+        router
+            .add_route_with_query_params(HttpMethod::GET, "/api/export", backends, query_param_matches)
+            .expect("Should add route with multiple query params");
+
+        // Request with BOTH query params should match
+        let route_match = router
+            .select_backend_with_query_params(
+                HttpMethod::GET,
+                "/api/export",
+                vec![("version", "v1"), ("format", "json")],
+                None,
+                None,
+            )
+            .expect("Should match with all query params present");
+
+        assert_eq!(
+            Ipv4Addr::from(route_match.backend.ipv4),
+            Ipv4Addr::new(10, 0, 3, 3)
+        );
+
+        // Request with only ONE query param should fail
+        let route_match = router.select_backend_with_query_params(
+            HttpMethod::GET,
+            "/api/export",
+            vec![("version", "v1")],
+            None,
+            None,
+        );
+
+        assert!(
+            route_match.is_none(),
+            "Should NOT match when missing required query param"
+        );
     }
 }
