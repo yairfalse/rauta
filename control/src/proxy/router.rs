@@ -312,6 +312,15 @@ impl Router {
         let routes = self.routes.read().unwrap();
         let route = routes.get(&route_key)?;
 
+        // GREEN phase: Check method constraints (Gateway API)
+        if let Some(method_matches) = &route.method_matches {
+            // Route has method constraints - check if request method matches
+            if !method_matches.contains(&method) {
+                return None; // Method doesn't match
+            }
+        }
+        // If method_matches is None, route accepts all methods (default behavior)
+
         // Use flow hash (path + src_ip + src_port) for Maglev lookup
         let flow_hash = self.compute_flow_hash(path_hash, src_ip, src_port);
 
@@ -401,7 +410,7 @@ impl Router {
             pattern: Arc::from(path),
             backends,
             maglev_table,
-            header_matches, // Store header matches for validation
+            header_matches,       // Store header matches for validation
             method_matches: None, // No method constraints by default
         };
 
@@ -446,13 +455,61 @@ impl Router {
     #[allow(dead_code)] // Used in tests
     pub fn add_route_with_methods(
         &self,
-        _method: HttpMethod,
-        _path: &str,
-        _backends: Vec<Backend>,
-        _method_matches: Vec<HttpMethod>,
+        method: HttpMethod,
+        path: &str,
+        backends: Vec<Backend>,
+        method_matches: Vec<HttpMethod>,
     ) -> Result<(), String> {
-        // RED phase: Stub implementation
-        unimplemented!("add_route_with_methods - RED phase")
+        // GREEN phase: Store method constraints in route
+        let path_hash = fnv1a_hash(path.as_bytes());
+        let key = RouteKey { method, path_hash };
+
+        // Build Maglev table
+        let maglev_table = maglev_build_compact_table(&backends);
+
+        let route = Route {
+            pattern: Arc::from(path),
+            backends,
+            maglev_table,
+            header_matches: Vec::new(),           // No header constraints
+            method_matches: Some(method_matches), // Store method constraints
+        };
+
+        // Update routes HashMap
+        {
+            let mut routes = self.routes.write().unwrap();
+            routes.insert(key, route);
+        }
+
+        // Rebuild matchit router (same as add_route)
+        let mut new_prefix_router = matchit::Router::new();
+        {
+            let routes = self.routes.read().unwrap();
+            for (route_key, route) in routes.iter() {
+                let path_str = route.pattern.as_ref();
+
+                new_prefix_router
+                    .insert(path_str.to_string(), *route_key)
+                    .map_err(|e| format!("Failed to add exact route {}: {}", path_str, e))?;
+
+                let prefix_pattern = if path_str == "/" {
+                    "/{*rest}".to_string()
+                } else {
+                    format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
+                };
+
+                new_prefix_router
+                    .insert(prefix_pattern, *route_key)
+                    .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
+            }
+        }
+
+        {
+            let mut prefix_router = self.prefix_router.write().unwrap();
+            *prefix_router = new_prefix_router;
+        }
+
+        Ok(())
     }
 
     /// Select backend with header matching support (Gateway API conformance)
