@@ -44,6 +44,7 @@ http-body-util = "0.1"
 
 # Routing
 matchit = "0.8"
+regex = "1.11"  # For HTTPRoute header RegularExpression matching
 
 # Metrics (Week 2)
 prometheus = { version = "0.14", features = ["process"] }

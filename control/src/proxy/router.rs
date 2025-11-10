@@ -4,6 +4,7 @@
 //! Includes passive health checking (circuit breaker) and connection draining (graceful removal).
 
 use common::{fnv1a_hash, maglev_build_compact_table, maglev_lookup_compact, Backend, HttpMethod};
+use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -77,6 +78,7 @@ struct Route {
     pattern: Arc<str>, // Original route pattern for metrics (Arc for cheap cloning)
     backends: Vec<Backend>,
     maglev_table: Vec<u8>,
+    header_matches: Vec<HeaderMatch>, // Gateway API header matching (empty = no header constraints)
 }
 
 /// Route match result (backend + pattern for metrics)
@@ -178,6 +180,7 @@ impl Router {
             pattern: Arc::from(path), // Convert to Arc<str> once during route setup
             backends,
             maglev_table,
+            header_matches: Vec::new(), // No header matching for basic routes
         };
 
         // Update routes HashMap (minimize write lock duration)
@@ -376,39 +379,181 @@ impl Router {
     }
 
     /// Add route with header matching support (Gateway API conformance)
-    ///
-    /// This is a temporary stub implementation for Feature 1: HTTPRoute Header Matching.
-    /// Currently forwards to add_route() and ignores headers (to be implemented).
     #[allow(dead_code)] // Used in tests
     pub fn add_route_with_headers(
         &self,
         method: HttpMethod,
         path: &str,
         backends: Vec<Backend>,
-        _header_matches: Vec<HeaderMatch>,
+        header_matches: Vec<HeaderMatch>,
     ) -> Result<(), String> {
-        // GREEN phase: Minimal implementation - just add route without header matching
-        // TODO: Store header_matches in Route struct and use in select_backend_with_headers
-        self.add_route(method, path, backends)
+        // GREEN phase: Store header_matches and create route
+        let path_hash = fnv1a_hash(path.as_bytes());
+        let key = RouteKey { method, path_hash };
+
+        // Build Maglev table
+        let maglev_table = maglev_build_compact_table(&backends);
+
+        let route = Route {
+            pattern: Arc::from(path),
+            backends,
+            maglev_table,
+            header_matches, // Store header matches for validation
+        };
+
+        // Update routes HashMap
+        {
+            let mut routes = self.routes.write().unwrap();
+            routes.insert(key, route);
+        }
+
+        // Rebuild matchit router (same as add_route)
+        let mut new_prefix_router = matchit::Router::new();
+        {
+            let routes = self.routes.read().unwrap();
+            for (route_key, route) in routes.iter() {
+                let path_str = route.pattern.as_ref();
+
+                new_prefix_router
+                    .insert(path_str.to_string(), *route_key)
+                    .map_err(|e| format!("Failed to add exact route {}: {}", path_str, e))?;
+
+                let prefix_pattern = if path_str == "/" {
+                    "/{*rest}".to_string()
+                } else {
+                    format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
+                };
+
+                new_prefix_router
+                    .insert(prefix_pattern, *route_key)
+                    .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
+            }
+        }
+
+        {
+            let mut prefix_router = self.prefix_router.write().unwrap();
+            *prefix_router = new_prefix_router;
+        }
+
+        Ok(())
     }
 
     /// Select backend with header matching support (Gateway API conformance)
     ///
-    /// This is a temporary stub implementation for Feature 1: HTTPRoute Header Matching.
-    /// Currently forwards to select_backend() and ignores headers (to be implemented).
+    /// Validates request headers against route's header_matches before selecting backend.
+    /// Supports Exact and RegularExpression matching per Gateway API spec.
+    /// Header names are case-insensitive per RFC 7230.
     #[allow(dead_code)] // Used in tests
     pub fn select_backend_with_headers(
         &self,
         method: HttpMethod,
         path: &str,
-        _request_headers: Vec<(&str, &str)>,
+        request_headers: Vec<(&str, &str)>,
         src_ip: Option<u32>,
         src_port: Option<u16>,
     ) -> Option<RouteMatch> {
-        // GREEN phase: Minimal implementation - just select backend without header matching
-        // TODO: Check if request_headers match the route's header_matches
-        self.select_backend(method, path, src_ip, src_port)
+        // GREEN phase: Full header matching implementation
+        let path_hash = fnv1a_hash(path.as_bytes());
+        let key = RouteKey { method, path_hash };
+
+        // Try exact match first, then prefix match (same as select_backend)
+        let route_key = {
+            let routes = self.routes.read().unwrap();
+            if routes.contains_key(&key) {
+                Some(key)
+            } else {
+                let prefix_router = self.prefix_router.read().unwrap();
+                prefix_router.at(path).ok().map(|m| *m.value)
+            }
+        }?;
+
+        // Look up route
+        let routes = self.routes.read().unwrap();
+        let route = routes.get(&route_key)?;
+
+        // Check header matches (ALL must match - AND logic)
+        if !route.header_matches.is_empty()
+            && !headers_match(&route.header_matches, &request_headers)
+        {
+            return None; // Headers don't match
+        }
+
+        // Headers match (or no header constraints) - select backend using Maglev
+        let flow_hash = self.compute_flow_hash(path_hash, src_ip, src_port);
+
+        let health = self.backend_health.read().unwrap();
+        let draining = self.draining_backends.read().unwrap();
+        let mut tried_indices = HashSet::new();
+
+        for attempt in 0..route.backends.len() * 10 {
+            let lookup_hash = flow_hash.wrapping_add(attempt as u64);
+            let backend_idx = maglev_lookup_compact(lookup_hash, &route.maglev_table);
+
+            if tried_indices.contains(&backend_idx) {
+                continue;
+            }
+            tried_indices.insert(backend_idx);
+
+            let backend = route.backends.get(backend_idx as usize).copied()?;
+
+            let is_healthy = health
+                .get(&backend.ipv4)
+                .map(|h| h.is_healthy())
+                .unwrap_or(true);
+
+            let is_draining = draining.contains_key(&backend.ipv4);
+
+            if !is_healthy || is_draining {
+                if tried_indices.len() == route.backends.len() {
+                    break;
+                }
+                continue;
+            }
+
+            return Some(RouteMatch {
+                backend,
+                pattern: Arc::clone(&route.pattern),
+            });
+        }
+
+        None
     }
+}
+
+/// Check if request headers match route's header_matches (Gateway API conformance)
+///
+/// ALL header_matches must be satisfied (AND logic).
+/// Header names are case-insensitive per RFC 7230.
+fn headers_match(header_matches: &[HeaderMatch], request_headers: &[(&str, &str)]) -> bool {
+    for header_match in header_matches {
+        // Find matching header in request (case-insensitive name comparison)
+        let found = request_headers.iter().any(|(req_name, req_value)| {
+            // Case-insensitive header name comparison (RFC 7230)
+            if !req_name.eq_ignore_ascii_case(&header_match.name) {
+                return false;
+            }
+
+            // Check value based on match type
+            match header_match.match_type {
+                HeaderMatchType::Exact => *req_value == header_match.value,
+                HeaderMatchType::RegularExpression => {
+                    // Compile regex and check match
+                    // Note: In production, we'd cache compiled regexes
+                    if let Ok(regex) = Regex::new(&header_match.value) {
+                        regex.is_match(req_value)
+                    } else {
+                        false // Invalid regex = no match
+                    }
+                }
+            }
+        });
+
+        if !found {
+            return false; // At least one header_match not satisfied
+        }
+    }
+
+    true // All header_matches satisfied
 }
 
 #[cfg(test)]
