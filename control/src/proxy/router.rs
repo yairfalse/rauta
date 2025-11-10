@@ -83,12 +83,16 @@ struct Route {
     method_matches: Option<Vec<HttpMethod>>, // Gateway API method matching (None = match all methods)
     #[allow(dead_code)] // Used in GREEN phase for Feature 3
     query_param_matches: Vec<QueryParamMatch>, // Gateway API query parameter matching (empty = no constraints)
+    #[allow(dead_code)] // Used in GREEN phase for Feature 4
+    request_filters: Option<crate::proxy::filters::RequestHeaderModifier>, // Gateway API request header filters
 }
 
 /// Route match result (backend + pattern for metrics)
 pub struct RouteMatch {
     pub backend: Backend,
     pub pattern: Arc<str>, // Arc<str> for zero-cost clone on hot path
+    #[allow(dead_code)] // Used in server.rs to apply filters during proxying
+    pub request_filters: Option<crate::proxy::filters::RequestHeaderModifier>,
 }
 
 /// Header match type for Gateway API conformance
@@ -208,6 +212,7 @@ impl Router {
             header_matches: Vec::new(), // No header matching for basic routes
             method_matches: None,       // No method constraints (match all methods)
             query_param_matches: Vec::new(), // No query param constraints
+            request_filters: None,      // No request header filters
         };
 
         // Update routes HashMap (minimize write lock duration)
@@ -388,6 +393,7 @@ impl Router {
             return Some(RouteMatch {
                 backend,
                 pattern: Arc::clone(&route.pattern),
+                request_filters: route.request_filters.clone(),
             });
         }
 
@@ -437,6 +443,7 @@ impl Router {
             header_matches,                  // Store header matches for validation
             method_matches: None,            // No method constraints by default
             query_param_matches: Vec::new(), // No query param constraints
+            request_filters: None,           // No request header filters
         };
 
         // Update routes HashMap
@@ -499,6 +506,7 @@ impl Router {
             header_matches: Vec::new(),           // No header constraints
             method_matches: Some(method_matches), // Store method constraints
             query_param_matches: Vec::new(),      // No query param constraints
+            request_filters: None,                // No request header filters
         };
 
         // Update routes HashMap
@@ -561,6 +569,7 @@ impl Router {
             header_matches: Vec::new(), // No header constraints
             method_matches: None,       // No method constraints
             query_param_matches,        // Store query param constraints
+            request_filters: None,      // No request header filters
         };
 
         // Update routes HashMap
@@ -598,6 +607,19 @@ impl Router {
         }
 
         Ok(())
+    }
+
+    /// Add route with request header filters (Gateway API HTTPRouteBackendRequestHeaderModification)
+    /// Filters are applied in server.rs before proxying to backend
+    #[allow(dead_code)] // Used in GREEN phase for Feature 4
+    pub fn add_route_with_filters(
+        &self,
+        _method: HttpMethod,
+        _path: &str,
+        _backends: Vec<Backend>,
+        _filters: crate::proxy::filters::RequestHeaderModifier,
+    ) -> Result<(), String> {
+        unimplemented!("Feature 4 RED phase - to be implemented in GREEN phase")
     }
 
     /// Select backend with header matching support (Gateway API conformance)
@@ -675,6 +697,7 @@ impl Router {
             return Some(RouteMatch {
                 backend,
                 pattern: Arc::clone(&route.pattern),
+                request_filters: route.request_filters.clone(),
             });
         }
 
@@ -755,6 +778,7 @@ impl Router {
             return Some(RouteMatch {
                 backend,
                 pattern: Arc::clone(&route.pattern),
+                request_filters: route.request_filters.clone(),
             });
         }
 
@@ -1715,6 +1739,122 @@ mod tests {
         assert!(
             route_match.is_none(),
             "Should NOT match when missing required query param"
+        );
+    }
+
+    // Feature 4: Request Header Filters (Gateway API HTTPRouteBackendRequestHeaderModification)
+
+    #[tokio::test]
+    async fn test_filter_set_header() {
+        use crate::proxy::filters::RequestHeaderModifier;
+
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+
+        // Create filter that sets X-Custom-Header
+        let filter = RequestHeaderModifier::new()
+            .set("X-Custom-Header".to_string(), "test-value".to_string());
+
+        router
+            .add_route_with_filters(HttpMethod::GET, "/api/users", backends, filter)
+            .expect("Should add route with filters");
+
+        // Select backend and verify filter is attached
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/api/users", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.request_filters.is_some(),
+            "RouteMatch should have filters attached"
+        );
+
+        let filters = route_match.request_filters.unwrap();
+        assert_eq!(
+            filters.operations.len(),
+            1,
+            "Should have 1 filter operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_filter_add_header() {
+        use crate::proxy::filters::RequestHeaderModifier;
+
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+
+        // Create filter that adds multiple X-Trace-Id headers
+        let filter = RequestHeaderModifier::new()
+            .add("X-Trace-Id".to_string(), "trace-1".to_string())
+            .add("X-Trace-Id".to_string(), "trace-2".to_string());
+
+        router
+            .add_route_with_filters(HttpMethod::POST, "/api/events", backends, filter)
+            .expect("Should add route with filters");
+
+        // Select backend and verify filters
+        let route_match = router
+            .select_backend(HttpMethod::POST, "/api/events", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.request_filters.is_some(),
+            "RouteMatch should have filters attached"
+        );
+
+        let filters = route_match.request_filters.unwrap();
+        assert_eq!(
+            filters.operations.len(),
+            2,
+            "Should have 2 filter operations"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_filter_remove_header() {
+        use crate::proxy::filters::RequestHeaderModifier;
+
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+
+        // Create filter that removes Authorization header
+        let filter = RequestHeaderModifier::new().remove("Authorization".to_string());
+
+        router
+            .add_route_with_filters(HttpMethod::DELETE, "/api/secure", backends, filter)
+            .expect("Should add route with filters");
+
+        // Select backend and verify filter
+        let route_match = router
+            .select_backend(HttpMethod::DELETE, "/api/secure", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.request_filters.is_some(),
+            "RouteMatch should have filters attached"
+        );
+
+        let filters = route_match.request_filters.unwrap();
+        assert_eq!(
+            filters.operations.len(),
+            1,
+            "Should have 1 filter operation"
         );
     }
 }
