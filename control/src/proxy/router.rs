@@ -611,15 +611,66 @@ impl Router {
 
     /// Add route with request header filters (Gateway API HTTPRouteBackendRequestHeaderModification)
     /// Filters are applied in server.rs before proxying to backend
-    #[allow(dead_code)] // Used in GREEN phase for Feature 4
+    #[allow(dead_code)] // Used in tests during TDD implementation
     pub fn add_route_with_filters(
         &self,
-        _method: HttpMethod,
-        _path: &str,
-        _backends: Vec<Backend>,
-        _filters: crate::proxy::filters::RequestHeaderModifier,
+        method: HttpMethod,
+        path: &str,
+        backends: Vec<Backend>,
+        filters: crate::proxy::filters::RequestHeaderModifier,
     ) -> Result<(), String> {
-        unimplemented!("Feature 4 RED phase - to be implemented in GREEN phase")
+        let path_hash = fnv1a_hash(path.as_bytes());
+        let key = RouteKey { method, path_hash };
+
+        // Build Maglev table
+        let maglev_table = maglev_build_compact_table(&backends);
+
+        let route = Route {
+            pattern: Arc::from(path),
+            backends,
+            maglev_table,
+            header_matches: Vec::new(),      // No header constraints
+            method_matches: None,            // No method constraints
+            query_param_matches: Vec::new(), // No query param constraints
+            request_filters: Some(filters),  // Store filters for server.rs to apply
+        };
+
+        // Update routes HashMap
+        {
+            let mut routes = self.routes.write().unwrap();
+            routes.insert(key, route);
+        }
+
+        // Rebuild matchit router from scratch (since matchit doesn't support updates)
+        let routes = self.routes.read().unwrap();
+        let mut new_prefix_router = matchit::Router::new();
+
+        for (route_key, route) in routes.iter() {
+            let path_str = route.pattern.as_ref();
+
+            // Add exact match route
+            new_prefix_router
+                .insert(path_str.to_string(), *route_key)
+                .map_err(|e| format!("Failed to add route {}: {}", path_str, e))?;
+
+            // Add prefix match route (/{*rest} pattern)
+            let prefix_pattern = if path_str == "/" {
+                "/{*rest}".to_string()
+            } else {
+                format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
+            };
+
+            new_prefix_router
+                .insert(prefix_pattern, *route_key)
+                .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
+        }
+
+        {
+            let mut prefix_router = self.prefix_router.write().unwrap();
+            *prefix_router = new_prefix_router;
+        }
+
+        Ok(())
     }
 
     /// Select backend with header matching support (Gateway API conformance)
