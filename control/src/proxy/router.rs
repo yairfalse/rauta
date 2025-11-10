@@ -79,6 +79,8 @@ struct Route {
     backends: Vec<Backend>,
     maglev_table: Vec<u8>,
     header_matches: Vec<HeaderMatch>, // Gateway API header matching (empty = no header constraints)
+    #[allow(dead_code)] // Used in GREEN phase
+    method_matches: Option<Vec<HttpMethod>>, // Gateway API method matching (None = match all methods)
 }
 
 /// Route match result (backend + pattern for metrics)
@@ -181,6 +183,7 @@ impl Router {
             backends,
             maglev_table,
             header_matches: Vec::new(), // No header matching for basic routes
+            method_matches: None,       // No method constraints (match all methods)
         };
 
         // Update routes HashMap (minimize write lock duration)
@@ -399,6 +402,7 @@ impl Router {
             backends,
             maglev_table,
             header_matches, // Store header matches for validation
+            method_matches: None, // No method constraints by default
         };
 
         // Update routes HashMap
@@ -436,6 +440,19 @@ impl Router {
         }
 
         Ok(())
+    }
+
+    /// Add route with method matching support (Gateway API conformance)
+    #[allow(dead_code)] // Used in tests
+    pub fn add_route_with_methods(
+        &self,
+        _method: HttpMethod,
+        _path: &str,
+        _backends: Vec<Backend>,
+        _method_matches: Vec<HttpMethod>,
+    ) -> Result<(), String> {
+        // RED phase: Stub implementation
+        unimplemented!("add_route_with_methods - RED phase")
     }
 
     /// Select backend with header matching support (Gateway API conformance)
@@ -1130,5 +1147,120 @@ mod tests {
             Ipv4Addr::from(route_match.backend.ipv4),
             Ipv4Addr::new(10, 0, 1, 4)
         );
+    }
+
+    // ============================================
+    // Feature 2: HTTPRoute Method Matching (Extended)
+    // ============================================
+
+    #[test]
+    fn test_method_match_single_method() {
+        // RED: Test matching a single HTTP method
+        // HTTPRoute spec: matches[].method field
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 2, 1)),
+            8080,
+            100,
+        )];
+
+        // Add route that ONLY matches POST requests
+        let method_matches = vec![HttpMethod::POST];
+        router
+            .add_route_with_methods(HttpMethod::ALL, "/api/test", backends, method_matches)
+            .expect("Should add route with method constraint");
+
+        // POST request should match
+        let route_match = router
+            .select_backend(HttpMethod::POST, "/api/test", None, None)
+            .expect("Should match POST request");
+        assert_eq!(
+            Ipv4Addr::from(route_match.backend.ipv4),
+            Ipv4Addr::new(10, 0, 2, 1)
+        );
+
+        // GET request should NOT match
+        let route_match = router.select_backend(HttpMethod::GET, "/api/test", None, None);
+        assert!(
+            route_match.is_none(),
+            "Should NOT match GET request when route only allows POST"
+        );
+    }
+
+    #[test]
+    fn test_method_match_multiple_methods() {
+        // RED: Test matching multiple HTTP methods
+        // HTTPRoute spec: can specify multiple methods in matches
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 2, 2)),
+            8080,
+            100,
+        )];
+
+        // Add route that matches GET, POST, PUT
+        let method_matches = vec![HttpMethod::GET, HttpMethod::POST, HttpMethod::PUT];
+        router
+            .add_route_with_methods(HttpMethod::ALL, "/api/test", backends, method_matches)
+            .expect("Should add route with multiple method constraints");
+
+        // GET, POST, PUT should all match
+        for method in &[HttpMethod::GET, HttpMethod::POST, HttpMethod::PUT] {
+            let route_match = router
+                .select_backend(*method, "/api/test", None, None)
+                .unwrap_or_else(|| panic!("Should match {:?} request", method));
+            assert_eq!(
+                Ipv4Addr::from(route_match.backend.ipv4),
+                Ipv4Addr::new(10, 0, 2, 2)
+            );
+        }
+
+        // DELETE should NOT match
+        let route_match = router.select_backend(HttpMethod::DELETE, "/api/test", None, None);
+        assert!(
+            route_match.is_none(),
+            "Should NOT match DELETE request when route only allows GET/POST/PUT"
+        );
+    }
+
+    #[test]
+    fn test_method_match_all_methods() {
+        // RED: Test matching ALL methods (Gateway API default)
+        // HTTPRoute spec: if matches[].method is omitted, match all methods
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 2, 3)),
+            8080,
+            100,
+        )];
+
+        // Add route with NO method constraints (should match all methods)
+        router
+            .add_route(HttpMethod::ALL, "/api/test", backends)
+            .expect("Should add route without method constraints");
+
+        // All methods should match
+        for method in &[
+            HttpMethod::GET,
+            HttpMethod::POST,
+            HttpMethod::PUT,
+            HttpMethod::DELETE,
+            HttpMethod::HEAD,
+            HttpMethod::OPTIONS,
+            HttpMethod::PATCH,
+        ] {
+            let route_match = router
+                .select_backend(*method, "/api/test", None, None)
+                .unwrap_or_else(|| panic!("Should match {:?} request", method));
+            assert_eq!(
+                Ipv4Addr::from(route_match.backend.ipv4),
+                Ipv4Addr::new(10, 0, 2, 3),
+                "Route without method constraints should match {:?}",
+                method
+            );
+        }
     }
 }
