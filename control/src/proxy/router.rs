@@ -85,6 +85,27 @@ pub struct RouteMatch {
     pub pattern: Arc<str>, // Arc<str> for zero-cost clone on hot path
 }
 
+/// Header match type for Gateway API conformance
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Used in tests during TDD implementation
+pub enum HeaderMatchType {
+    /// Exact match (default)
+    Exact,
+    /// Regular expression match
+    RegularExpression,
+}
+
+/// Header match configuration for routes
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderMatch {
+    /// Header name (case-insensitive per RFC 7230)
+    pub name: String,
+    /// Header value to match
+    pub value: String,
+    /// Match type (exact or regex)
+    pub match_type: HeaderMatchType,
+}
+
 /// Route lookup key
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct RouteKey {
@@ -352,6 +373,41 @@ impl Router {
                 path_hash
             }
         }
+    }
+
+    /// Add route with header matching support (Gateway API conformance)
+    ///
+    /// This is a temporary stub implementation for Feature 1: HTTPRoute Header Matching.
+    /// Currently forwards to add_route() and ignores headers (to be implemented).
+    #[allow(dead_code)] // Used in tests
+    pub fn add_route_with_headers(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        backends: Vec<Backend>,
+        _header_matches: Vec<HeaderMatch>,
+    ) -> Result<(), String> {
+        // GREEN phase: Minimal implementation - just add route without header matching
+        // TODO: Store header_matches in Route struct and use in select_backend_with_headers
+        self.add_route(method, path, backends)
+    }
+
+    /// Select backend with header matching support (Gateway API conformance)
+    ///
+    /// This is a temporary stub implementation for Feature 1: HTTPRoute Header Matching.
+    /// Currently forwards to select_backend() and ignores headers (to be implemented).
+    #[allow(dead_code)] // Used in tests
+    pub fn select_backend_with_headers(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        _request_headers: Vec<(&str, &str)>,
+        src_ip: Option<u32>,
+        src_port: Option<u16>,
+    ) -> Option<RouteMatch> {
+        // GREEN phase: Minimal implementation - just select backend without header matching
+        // TODO: Check if request_headers match the route's header_matches
+        self.select_backend(method, path, src_ip, src_port)
     }
 }
 
@@ -743,6 +799,191 @@ mod tests {
             "Weighted distribution: stable={:.1}%, canary={:.1}%",
             stable_pct * 100.0,
             canary_pct * 100.0
+        );
+    }
+
+    // =============================================================================
+    // Gateway API Conformance Tests - Feature 1: HTTPRoute Header Matching (Core)
+    // =============================================================================
+    // These tests follow TDD approach: RED → GREEN → REFACTOR
+    // Currently in RED phase - tests will FAIL until implementation is complete
+
+    #[test]
+    fn test_header_match_exact() {
+        // RED: Test exact header matching
+        // HTTPRoute spec: headers.type = "Exact" (default)
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+
+        // Add route with header match: X-Version = "v1"
+        let header_matches = vec![HeaderMatch {
+            name: "X-Version".to_string(),
+            value: "v1".to_string(),
+            match_type: HeaderMatchType::Exact,
+        }];
+
+        router
+            .add_route_with_headers(HttpMethod::GET, "/api/test", backends, header_matches)
+            .expect("Should add route with headers");
+
+        // Request WITH matching header should succeed
+        let headers = vec![("X-Version", "v1")];
+        let route_match = router
+            .select_backend_with_headers(HttpMethod::GET, "/api/test", headers, None, None)
+            .expect("Should match with correct header");
+
+        assert_eq!(
+            Ipv4Addr::from(route_match.backend.ipv4),
+            Ipv4Addr::new(10, 0, 1, 1)
+        );
+
+        // Request WITHOUT matching header should fail
+        let headers = vec![("X-Version", "v2")];
+        let route_match =
+            router.select_backend_with_headers(HttpMethod::GET, "/api/test", headers, None, None);
+
+        assert!(
+            route_match.is_none(),
+            "Should NOT match with incorrect header value"
+        );
+    }
+
+    #[test]
+    fn test_header_match_regex() {
+        // RED: Test regex header matching
+        // HTTPRoute spec: headers.type = "RegularExpression"
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 2)),
+            8080,
+            100,
+        )];
+
+        // Add route with regex header match: X-Version matches "v[0-9]+"
+        let header_matches = vec![HeaderMatch {
+            name: "X-Version".to_string(),
+            value: "v[0-9]+".to_string(),
+            match_type: HeaderMatchType::RegularExpression,
+        }];
+
+        router
+            .add_route_with_headers(HttpMethod::GET, "/api/test", backends, header_matches)
+            .expect("Should add route with regex headers");
+
+        // Request WITH matching header (v1, v2, v99) should succeed
+        for version in &["v1", "v2", "v99"] {
+            let headers = vec![("X-Version", *version)];
+            let route_match = router
+                .select_backend_with_headers(HttpMethod::GET, "/api/test", headers, None, None)
+                .unwrap_or_else(|| panic!("Should match header {}", version));
+
+            assert_eq!(
+                Ipv4Addr::from(route_match.backend.ipv4),
+                Ipv4Addr::new(10, 0, 1, 2)
+            );
+        }
+
+        // Request WITHOUT matching header should fail
+        let headers = vec![("X-Version", "beta")];
+        let route_match =
+            router.select_backend_with_headers(HttpMethod::GET, "/api/test", headers, None, None);
+
+        assert!(
+            route_match.is_none(),
+            "Should NOT match with non-matching regex"
+        );
+    }
+
+    #[test]
+    fn test_header_match_multiple_headers() {
+        // RED: Test multiple header matches (AND logic)
+        // HTTPRoute spec: ALL headers must match
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 3)),
+            8080,
+            100,
+        )];
+
+        // Add route with multiple header matches
+        let header_matches = vec![
+            HeaderMatch {
+                name: "X-Version".to_string(),
+                value: "v1".to_string(),
+                match_type: HeaderMatchType::Exact,
+            },
+            HeaderMatch {
+                name: "X-Environment".to_string(),
+                value: "production".to_string(),
+                match_type: HeaderMatchType::Exact,
+            },
+        ];
+
+        router
+            .add_route_with_headers(HttpMethod::GET, "/api/test", backends, header_matches)
+            .expect("Should add route with multiple headers");
+
+        // Request WITH ALL matching headers should succeed
+        let headers = vec![("X-Version", "v1"), ("X-Environment", "production")];
+        let route_match = router
+            .select_backend_with_headers(HttpMethod::GET, "/api/test", headers, None, None)
+            .expect("Should match with all headers");
+
+        assert_eq!(
+            Ipv4Addr::from(route_match.backend.ipv4),
+            Ipv4Addr::new(10, 0, 1, 3)
+        );
+
+        // Request WITH ONLY ONE matching header should fail
+        let headers = vec![("X-Version", "v1")]; // Missing X-Environment
+        let route_match =
+            router.select_backend_with_headers(HttpMethod::GET, "/api/test", headers, None, None);
+
+        assert!(
+            route_match.is_none(),
+            "Should NOT match when missing required headers"
+        );
+    }
+
+    #[test]
+    fn test_header_match_case_insensitive_name() {
+        // RED: Test case-insensitive header name matching
+        // HTTPRoute spec: Header names are case-insensitive (RFC 7230)
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 4)),
+            8080,
+            100,
+        )];
+
+        // Add route with header match: x-version = "v1" (lowercase)
+        let header_matches = vec![HeaderMatch {
+            name: "x-version".to_string(),
+            value: "v1".to_string(),
+            match_type: HeaderMatchType::Exact,
+        }];
+
+        router
+            .add_route_with_headers(HttpMethod::GET, "/api/test", backends, header_matches)
+            .expect("Should add route");
+
+        // Request with X-Version (uppercase) should match
+        let headers = vec![("X-Version", "v1")];
+        let route_match = router
+            .select_backend_with_headers(HttpMethod::GET, "/api/test", headers, None, None)
+            .expect("Should match with case-insensitive header name");
+
+        assert_eq!(
+            Ipv4Addr::from(route_match.backend.ipv4),
+            Ipv4Addr::new(10, 0, 1, 4)
         );
     }
 }
