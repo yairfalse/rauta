@@ -205,8 +205,8 @@ impl Router {
             pattern: Arc::from(path), // Convert to Arc<str> once during route setup
             backends,
             maglev_table,
-            header_matches: Vec::new(),      // No header matching for basic routes
-            method_matches: None,            // No method constraints (match all methods)
+            header_matches: Vec::new(), // No header matching for basic routes
+            method_matches: None,       // No method constraints (match all methods)
             query_param_matches: Vec::new(), // No query param constraints
         };
 
@@ -434,8 +434,8 @@ impl Router {
             pattern: Arc::from(path),
             backends,
             maglev_table,
-            header_matches,              // Store header matches for validation
-            method_matches: None,        // No method constraints by default
+            header_matches,                  // Store header matches for validation
+            method_matches: None,            // No method constraints by default
             query_param_matches: Vec::new(), // No query param constraints
         };
 
@@ -542,13 +542,62 @@ impl Router {
     #[allow(dead_code)] // Used in tests
     pub fn add_route_with_query_params(
         &self,
-        _method: HttpMethod,
-        _path: &str,
-        _backends: Vec<Backend>,
-        _query_param_matches: Vec<QueryParamMatch>,
+        method: HttpMethod,
+        path: &str,
+        backends: Vec<Backend>,
+        query_param_matches: Vec<QueryParamMatch>,
     ) -> Result<(), String> {
-        // RED phase: Stub implementation
-        unimplemented!("add_route_with_query_params - RED phase")
+        // GREEN phase: Store query param matches in route
+        let path_hash = fnv1a_hash(path.as_bytes());
+        let key = RouteKey { method, path_hash };
+
+        // Build Maglev table
+        let maglev_table = maglev_build_compact_table(&backends);
+
+        let route = Route {
+            pattern: Arc::from(path),
+            backends,
+            maglev_table,
+            header_matches: Vec::new(), // No header constraints
+            method_matches: None,       // No method constraints
+            query_param_matches,        // Store query param constraints
+        };
+
+        // Update routes HashMap
+        {
+            let mut routes = self.routes.write().unwrap();
+            routes.insert(key, route);
+        }
+
+        // Rebuild matchit router (same as add_route)
+        let mut new_prefix_router = matchit::Router::new();
+        {
+            let routes = self.routes.read().unwrap();
+            for (route_key, route) in routes.iter() {
+                let path_str = route.pattern.as_ref();
+
+                new_prefix_router
+                    .insert(path_str.to_string(), *route_key)
+                    .map_err(|e| format!("Failed to add exact route {}: {}", path_str, e))?;
+
+                let prefix_pattern = if path_str == "/" {
+                    "/{*rest}".to_string()
+                } else {
+                    format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
+                };
+
+                new_prefix_router
+                    .insert(prefix_pattern, *route_key)
+                    .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
+            }
+        }
+
+        {
+            let mut prefix_router = self.prefix_router.write().unwrap();
+            *prefix_router = new_prefix_router;
+        }
+
+        Ok(())
     }
 
     /// Select backend with header matching support (Gateway API conformance)
@@ -633,18 +682,83 @@ impl Router {
     }
 
     /// Select backend with query parameter matching support (Gateway API conformance)
-    /// RED phase stub - will be implemented in GREEN phase
+    ///
+    /// Validates request query params against route's query_param_matches before selecting backend.
+    /// Supports Exact and RegularExpression matching per Gateway API spec.
     #[allow(dead_code)] // Used in tests during TDD implementation
     pub fn select_backend_with_query_params(
         &self,
-        _method: HttpMethod,
-        _path: &str,
-        _query_params: Vec<(&str, &str)>,
-        _src_ip: Option<u32>,
-        _src_port: Option<u16>,
+        method: HttpMethod,
+        path: &str,
+        query_params: Vec<(&str, &str)>,
+        src_ip: Option<u32>,
+        src_port: Option<u16>,
     ) -> Option<RouteMatch> {
-        // RED phase: Stub implementation
-        unimplemented!("select_backend_with_query_params - RED phase")
+        // GREEN phase: Full query parameter matching implementation
+        let path_hash = fnv1a_hash(path.as_bytes());
+        let key = RouteKey { method, path_hash };
+
+        // Try exact match first, then prefix match (same as select_backend)
+        let route_key = {
+            let routes = self.routes.read().unwrap();
+            if routes.contains_key(&key) {
+                Some(key)
+            } else {
+                let prefix_router = self.prefix_router.read().unwrap();
+                prefix_router.at(path).ok().map(|m| *m.value)
+            }
+        }?;
+
+        // Look up route
+        let routes = self.routes.read().unwrap();
+        let route = routes.get(&route_key)?;
+
+        // Check query parameter matches (ALL must match - AND logic)
+        if !route.query_param_matches.is_empty()
+            && !query_params_match(&route.query_param_matches, &query_params)
+        {
+            return None; // Query params don't match
+        }
+
+        // Query params match (or no query param constraints) - select backend using Maglev
+        let flow_hash = self.compute_flow_hash(path_hash, src_ip, src_port);
+
+        let health = self.backend_health.read().unwrap();
+        let draining = self.draining_backends.read().unwrap();
+        let mut tried_indices = HashSet::new();
+
+        for attempt in 0..route.backends.len() * 10 {
+            let lookup_hash = flow_hash.wrapping_add(attempt as u64);
+            let backend_idx = maglev_lookup_compact(lookup_hash, &route.maglev_table);
+
+            if tried_indices.contains(&backend_idx) {
+                continue;
+            }
+            tried_indices.insert(backend_idx);
+
+            let backend = route.backends.get(backend_idx as usize).copied()?;
+
+            let is_healthy = health
+                .get(&backend.ipv4)
+                .map(|h| h.is_healthy())
+                .unwrap_or(true);
+
+            let is_draining = draining.contains_key(&backend.ipv4);
+
+            if !is_healthy || is_draining {
+                if tried_indices.len() == route.backends.len() {
+                    break;
+                }
+                continue;
+            }
+
+            return Some(RouteMatch {
+                backend,
+                pattern: Arc::clone(&route.pattern),
+            });
+        }
+
+        None
     }
 }
 
@@ -682,6 +796,45 @@ fn headers_match(header_matches: &[HeaderMatch], request_headers: &[(&str, &str)
     }
 
     true // All header_matches satisfied
+}
+
+/// Check if request query params match route's query_param_matches (Gateway API conformance)
+///
+/// ALL query_param_matches must be satisfied (AND logic).
+/// Query parameter names are case-sensitive.
+fn query_params_match(
+    query_param_matches: &[QueryParamMatch],
+    request_query_params: &[(&str, &str)],
+) -> bool {
+    for query_param_match in query_param_matches {
+        // Find matching query param in request (case-sensitive name comparison)
+        let found = request_query_params.iter().any(|(req_name, req_value)| {
+            // Exact name match (query params are case-sensitive)
+            if *req_name != query_param_match.name {
+                return false;
+            }
+
+            // Check value based on match type
+            match query_param_match.match_type {
+                QueryParamMatchType::Exact => *req_value == query_param_match.value,
+                QueryParamMatchType::RegularExpression => {
+                    // Compile regex and check match
+                    // Note: In production, we'd cache compiled regexes
+                    if let Ok(regex) = Regex::new(&query_param_match.value) {
+                        regex.is_match(req_value)
+                    } else {
+                        false // Invalid regex = no match
+                    }
+                }
+            }
+        });
+
+        if !found {
+            return false; // At least one query_param_match not satisfied
+        }
+    }
+
+    true // All query_param_matches satisfied
 }
 
 #[cfg(test)]
@@ -1399,7 +1552,12 @@ mod tests {
         }];
 
         router
-            .add_route_with_query_params(HttpMethod::GET, "/api/data", backends, query_param_matches)
+            .add_route_with_query_params(
+                HttpMethod::GET,
+                "/api/data",
+                backends,
+                query_param_matches,
+            )
             .expect("Should add route with query param matching");
 
         // Request WITH matching query param should succeed
@@ -1453,7 +1611,12 @@ mod tests {
         }];
 
         router
-            .add_route_with_query_params(HttpMethod::GET, "/api/list", backends, query_param_matches)
+            .add_route_with_query_params(
+                HttpMethod::GET,
+                "/api/list",
+                backends,
+                query_param_matches,
+            )
             .expect("Should add route with regex query params");
 
         // Requests WITH matching query params (page=1, page=99) should succeed
@@ -1516,7 +1679,12 @@ mod tests {
         ];
 
         router
-            .add_route_with_query_params(HttpMethod::GET, "/api/export", backends, query_param_matches)
+            .add_route_with_query_params(
+                HttpMethod::GET,
+                "/api/export",
+                backends,
+                query_param_matches,
+            )
             .expect("Should add route with multiple query params");
 
         // Request with BOTH query params should match
