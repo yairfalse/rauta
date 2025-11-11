@@ -1,7 +1,7 @@
 //! HTTP Server - proxies requests to backends
 
 use crate::apis::metrics::CONTROLLER_METRICS_REGISTRY;
-use crate::proxy::filters::{HeaderModifierOp, RequestHeaderModifier};
+use crate::proxy::filters::{HeaderModifierOp, RequestHeaderModifier, ResponseHeaderModifier};
 use crate::proxy::router::Router;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Bytes;
@@ -423,6 +423,41 @@ fn apply_request_filters(
                 let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
                     .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
                 req.headers_mut().remove(header_name);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply response header filters after receiving response from backend
+/// Gateway API HTTPResponseHeaderModifier
+fn apply_response_filters<B>(
+    resp: &mut Response<B>,
+    filters: &ResponseHeaderModifier,
+) -> Result<(), String> {
+    for op in &filters.operations {
+        match op {
+            HeaderModifierOp::Set { name, value } => {
+                // Set replaces existing header or adds new one
+                let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
+                let header_value = hyper::header::HeaderValue::from_str(value)
+                    .map_err(|e| format!("Invalid header value '{}': {}", value, e))?;
+                resp.headers_mut().insert(header_name, header_value);
+            }
+            HeaderModifierOp::Add { name, value } => {
+                // Add appends header (allows multiple values)
+                let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
+                let header_value = hyper::header::HeaderValue::from_str(value)
+                    .map_err(|e| format!("Invalid header value '{}': {}", value, e))?;
+                resp.headers_mut().append(header_name, header_value);
+            }
+            HeaderModifierOp::Remove { name } => {
+                // Remove deletes all values for this header
+                let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
+                resp.headers_mut().remove(header_name);
             }
         }
     }
@@ -989,7 +1024,35 @@ async fn handle_request(
                 }
             }
 
-            result
+            // Apply response header filters if configured (Gateway API HTTPResponseHeaderModifier)
+            if let Some(filters) = &route_match.response_filters {
+                match result {
+                    Ok(mut resp) => {
+                        if let Err(e) = apply_response_filters(&mut resp, filters) {
+                            error!(
+                                request_id = %request_id,
+                                error = %e,
+                                "Failed to apply response header filters"
+                            );
+                            // Return error response if filter application fails
+                            Ok(Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .header("Content-Type", "text/plain")
+                                .body(
+                                    Full::new(Bytes::from(format!("Response filter error: {}", e)))
+                                        .map_err(|never| match never {})
+                                        .boxed(),
+                                )
+                                .unwrap())
+                        } else {
+                            Ok(resp)
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                result
+            }
         }
         None => {
             let duration = start.elapsed();
