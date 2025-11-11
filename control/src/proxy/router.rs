@@ -1908,4 +1908,122 @@ mod tests {
             "Should have 1 filter operation"
         );
     }
+
+    // Response header filter tests (Feature 5)
+    #[tokio::test]
+    async fn test_response_filter_set_header() {
+        use crate::proxy::filters::ResponseHeaderModifier;
+
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+
+        // Create filter that sets Server header
+        let filter =
+            ResponseHeaderModifier::new().set("Server".to_string(), "RAUTA/1.0".to_string());
+
+        router
+            .add_route_with_response_filters(HttpMethod::GET, "/api/data", backends, filter)
+            .expect("Should add route with response filters");
+
+        // Select backend and verify filter
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/api/data", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.response_filters.is_some(),
+            "RouteMatch should have response filters attached"
+        );
+
+        let filters = route_match.response_filters.unwrap();
+        assert_eq!(
+            filters.operations.len(),
+            1,
+            "Should have 1 filter operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_response_filter_add_header() {
+        use crate::proxy::filters::ResponseHeaderModifier;
+
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+
+        // Create filter that adds CORS headers
+        let filter = ResponseHeaderModifier::new()
+            .add("Access-Control-Allow-Origin".to_string(), "*".to_string())
+            .add(
+                "Access-Control-Allow-Methods".to_string(),
+                "GET, POST".to_string(),
+            );
+
+        router
+            .add_route_with_response_filters(HttpMethod::GET, "/api/public", backends, filter)
+            .expect("Should add route with response filters");
+
+        // Select backend and verify filter
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/api/public", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.response_filters.is_some(),
+            "RouteMatch should have response filters attached"
+        );
+
+        let filters = route_match.response_filters.unwrap();
+        assert_eq!(
+            filters.operations.len(),
+            2,
+            "Should have 2 filter operations"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_response_filter_remove_header() {
+        use crate::proxy::filters::ResponseHeaderModifier;
+
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+
+        // Create filter that removes Server header
+        let filter = ResponseHeaderModifier::new().remove("Server".to_string());
+
+        router
+            .add_route_with_response_filters(HttpMethod::GET, "/api/masked", backends, filter)
+            .expect("Should add route with response filters");
+
+        // Select backend and verify filter
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/api/masked", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.response_filters.is_some(),
+            "RouteMatch should have response filters attached"
+        );
+
+        let filters = route_match.response_filters.unwrap();
+        assert_eq!(
+            filters.operations.len(),
+            1,
+            "Should have 1 filter operation"
+        );
+    }
 }
