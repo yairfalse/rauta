@@ -544,10 +544,7 @@ impl<B> HasHeadersMut for hyper::Response<B> {
 }
 
 /// Generic helper to apply header filters
-fn apply_header_filters<T, F>(
-    target: &mut T,
-    filters: &F,
-) -> Result<(), String>
+fn apply_header_filters<T, F>(target: &mut T, filters: &F) -> Result<(), String>
 where
     T: HasHeadersMut,
     F: std::ops::Deref<Target = [HeaderModifierOp]>,

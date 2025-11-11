@@ -239,7 +239,8 @@ impl HTTPRouteReconciler {
                         // Step 1: Calculate exact fractional slots and assign floor values
                         let mut allocated_slots = 0;
                         for (service_backends, weight) in &resolved_services {
-                            let exact_slots = (*weight as f64 / total_weight as f64) * MAX_MAGLEV_BACKENDS as f64;
+                            let exact_slots =
+                                (*weight as f64 / total_weight as f64) * MAX_MAGLEV_BACKENDS as f64;
                             let floor_slots = exact_slots.floor() as usize;
                             let remainder = exact_slots - floor_slots as f64;
 
