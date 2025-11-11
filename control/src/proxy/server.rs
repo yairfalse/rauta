@@ -1,6 +1,7 @@
 //! HTTP Server - proxies requests to backends
 
 use crate::apis::metrics::CONTROLLER_METRICS_REGISTRY;
+use crate::proxy::filters::{HeaderModifierOp, RequestHeaderModifier};
 use crate::proxy::router::Router;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Bytes;
@@ -393,6 +394,41 @@ fn is_hop_by_hop_header(name: &str) -> bool {
     )
 }
 
+/// Apply request header filters before forwarding to backend
+/// Gateway API HTTPRouteBackendRequestHeaderModification
+fn apply_request_filters(
+    req: &mut Request<hyper::body::Incoming>,
+    filters: &RequestHeaderModifier,
+) -> Result<(), String> {
+    for op in &filters.operations {
+        match op {
+            HeaderModifierOp::Set { name, value } => {
+                // Set replaces existing header or adds new one
+                let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
+                let header_value = hyper::header::HeaderValue::from_str(value)
+                    .map_err(|e| format!("Invalid header value '{}': {}", value, e))?;
+                req.headers_mut().insert(header_name, header_value);
+            }
+            HeaderModifierOp::Add { name, value } => {
+                // Add appends header (allows multiple values)
+                let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
+                let header_value = hyper::header::HeaderValue::from_str(value)
+                    .map_err(|e| format!("Invalid header value '{}': {}", value, e))?;
+                req.headers_mut().append(header_name, header_value);
+            }
+            HeaderModifierOp::Remove { name } => {
+                // Remove deletes all values for this header
+                let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
+                req.headers_mut().remove(header_name);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Forward request to backend server
 /// Returns BoxBody to support zero-copy streaming for HTTP/2 (hot path)
 #[allow(clippy::too_many_arguments)] // Workers integration requires additional parameters
@@ -771,7 +807,7 @@ fn status_to_str(status: u16) -> &'static str {
 /// Handle incoming HTTP request
 /// Returns BoxBody to support zero-copy streaming for HTTP/2 responses
 async fn handle_request(
-    req: Request<hyper::body::Incoming>,
+    mut req: Request<hyper::body::Incoming>,
     router: Arc<Router>,
     client: Client<HttpConnector, Full<Bytes>>,
     backend_pools: BackendPools,
@@ -865,6 +901,26 @@ async fn handle_request(
         Some(route_match) => {
             // Select worker for this request (lock-free round-robin)
             let worker_index = worker_selector.as_ref().map(|selector| selector.select());
+
+            // Apply request header filters if configured (Gateway API HTTPRouteBackendRequestHeaderModification)
+            if let Some(filters) = &route_match.request_filters {
+                if let Err(e) = apply_request_filters(&mut req, filters) {
+                    error!(
+                        request_id = %request_id,
+                        error = %e,
+                        "Failed to apply request header filters"
+                    );
+                    return Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header("Content-Type", "text/plain")
+                        .body(
+                            Full::new(Bytes::from(format!("Filter error: {}", e)))
+                                .map_err(|never| match never {})
+                                .boxed(),
+                        )
+                        .unwrap());
+                }
+            }
 
             info!(
                 request_id = %request_id,
