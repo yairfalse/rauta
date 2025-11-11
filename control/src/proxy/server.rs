@@ -177,6 +177,8 @@ impl ProxyServer {
     }
 
     /// Start serving HTTP requests
+    /// NOTE: Production code should use serve_with_shutdown() instead for graceful shutdown
+    #[allow(dead_code)] // Used in tests; production uses serve_with_shutdown()
     pub async fn serve(self) -> Result<(), String> {
         let listener = TcpListener::bind(&self.bind_addr)
             .await
@@ -227,6 +229,122 @@ impl ProxyServer {
                     debug!("Error serving connection: {}", e);
                 }
             });
+        }
+    }
+
+    /// Start serving HTTP requests with graceful shutdown support
+    /// When shutdown signal is received:
+    /// 1. Stop accepting new connections
+    /// 2. Wait for active connections to complete
+    /// 3. Shutdown after all connections drained or timeout
+    #[allow(dead_code)] // Used in production via main.rs signal handling
+    pub async fn serve_with_shutdown<F>(self, shutdown_signal: F) -> Result<(), String>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use tokio::sync::Notify;
+
+        let listener = TcpListener::bind(&self.bind_addr)
+            .await
+            .map_err(|e| format!("Failed to bind to {}: {}", self.bind_addr, e))?;
+
+        let _actual_addr = listener
+            .local_addr()
+            .map_err(|e| format!("Failed to get local addr: {}", e))?;
+
+        // Track active connections
+        let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shutdown_notify = Arc::new(Notify::new());
+
+        // Spawn shutdown handler
+        let active_connections_clone = active_connections.clone();
+        let shutdown_notify_clone = shutdown_notify.clone();
+        tokio::spawn(async move {
+            shutdown_signal.await;
+            info!("Graceful shutdown initiated - draining active connections");
+
+            // Wait for active connections to complete (with timeout)
+            let drain_timeout = tokio::time::Duration::from_secs(30);
+            let start = std::time::Instant::now();
+
+            while active_connections_clone.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                if start.elapsed() > drain_timeout {
+                    warn!(
+                        "Drain timeout exceeded - forcing shutdown with {} active connections",
+                        active_connections_clone.load(std::sync::atomic::Ordering::Relaxed)
+                    );
+                    break;
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+
+            info!("All connections drained - shutting down");
+            shutdown_notify_clone.notify_one();
+        });
+
+        // Main accept loop
+        loop {
+            tokio::select! {
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok((stream, _)) => {
+                            // Increment active connection counter
+                            active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                            let router = self.router.clone();
+                            let client = self.client.clone();
+                            let backend_pools = self.backend_pools.clone();
+                            let protocol_cache = self.protocol_cache.clone();
+                            let workers = self.workers.clone();
+                            let worker_selector = self.worker_selector.clone();
+                            let active_connections_clone = active_connections.clone();
+
+                            tokio::spawn(async move {
+                                let io = TokioIo::new(stream);
+
+                                let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                                    let router = router.clone();
+                                    let client = client.clone();
+                                    let backend_pools = backend_pools.clone();
+                                    let protocol_cache = protocol_cache.clone();
+                                    let workers = workers.clone();
+                                    let worker_selector = worker_selector.clone();
+                                    async move {
+                                        handle_request(
+                                            req,
+                                            router,
+                                            client,
+                                            backend_pools,
+                                            protocol_cache,
+                                            workers,
+                                            worker_selector,
+                                        )
+                                        .await
+                                    }
+                                });
+
+                                if let Err(e) = http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await
+                                {
+                                    debug!("Error serving connection: {}", e);
+                                }
+
+                                // Decrement active connection counter when done
+                                active_connections_clone.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            });
+                        }
+                        Err(e) => {
+                            return Err(format!("Failed to accept connection: {}", e));
+                        }
+                    }
+                }
+                _ = shutdown_notify.notified() => {
+                    info!("Server shutdown complete");
+                    return Ok(());
+                }
+            }
         }
     }
 

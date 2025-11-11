@@ -20,6 +20,48 @@ pub struct ControllerConfig {
 
     /// GatewayClass name to watch (for Gateway API)
     pub gateway_class_name: Option<String>,
+
+    /// Timeout configuration
+    #[serde(default)]
+    pub timeouts: TimeoutConfig,
+}
+
+/// Timeout configuration for reliability
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TimeoutConfig {
+    /// TCP connection timeout in seconds (default: 5s)
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_secs: u64,
+
+    /// HTTP request timeout in seconds (default: 30s)
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout_secs: u64,
+
+    /// Idle connection timeout in seconds (default: 90s)
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout_secs: u64,
+}
+
+fn default_connect_timeout() -> u64 {
+    5
+}
+
+fn default_request_timeout() -> u64 {
+    30
+}
+
+fn default_idle_timeout() -> u64 {
+    90
+}
+
+impl Default for TimeoutConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout_secs: default_connect_timeout(),
+            request_timeout_secs: default_request_timeout(),
+            idle_timeout_secs: default_idle_timeout(),
+        }
+    }
 }
 
 /// API feature flags
@@ -52,6 +94,7 @@ impl Default for ControllerConfig {
             controller_name: default_controller_name(),
             ingress_class_name: Some("rauta".to_string()),
             gateway_class_name: Some("rauta".to_string()),
+            timeouts: TimeoutConfig::default(),
         }
     }
 }
@@ -120,5 +163,24 @@ mod tests {
         // This config is invalid if we try to validate it
         // (We don't have a validate() method yet, but we check in from_env())
         assert!(!result.apis.gateway && !result.apis.ingress);
+    }
+
+    #[test]
+    fn test_timeout_defaults() {
+        let config = ControllerConfig::default();
+
+        // Production timeouts for reliability
+        assert_eq!(
+            config.timeouts.connect_timeout_secs, 5,
+            "Connect timeout should be 5s (fast-fail for dead backends)"
+        );
+        assert_eq!(
+            config.timeouts.request_timeout_secs, 30,
+            "Request timeout should be 30s (reasonable for most requests)"
+        );
+        assert_eq!(
+            config.timeouts.idle_timeout_secs, 90,
+            "Idle timeout should be 90s (keep connections alive but not forever)"
+        );
     }
 }
