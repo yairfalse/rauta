@@ -4,6 +4,9 @@
 //! - RequestHeaderModifier: Modify request headers before proxying
 //! - ResponseHeaderModifier: Modify response headers after proxying
 //! - RequestRedirect: Redirect requests (status codes 301, 302)
+//! - Timeout: Request and backend timeout configuration (Extended feature)
+
+use std::time::Duration;
 
 /// HTTP redirect status code (Gateway API HTTPRequestRedirectFilter)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -161,6 +164,44 @@ impl ResponseHeaderModifier {
     #[allow(dead_code)] // Used in tests during TDD implementation
     pub fn remove(mut self, name: String) -> Self {
         self.operations.push(HeaderModifierOp::Remove { name });
+        self
+    }
+}
+
+/// Request timeout configuration (Gateway API HTTPRouteTimeouts - Extended feature)
+///
+/// Specifies timeouts for the entire request and for backend requests.
+/// Gateway API spec: https://gateway-api.sigs.k8s.io/reference/spec/#gateway.networking.k8s.io/v1.HTTPRouteTimeouts
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(dead_code)] // Used in tests during TDD implementation
+pub struct Timeout {
+    /// Overall request timeout (includes all retries, queuing, etc.)
+    /// If None, no request-level timeout is enforced
+    pub request: Option<Duration>,
+
+    /// Backend request timeout (time allowed for a single backend attempt)
+    /// If None, no backend-level timeout is enforced
+    pub backend_request: Option<Duration>,
+}
+
+impl Timeout {
+    /// Create a new empty timeout configuration
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set overall request timeout
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn request(mut self, timeout: Duration) -> Self {
+        self.request = Some(timeout);
+        self
+    }
+
+    /// Set backend request timeout
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn backend_request(mut self, timeout: Duration) -> Self {
+        self.backend_request = Some(timeout);
         self
     }
 }
