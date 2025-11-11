@@ -85,6 +85,8 @@ struct Route {
     query_param_matches: Vec<QueryParamMatch>, // Gateway API query parameter matching (empty = no constraints)
     #[allow(dead_code)] // Used in GREEN phase for Feature 4
     request_filters: Option<crate::proxy::filters::RequestHeaderModifier>, // Gateway API request header filters
+    #[allow(dead_code)] // Used in GREEN phase for Feature 5
+    response_filters: Option<crate::proxy::filters::ResponseHeaderModifier>, // Gateway API response header filters
 }
 
 /// Route match result (backend + pattern for metrics)
@@ -93,6 +95,8 @@ pub struct RouteMatch {
     pub pattern: Arc<str>, // Arc<str> for zero-cost clone on hot path
     #[allow(dead_code)] // Used in server.rs to apply filters during proxying
     pub request_filters: Option<crate::proxy::filters::RequestHeaderModifier>,
+    #[allow(dead_code)] // Used in server.rs to apply filters after backend response
+    pub response_filters: Option<crate::proxy::filters::ResponseHeaderModifier>,
 }
 
 /// Header match type for Gateway API conformance
@@ -213,6 +217,7 @@ impl Router {
             method_matches: None,       // No method constraints (match all methods)
             query_param_matches: Vec::new(), // No query param constraints
             request_filters: None,      // No request header filters
+            response_filters: None,     // No response header filters
         };
 
         // Update routes HashMap (minimize write lock duration)
@@ -394,6 +399,7 @@ impl Router {
                 backend,
                 pattern: Arc::clone(&route.pattern),
                 request_filters: route.request_filters.clone(),
+                response_filters: route.response_filters.clone(),
             });
         }
 
@@ -444,6 +450,7 @@ impl Router {
             method_matches: None,            // No method constraints by default
             query_param_matches: Vec::new(), // No query param constraints
             request_filters: None,           // No request header filters
+            response_filters: None,          // No response header filters
         };
 
         // Update routes HashMap
@@ -507,6 +514,7 @@ impl Router {
             method_matches: Some(method_matches), // Store method constraints
             query_param_matches: Vec::new(),      // No query param constraints
             request_filters: None,                // No request header filters
+            response_filters: None,               // No response header filters
         };
 
         // Update routes HashMap
@@ -570,6 +578,7 @@ impl Router {
             method_matches: None,       // No method constraints
             query_param_matches,        // Store query param constraints
             request_filters: None,      // No request header filters
+            response_filters: None,     // No response header filters
         };
 
         // Update routes HashMap
@@ -633,6 +642,72 @@ impl Router {
             method_matches: None,            // No method constraints
             query_param_matches: Vec::new(), // No query param constraints
             request_filters: Some(filters),  // Store filters for server.rs to apply
+            response_filters: None,          // No response header filters
+        };
+
+        // Update routes HashMap
+        {
+            let mut routes = self.routes.write().unwrap();
+            routes.insert(key, route);
+        }
+
+        // Rebuild matchit router from scratch (since matchit doesn't support updates)
+        let routes = self.routes.read().unwrap();
+        let mut new_prefix_router = matchit::Router::new();
+
+        for (route_key, route) in routes.iter() {
+            let path_str = route.pattern.as_ref();
+
+            // Add exact match route
+            new_prefix_router
+                .insert(path_str.to_string(), *route_key)
+                .map_err(|e| format!("Failed to add route {}: {}", path_str, e))?;
+
+            // Add prefix match route (/{*rest} pattern)
+            let prefix_pattern = if path_str == "/" {
+                "/{*rest}".to_string()
+            } else {
+                format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
+            };
+
+            new_prefix_router
+                .insert(prefix_pattern, *route_key)
+                .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
+        }
+
+        {
+            let mut prefix_router = self.prefix_router.write().unwrap();
+            *prefix_router = new_prefix_router;
+        }
+
+        Ok(())
+    }
+
+    /// Add route with response header filters (Gateway API HTTPRouteBackendResponseHeaderModification)
+    /// Filters are applied in server.rs after receiving response from backend
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn add_route_with_response_filters(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        backends: Vec<Backend>,
+        filters: crate::proxy::filters::ResponseHeaderModifier,
+    ) -> Result<(), String> {
+        let path_hash = fnv1a_hash(path.as_bytes());
+        let key = RouteKey { method, path_hash };
+
+        // Build Maglev table
+        let maglev_table = maglev_build_compact_table(&backends);
+
+        let route = Route {
+            pattern: Arc::from(path),
+            backends,
+            maglev_table,
+            header_matches: Vec::new(),      // No header constraints
+            method_matches: None,            // No method constraints
+            query_param_matches: Vec::new(), // No query param constraints
+            request_filters: None,           // No request header filters
+            response_filters: Some(filters), // Store filters for server.rs to apply after backend response
         };
 
         // Update routes HashMap
@@ -749,6 +824,7 @@ impl Router {
                 backend,
                 pattern: Arc::clone(&route.pattern),
                 request_filters: route.request_filters.clone(),
+                response_filters: route.response_filters.clone(),
             });
         }
 
@@ -830,6 +906,7 @@ impl Router {
                 backend,
                 pattern: Arc::clone(&route.pattern),
                 request_filters: route.request_filters.clone(),
+                response_filters: route.response_filters.clone(),
             });
         }
 
