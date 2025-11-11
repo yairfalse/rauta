@@ -1397,7 +1397,9 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            _ => panic!("Expected IPv4 address (IPv6 not supported due to eBPF compatibility constraints)"),
+            _ => panic!(
+                "Test expects IPv4 address (IPv6 support not yet implemented in Backend struct)"
+            ),
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
