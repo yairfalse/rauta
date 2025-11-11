@@ -4,6 +4,7 @@ Multi-source load tester for canary routing validation.
 Simulates requests from different IPs to test Maglev distribution.
 """
 
+import json
 import subprocess
 import sys
 from collections import Counter
@@ -43,23 +44,25 @@ def test_from_different_pods(num_requests=100):
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=10
+                timeout=10  # Prevent hanging
             )
         except subprocess.TimeoutExpired:
-            print(f"\n  Warning: kubectl exec timed out for pod {pod_name}")
+            print(f"  Request {i+1} timed out (pod: {pod_name})")
             continue
         except subprocess.SubprocessError as e:
-            print(f"\n  Warning: kubectl exec failed for pod {pod_name}: {e}")
+            print(f"  Request {i+1} failed with error: {e} (pod: {pod_name})")
             continue
 
         if result.returncode == 0:
             output = result.stdout
-            if '"version"' in output:
-                # Extract version from JSON response
-                if '"v1-stable"' in output:
-                    versions.append("v1-stable")
-                elif '"v2-canary"' in output:
-                    versions.append("v2-canary")
+            # Use proper JSON parsing
+            try:
+                data = json.loads(output)
+                version = data.get("version")
+                if version:
+                    versions.append(version)
+            except json.JSONDecodeError:
+                pass  # Silently skip malformed responses
 
         # Progress indicator
         if (i + 1) % 10 == 0:
@@ -103,7 +106,7 @@ if __name__ == "__main__":
             print("ERROR: Number of requests must be positive")
             sys.exit(1)
     except ValueError:
-        print(f"ERROR: Invalid argument '{sys.argv[1]}'. Expected a positive integer.")
+        print("ERROR: Invalid number of requests")
         sys.exit(1)
 
     test_from_different_pods(num_requests)

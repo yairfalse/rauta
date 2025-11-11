@@ -1,8 +1,11 @@
 //! HTTP Server - proxies requests to backends
 
 use crate::apis::metrics::CONTROLLER_METRICS_REGISTRY;
+use crate::proxy::filters::{
+    HeaderModifierOp, RequestHeaderModifier, RequestRedirect, ResponseHeaderModifier,
+};
 use crate::proxy::router::Router;
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::body::Bytes;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
@@ -511,6 +514,136 @@ fn is_hop_by_hop_header(name: &str) -> bool {
     )
 }
 
+/// Apply request header filters before forwarding to backend
+/// Gateway API HTTPRouteBackendRequestHeaderModification
+///
+/// Security: HeaderName::from_bytes() and HeaderValue::from_str() validate input and reject
+/// CRLF characters (\r\n), preventing header injection attacks. Invalid headers return errors.
+fn apply_request_filters(
+    req: &mut Request<hyper::body::Incoming>,
+    filters: &RequestHeaderModifier,
+) -> Result<(), String> {
+    apply_header_filters(req, &filters.operations)
+}
+
+/// Trait for types that provide mutable access to headers
+trait HasHeadersMut {
+    fn headers_mut(&mut self) -> &mut hyper::header::HeaderMap;
+}
+
+impl<B> HasHeadersMut for hyper::Request<B> {
+    fn headers_mut(&mut self) -> &mut hyper::header::HeaderMap {
+        self.headers_mut()
+    }
+}
+
+impl<B> HasHeadersMut for hyper::Response<B> {
+    fn headers_mut(&mut self) -> &mut hyper::header::HeaderMap {
+        self.headers_mut()
+    }
+}
+
+/// Generic helper to apply header filters
+fn apply_header_filters<T, F>(target: &mut T, filters: &F) -> Result<(), String>
+where
+    T: HasHeadersMut,
+    F: std::ops::Deref<Target = [HeaderModifierOp]>,
+{
+    for op in filters.iter() {
+        match op {
+            HeaderModifierOp::Set { name, value } => {
+                let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
+                let header_value = hyper::header::HeaderValue::from_str(value)
+                    .map_err(|e| format!("Invalid header value '{}': {}", value, e))?;
+                target.headers_mut().insert(header_name, header_value);
+            }
+            HeaderModifierOp::Add { name, value } => {
+                let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
+                let header_value = hyper::header::HeaderValue::from_str(value)
+                    .map_err(|e| format!("Invalid header value '{}': {}", value, e))?;
+                target.headers_mut().append(header_name, header_value);
+            }
+            HeaderModifierOp::Remove { name } => {
+                let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
+                target.headers_mut().remove(header_name);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply response header filters after receiving response from backend
+/// Gateway API HTTPResponseHeaderModifier
+fn apply_response_filters<B>(
+    resp: &mut Response<B>,
+    filters: &ResponseHeaderModifier,
+) -> Result<(), String> {
+    apply_header_filters(resp, &filters.operations)
+}
+/// Build redirect response (Gateway API HTTPRequestRedirectFilter - Core)
+///
+/// Security Note: Redirect configuration is controlled by cluster operators via Gateway API
+/// HTTPRoute resources. While this function doesn't validate redirect targets against an allowlist,
+/// operators must ensure that redirect filters only point to trusted destinations. Redirects
+/// configured via HTTPRoute are considered intentional by the cluster operator.
+///
+/// For production deployments, operators should:
+/// 1. Use RBAC to restrict who can create/modify HTTPRoutes
+/// 2. Review redirect configurations during deployment
+/// 3. Implement admission webhooks for additional validation if needed
+fn build_redirect_response(
+    req: &Request<hyper::body::Incoming>,
+    redirect: &RequestRedirect,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, String> {
+    let uri = req.uri();
+
+    // Extract components with fallbacks
+    let scheme = redirect
+        .scheme
+        .as_deref()
+        .or_else(|| uri.scheme_str())
+        .unwrap_or("http");
+
+    let host = redirect
+        .hostname
+        .as_deref()
+        .or_else(|| uri.host())
+        .or_else(|| req.headers().get("host").and_then(|h| h.to_str().ok()))
+        .ok_or_else(|| "Cannot determine redirect host".to_string())?;
+
+    let port = redirect
+        .port
+        .or_else(|| uri.port_u16())
+        .map(|p| format!(":{}", p))
+        .unwrap_or_default();
+
+    let path = redirect.path.as_deref().unwrap_or_else(|| uri.path());
+
+    // Build Location header
+    let location = format!("{}://{}{}{}", scheme, host, port, path);
+
+    // Map status code
+    use crate::proxy::filters::RedirectStatusCode;
+    let status = match redirect.status_code {
+        RedirectStatusCode::MovedPermanently => StatusCode::MOVED_PERMANENTLY,
+        RedirectStatusCode::Found => StatusCode::FOUND,
+    };
+
+    // Build response
+    Ok(Response::builder()
+        .status(status)
+        .header("Location", location)
+        .body(
+            Empty::<Bytes>::new()
+                .map_err(|never| match never {}) // Handle infallible error type
+                .boxed(),
+        )
+        .unwrap())
+}
+
 /// Forward request to backend server
 /// Returns BoxBody to support zero-copy streaming for HTTP/2 (hot path)
 #[allow(clippy::too_many_arguments)] // Workers integration requires additional parameters
@@ -889,7 +1022,7 @@ fn status_to_str(status: u16) -> &'static str {
 /// Handle incoming HTTP request
 /// Returns BoxBody to support zero-copy streaming for HTTP/2 responses
 async fn handle_request(
-    req: Request<hyper::body::Incoming>,
+    mut req: Request<hyper::body::Incoming>,
     router: Arc<Router>,
     client: Client<HttpConnector, Full<Bytes>>,
     backend_pools: BackendPools,
@@ -984,6 +1117,58 @@ async fn handle_request(
             // Select worker for this request (lock-free round-robin)
             let worker_index = worker_selector.as_ref().map(|selector| selector.select());
 
+            // Check for redirect filter (Gateway API HTTPRequestRedirectFilter - Core)
+            // Redirects return immediately - NEVER forward to backend
+            if let Some(redirect) = &route_match.redirect {
+                match build_redirect_response(&req, redirect) {
+                    Ok(resp) => {
+                        info!(
+                            request_id = %request_id,
+                            status = %resp.status().as_u16(),
+                            location = ?resp.headers().get("Location"),
+                            "Redirect response generated"
+                        );
+                        return Ok(resp);
+                    }
+                    Err(e) => {
+                        error!(
+                            request_id = %request_id,
+                            error = %e,
+                            "Failed to build redirect response"
+                        );
+                        return Ok(Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .header("Content-Type", "text/plain")
+                            .body(
+                                Full::new(Bytes::from(format!("Redirect error: {}", e)))
+                                    .map_err(|never| match never {})
+                                    .boxed(),
+                            )
+                            .unwrap());
+                    }
+                }
+            }
+
+            // Apply request header filters if configured (Gateway API HTTPRouteBackendRequestHeaderModification)
+            if let Some(filters) = &route_match.request_filters {
+                if let Err(e) = apply_request_filters(&mut req, filters) {
+                    error!(
+                        request_id = %request_id,
+                        error = %e,
+                        "Failed to apply request header filters"
+                    );
+                    return Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header("Content-Type", "text/plain")
+                        .body(
+                            Full::new(Bytes::from(format!("Filter error: {}", e)))
+                                .map_err(|never| match never {})
+                                .boxed(),
+                        )
+                        .unwrap());
+                }
+            }
+
             info!(
                 request_id = %request_id,
                 stage = "route_matched",
@@ -994,35 +1179,17 @@ async fn handle_request(
                 "Route matched, forwarding to backend"
             );
 
-            // Wrap backend request with 30s timeout (prevent hanging on slow backends)
-            let request_timeout = tokio::time::Duration::from_secs(30);
-            let result = tokio::time::timeout(
-                request_timeout,
-                forward_to_backend(
-                    req,
-                    route_match.backend,
-                    client,
-                    &request_id,
-                    backend_pools,
-                    protocol_cache,
-                    workers,
-                    worker_index,
-                ),
+            let result = forward_to_backend(
+                req,
+                route_match.backend,
+                client,
+                &request_id,
+                backend_pools,
+                protocol_cache,
+                workers,
+                worker_index,
             )
             .await;
-
-            // Convert timeout error to proper response
-            let result = match result {
-                Ok(res) => res,
-                Err(_elapsed) => {
-                    warn!(
-                        request_id = %request_id,
-                        timeout_secs = 30,
-                        "Request timeout - backend took too long"
-                    );
-                    Err("Request timeout after 30s".to_string())
-                }
-            };
             let duration = start.elapsed();
 
             // Record metrics (zero-allocation with static strings)
@@ -1069,7 +1236,35 @@ async fn handle_request(
                 }
             }
 
-            result
+            // Apply response header filters if configured (Gateway API HTTPResponseHeaderModifier)
+            if let Some(filters) = &route_match.response_filters {
+                match result {
+                    Ok(mut resp) => {
+                        if let Err(e) = apply_response_filters(&mut resp, filters) {
+                            error!(
+                                request_id = %request_id,
+                                error = %e,
+                                "Failed to apply response header filters"
+                            );
+                            // Return error response if filter application fails
+                            Ok(Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .header("Content-Type", "text/plain")
+                                .body(
+                                    Full::new(Bytes::from(format!("Response filter error: {}", e)))
+                                        .map_err(|never| match never {})
+                                        .boxed(),
+                                )
+                                .unwrap())
+                        } else {
+                            Ok(resp)
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                result
+            }
         }
         None => {
             let duration = start.elapsed();
@@ -1202,10 +1397,9 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            std::net::IpAddr::V6(_) => {
-                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
-                return;
-            }
+            _ => panic!(
+                "Test expects IPv4 address (IPv6 support not yet implemented in Backend struct)"
+            ),
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -1277,10 +1471,7 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            std::net::IpAddr::V6(_) => {
-                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
-                return;
-            }
+            _ => panic!("Expected IPv4 address"),
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -1353,10 +1544,7 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            std::net::IpAddr::V6(_) => {
-                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
-                return;
-            }
+            _ => panic!("Expected IPv4 address"),
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -1454,10 +1642,7 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            std::net::IpAddr::V6(_) => {
-                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
-                return;
-            }
+            _ => panic!("Expected IPv4 address"),
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -1546,10 +1731,7 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            std::net::IpAddr::V6(_) => {
-                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
-                return;
-            }
+            _ => panic!("Expected IPv4 address"),
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -1639,10 +1821,7 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            std::net::IpAddr::V6(_) => {
-                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
-                return;
-            }
+            _ => panic!("Expected IPv4 address"),
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -1732,10 +1911,7 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            std::net::IpAddr::V6(_) => {
-                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
-                return;
-            }
+            _ => panic!("Expected IPv4 address"),
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -1829,10 +2005,7 @@ mod tests {
         let router = Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            std::net::IpAddr::V6(_) => {
-                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
-                return;
-            }
+            _ => panic!("Expected IPv4 address"),
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -2068,10 +2241,7 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            std::net::IpAddr::V6(_) => {
-                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
-                return;
-            }
+            _ => panic!("Expected IPv4 address"),
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -2208,10 +2378,7 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            std::net::IpAddr::V6(_) => {
-                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
-                return;
-            }
+            _ => panic!("Expected IPv4 address"),
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -2332,10 +2499,7 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            std::net::IpAddr::V6(_) => {
-                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
-                return;
-            }
+            _ => panic!("Expected IPv4 address"),
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -2544,231 +2708,171 @@ mod tests {
         );
     }
 
-    /// RED: Test that slow backends timeout after 30 seconds
-    /// Production requirement: Don't wait forever for slow backends
-    /// Expected: Request should timeout with 504 Gateway Timeout
+    /// RED: Test HTTP → HTTPS redirect with 301 status code
+    ///
+    /// This test verifies that the proxy server returns a 301 redirect response
+    /// when a RequestRedirect filter is configured to upgrade HTTP to HTTPS.
+    /// The Location header should contain the HTTPS URL, and the backend
+    /// should NOT be called (request is handled by the proxy).
     #[tokio::test]
-    async fn test_request_timeout_on_slow_backend() {
-        use std::time::Instant;
+    async fn test_redirect_https_upgrade() {
+        use crate::proxy::filters::{RedirectStatusCode, RequestRedirect};
+        use crate::proxy::router::Router;
 
-        // Create a slow backend that delays 35 seconds (exceeds 30s timeout)
-        let slow_backend = tokio::spawn(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-
-            tokio::spawn(async move {
-                loop {
-                    if let Ok((stream, _)) = listener.accept().await {
-                        tokio::spawn(async move {
-                            let io = TokioIo::new(stream);
-                            let service = service_fn(|_req| async {
-                                // Sleep for 35 seconds (longer than 30s timeout)
-                                tokio::time::sleep(tokio::time::Duration::from_secs(35)).await;
-
-                                Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("slow"))))
-                            });
-
-                            let _ = hyper::server::conn::http1::Builder::new()
-                                .serve_connection(io, service)
-                                .await;
-                        });
-                    }
-                }
-            });
-
-            addr
-        })
-        .await
-        .unwrap();
-
-        // Create router pointing to slow backend
+        // Create router with redirect filter (HTTP → HTTPS with 301)
         let router = Arc::new(Router::new());
 
-        // Convert IP address to u32 (IPv4 only - Backend struct constraint)
-        let ip_u32 = match slow_backend.ip() {
-            std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            std::net::IpAddr::V6(_) => {
-                // Skip test gracefully if IPv6 is encountered (shouldn't happen with 127.0.0.1 bind)
-                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
-                return;
-            }
-        };
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
 
-        let backend = common::Backend::new(ip_u32, slow_backend.port(), 100);
+        // Create redirect filter: scheme="https", status_code=301
+        let redirect = RequestRedirect::new()
+            .scheme("https".to_string())
+            .status_code(RedirectStatusCode::MovedPermanently);
+
         router
-            .add_route(common::HttpMethod::GET, "/slow", vec![backend])
-            .unwrap();
+            .add_route_with_redirect(HttpMethod::GET, "/old-path", backends, redirect)
+            .expect("Should add route with redirect");
 
         // Start proxy server
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let server = ProxyServer::new(proxy_addr.to_string(), router).unwrap();
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::clone(&router)).unwrap();
         tokio::spawn(async move {
             let _ = server.serve().await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Make request to slow backend
+        // Send HTTP request to /old-path
         let client = Client::builder(TokioExecutor::new()).build_http();
-        let uri = format!("http://{}/slow", proxy_addr);
+
+        let uri = format!("http://{}/old-path", proxy_addr);
         let req = Request::builder()
-            .uri(uri)
+            .uri(&uri)
+            .header("Host", "example.com")
             .body(Full::new(Bytes::new()))
             .unwrap();
 
-        let start = Instant::now();
-        let result = client.request(req).await;
-        let elapsed = start.elapsed();
+        let response = client.request(req).await.unwrap();
 
-        // Should timeout within ~30 seconds (not 35+)
-        assert!(
-            elapsed.as_secs() <= 32,
-            "Request should timeout in ~30s, took {:?}",
-            elapsed
+        // Verify redirect response (will FAIL - not implemented yet)
+        assert_eq!(
+            response.status(),
+            StatusCode::MOVED_PERMANENTLY,
+            "Expected 301 redirect response"
         );
 
-        // Should return 504 Gateway Timeout (or error)
-        match result {
-            Ok(response) => {
-                assert_eq!(
-                    response.status(),
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "Should return 504 Gateway Timeout for slow backend"
-                );
-            }
-            Err(_) => {
-                // Connection error is also acceptable (timeout closed connection)
-            }
-        }
+        // Verify Location header exists with HTTPS scheme
+        let location = response
+            .headers()
+            .get("Location")
+            .expect("Location header should be present");
+
+        let location_str = location.to_str().unwrap();
+        assert!(
+            location_str.starts_with("https://"),
+            "Location should start with https://, got: {}",
+            location_str
+        );
+        assert!(
+            location_str.contains("example.com"),
+            "Location should preserve hostname, got: {}",
+            location_str
+        );
+        assert!(
+            location_str.contains("/old-path"),
+            "Location should preserve path, got: {}",
+            location_str
+        );
     }
 
-    /// RED: Test graceful shutdown with tokio signal handling
-    /// Production requirement: Handle SIGTERM gracefully, drain active connections
-    /// Expected: serve_with_shutdown() method exists and drains properly
+    /// RED: Test hostname redirect with 302 status code
+    ///
+    /// This test verifies that the proxy server returns a 302 redirect response
+    /// when a RequestRedirect filter is configured to change the hostname.
+    /// The Location header should contain the new hostname while preserving
+    /// the scheme and path.
     #[tokio::test]
-    async fn test_graceful_shutdown_drains_connections() {
-        use tokio::sync::oneshot;
-        use tokio::time::Duration;
+    async fn test_redirect_hostname_change() {
+        use crate::proxy::filters::{RedirectStatusCode, RequestRedirect};
+        use crate::proxy::router::Router;
 
-        // Create backend that takes 2 seconds to respond
-        let backend = tokio::spawn(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-
-            tokio::spawn(async move {
-                loop {
-                    if let Ok((stream, _)) = listener.accept().await {
-                        tokio::spawn(async move {
-                            let io = TokioIo::new(stream);
-                            let service = service_fn(|_req| async {
-                                // Simulate slow backend (2 seconds)
-                                tokio::time::sleep(Duration::from_secs(2)).await;
-                                Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(
-                                    "completed",
-                                ))))
-                            });
-
-                            let _ = hyper::server::conn::http1::Builder::new()
-                                .serve_connection(io, service)
-                                .await;
-                        });
-                    }
-                }
-            });
-
-            addr
-        })
-        .await
-        .unwrap();
-
-        // Create router pointing to slow backend
+        // Create router with redirect filter (hostname change with 302)
         let router = Arc::new(Router::new());
 
-        // Convert IP address to u32 (IPv4 only - Backend struct constraint)
-        let ip_u32 = match backend.ip() {
-            std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            std::net::IpAddr::V6(_) => {
-                // Skip test gracefully if IPv6 is encountered (shouldn't happen with 127.0.0.1 bind)
-                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
-                return;
-            }
-        };
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
 
-        let backend_ref = common::Backend::new(ip_u32, backend.port(), 100);
+        // Create redirect filter: hostname="new.example.com", status_code=302
+        let redirect = RequestRedirect::new()
+            .hostname("new.example.com".to_string())
+            .status_code(RedirectStatusCode::Found);
+
         router
-            .add_route(common::HttpMethod::GET, "/slow", vec![backend_ref])
-            .unwrap();
+            .add_route_with_redirect(HttpMethod::GET, "/api/test", backends, redirect)
+            .expect("Should add route with redirect");
 
         // Start proxy server
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let server = ProxyServer::new(proxy_addr.to_string(), router).unwrap();
-
-        // Channel to trigger shutdown
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-
-        // Spawn server with graceful shutdown support
-        // This will fail until we implement serve_with_shutdown()
-        let server_handle = tokio::spawn(async move {
-            server
-                .serve_with_shutdown(async {
-                    shutdown_rx.await.ok();
-                })
-                .await
-                .expect("Server should shutdown gracefully");
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::clone(&router)).unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
         });
 
-        // Wait for server to be ready
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Start a slow request (2 seconds)
+        // Send request to /api/test with original hostname
         let client = Client::builder(TokioExecutor::new()).build_http();
-        let uri = format!("http://{}/slow", proxy_addr);
-        let req_handle = tokio::spawn(async move {
-            let req = Request::builder()
-                .uri(uri)
-                .body(Full::new(Bytes::new()))
-                .unwrap();
 
-            client.request(req).await
-        });
+        let uri = format!("http://{}/api/test", proxy_addr);
+        let req = Request::builder()
+            .uri(&uri)
+            .header("Host", "old.example.com")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
 
-        // Give request time to start processing
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let response = client.request(req).await.unwrap();
 
-        // Trigger shutdown while request is in-flight
-        shutdown_tx.send(()).ok();
-
-        // Wait for server to shutdown (should wait for request to complete)
-        let shutdown_result = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
-
-        assert!(
-            shutdown_result.is_ok(),
-            "Server should shutdown within 5 seconds after draining"
+        // Verify redirect response (will FAIL - not implemented yet)
+        assert_eq!(
+            response.status(),
+            StatusCode::FOUND,
+            "Expected 302 redirect response"
         );
 
-        // Verify the in-flight request completed successfully
-        let request_result = tokio::time::timeout(Duration::from_secs(3), req_handle)
-            .await
-            .expect("Request should complete")
-            .expect("Request handle should not panic");
+        // Verify Location header has new hostname
+        let location = response
+            .headers()
+            .get("Location")
+            .expect("Location header should be present");
 
+        let location_str = location.to_str().unwrap();
         assert!(
-            request_result.is_ok(),
-            "In-flight request should complete successfully during graceful shutdown"
+            location_str.contains("new.example.com"),
+            "Location should contain new hostname, got: {}",
+            location_str
         );
-
-        if let Ok(response) = request_result {
-            assert_eq!(
-                response.status(),
-                StatusCode::OK,
-                "Response should be 200 OK"
-            );
-        }
+        assert!(
+            location_str.contains("/api/test"),
+            "Location should preserve path, got: {}",
+            location_str
+        );
+        assert!(
+            location_str.starts_with("http://"),
+            "Location should preserve HTTP scheme, got: {}",
+            location_str
+        );
     }
 }

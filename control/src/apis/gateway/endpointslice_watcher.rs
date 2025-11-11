@@ -265,9 +265,9 @@ fn aggregate_backends_for_service(
 
 /// Parse EndpointSlice to Backend list
 ///
-/// **IPv4-only limitation**: Due to eBPF POD-compatible constraints in the `common::Backend`
-/// struct (which stores IP as `u32`), only IPv4 addresses are supported. IPv6 addresses
-/// are logged as warnings and gracefully skipped without panicking.
+/// **IPv4-only limitation**: The `common::Backend` struct currently uses `u32` for IPv4-only
+/// addresses. IPv6 support is not yet implemented. IPv6 addresses are logged as warnings
+/// and gracefully skipped without panicking.
 ///
 /// (Reuse from http_route.rs)
 fn parse_endpointslice_to_backends(
@@ -314,7 +314,7 @@ fn parse_endpointslice_to_backends(
                     // IPv6 addresses contain colons, IPv4 addresses do not
                     if address.contains(':') {
                         warn!(
-                            "IPv6 address {} not supported (Backend struct is IPv4-only for eBPF compatibility), skipping",
+                            "IPv6 address {} not supported (Backend struct uses u32 for IPv4-only), skipping",
                             address
                         );
                     } else {

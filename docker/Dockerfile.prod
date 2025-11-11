@@ -69,8 +69,7 @@ RUN cd cli && cargo build --release
 # ============================================
 FROM ubuntu:22.04
 
-# Install runtime dependencies
-# Minimal packages needed for Gateway controller operation
+# Install runtime dependencies (minimal for Gateway controller)
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \

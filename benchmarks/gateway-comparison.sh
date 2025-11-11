@@ -4,13 +4,10 @@
 
 set -e
 
-# Cleanup function to kill background processes
 cleanup() {
-    echo "Cleaning up background processes..."
     jobs -p | xargs -r kill 2>/dev/null || true
 }
 trap cleanup EXIT
-
 RESULTS_DIR="./benchmark-results"
 mkdir -p "$RESULTS_DIR"
 

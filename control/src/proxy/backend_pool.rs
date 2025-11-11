@@ -629,7 +629,9 @@ mod tests {
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
             std::net::IpAddr::V6(_) => {
-                eprintln!("Test skipped: IPv6 not supported (Backend struct is IPv4-only for eBPF compatibility)");
+                eprintln!(
+                    "Test skipped: IPv6 not supported (Backend struct uses u32 for IPv4-only)"
+                );
                 return;
             }
         };
