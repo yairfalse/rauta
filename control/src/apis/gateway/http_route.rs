@@ -260,9 +260,11 @@ impl HTTPRouteReconciler {
                         indexed_remainders.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
                         // Give one extra slot to top N services (where N = remaining_slots)
-                        for i in 0..remaining_slots.min(indexed_remainders.len()) {
-                            let idx = indexed_remainders[i].0;
-                            slot_allocations[idx].1 += 1;
+                        for (idx, _remainder) in indexed_remainders
+                            .iter()
+                            .take(remaining_slots.min(indexed_remainders.len()))
+                        {
+                            slot_allocations[*idx].1 += 1;
                         }
 
                         // Step 3: Calculate replicas per pod for each service
