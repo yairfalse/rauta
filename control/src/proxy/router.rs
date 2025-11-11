@@ -3,6 +3,7 @@
 //! Supports both exact and prefix matching for K8s Ingress compatibility.
 //! Includes passive health checking (circuit breaker) and connection draining (graceful removal).
 
+use crate::proxy::filters::{RequestHeaderModifier, RequestRedirect, ResponseHeaderModifier};
 use common::{fnv1a_hash, maglev_build_compact_table, maglev_lookup_compact, Backend, HttpMethod};
 use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -84,9 +85,11 @@ struct Route {
     #[allow(dead_code)] // Used in GREEN phase for Feature 3
     query_param_matches: Vec<QueryParamMatch>, // Gateway API query parameter matching (empty = no constraints)
     #[allow(dead_code)] // Used in GREEN phase for Feature 4
-    request_filters: Option<crate::proxy::filters::RequestHeaderModifier>, // Gateway API request header filters
+    request_filters: Option<RequestHeaderModifier>, // Gateway API request header filters
     #[allow(dead_code)] // Used in GREEN phase for Feature 5
-    response_filters: Option<crate::proxy::filters::ResponseHeaderModifier>, // Gateway API response header filters
+    response_filters: Option<ResponseHeaderModifier>, // Gateway API response header filters
+    #[allow(dead_code)] // Used in GREEN phase for Feature 6
+    redirect: Option<RequestRedirect>, // Gateway API redirect filter (Core feature)
 }
 
 /// Route match result (backend + pattern for metrics)
@@ -94,9 +97,11 @@ pub struct RouteMatch {
     pub backend: Backend,
     pub pattern: Arc<str>, // Arc<str> for zero-cost clone on hot path
     #[allow(dead_code)] // Used in server.rs to apply filters during proxying
-    pub request_filters: Option<crate::proxy::filters::RequestHeaderModifier>,
+    pub request_filters: Option<RequestHeaderModifier>,
     #[allow(dead_code)] // Used in server.rs to apply filters after backend response
-    pub response_filters: Option<crate::proxy::filters::ResponseHeaderModifier>,
+    pub response_filters: Option<ResponseHeaderModifier>,
+    #[allow(dead_code)] // Used in server.rs to send redirect response
+    pub redirect: Option<RequestRedirect>,
 }
 
 /// Header match type for Gateway API conformance
@@ -218,6 +223,7 @@ impl Router {
             query_param_matches: Vec::new(), // No query param constraints
             request_filters: None,      // No request header filters
             response_filters: None,     // No response header filters
+            redirect: None,             // No redirect filter
         };
 
         // Update routes HashMap (minimize write lock duration)
@@ -400,6 +406,7 @@ impl Router {
                 pattern: Arc::clone(&route.pattern),
                 request_filters: route.request_filters.clone(),
                 response_filters: route.response_filters.clone(),
+                redirect: route.redirect.clone(),
             });
         }
 
@@ -451,6 +458,7 @@ impl Router {
             query_param_matches: Vec::new(), // No query param constraints
             request_filters: None,           // No request header filters
             response_filters: None,          // No response header filters
+            redirect: None,                  // No redirect filter
         };
 
         // Update routes HashMap
@@ -515,6 +523,7 @@ impl Router {
             query_param_matches: Vec::new(),      // No query param constraints
             request_filters: None,                // No request header filters
             response_filters: None,               // No response header filters
+            redirect: None,                       // No redirect filter
         };
 
         // Update routes HashMap
@@ -579,6 +588,7 @@ impl Router {
             query_param_matches,        // Store query param constraints
             request_filters: None,      // No request header filters
             response_filters: None,     // No response header filters
+            redirect: None,             // No redirect filter
         };
 
         // Update routes HashMap
@@ -643,6 +653,7 @@ impl Router {
             query_param_matches: Vec::new(), // No query param constraints
             request_filters: Some(filters),  // Store filters for server.rs to apply
             response_filters: None,          // No response header filters
+            redirect: None,                  // No redirect filter
         };
 
         // Update routes HashMap
@@ -708,6 +719,73 @@ impl Router {
             query_param_matches: Vec::new(), // No query param constraints
             request_filters: None,           // No request header filters
             response_filters: Some(filters), // Store filters for server.rs to apply after backend response
+            redirect: None,                  // No redirect filter
+        };
+
+        // Update routes HashMap
+        {
+            let mut routes = self.routes.write().unwrap();
+            routes.insert(key, route);
+        }
+
+        // Rebuild matchit router from scratch (since matchit doesn't support updates)
+        let routes = self.routes.read().unwrap();
+        let mut new_prefix_router = matchit::Router::new();
+
+        for (route_key, route) in routes.iter() {
+            let path_str = route.pattern.as_ref();
+
+            // Add exact match route
+            new_prefix_router
+                .insert(path_str.to_string(), *route_key)
+                .map_err(|e| format!("Failed to add route {}: {}", path_str, e))?;
+
+            // Add prefix match route (/{*rest} pattern)
+            let prefix_pattern = if path_str == "/" {
+                "/{*rest}".to_string()
+            } else {
+                format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
+            };
+
+            new_prefix_router
+                .insert(prefix_pattern, *route_key)
+                .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
+        }
+
+        {
+            let mut prefix_router = self.prefix_router.write().unwrap();
+            *prefix_router = new_prefix_router;
+        }
+
+        Ok(())
+    }
+
+    /// Add route with redirect filter (Gateway API HTTPRequestRedirectFilter - Core feature)
+    /// Redirect filters return HTTP 301/302 responses instead of proxying to backend
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn add_route_with_redirect(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        backends: Vec<Backend>,
+        redirect_filter: RequestRedirect,
+    ) -> Result<(), String> {
+        let path_hash = fnv1a_hash(path.as_bytes());
+        let key = RouteKey { method, path_hash };
+
+        // Build Maglev table
+        let maglev_table = maglev_build_compact_table(&backends);
+
+        let route = Route {
+            pattern: Arc::from(path),
+            backends,
+            maglev_table,
+            header_matches: Vec::new(),      // No header constraints
+            method_matches: None,            // No method constraints
+            query_param_matches: Vec::new(), // No query param constraints
+            request_filters: None,           // No request header filters
+            response_filters: None,          // No response header filters
+            redirect: Some(redirect_filter), // Store redirect filter for server.rs to apply
         };
 
         // Update routes HashMap
@@ -825,6 +903,7 @@ impl Router {
                 pattern: Arc::clone(&route.pattern),
                 request_filters: route.request_filters.clone(),
                 response_filters: route.response_filters.clone(),
+                redirect: route.redirect.clone(),
             });
         }
 
@@ -907,6 +986,7 @@ impl Router {
                 pattern: Arc::clone(&route.pattern),
                 request_filters: route.request_filters.clone(),
                 response_filters: route.response_filters.clone(),
+                redirect: route.redirect.clone(),
             });
         }
 
