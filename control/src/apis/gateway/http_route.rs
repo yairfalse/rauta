@@ -231,19 +231,48 @@ impl HTTPRouteReconciler {
                     let mut backends = Vec::new();
 
                     if total_weight > 0 {
-                        // First, calculate target slots for each service
+                        // First, calculate target slots for each service using largest-remainder method
+                        // This ensures slots sum to exactly MAX_MAGLEV_BACKENDS (more fair than simple rounding)
                         let mut service_targets = Vec::new();
+                        let mut slot_allocations = Vec::new();
+
+                        // Step 1: Calculate exact fractional slots and assign floor values
+                        let mut allocated_slots = 0;
                         for (service_backends, weight) in &resolved_services {
+                            let exact_slots = (*weight as f64 / total_weight as f64) * MAX_MAGLEV_BACKENDS as f64;
+                            let floor_slots = exact_slots.floor() as usize;
+                            let remainder = exact_slots - floor_slots as f64;
+
+                            slot_allocations.push((service_backends, floor_slots, remainder));
+                            allocated_slots += floor_slots;
+                        }
+
+                        // Step 2: Distribute remaining slots to services with largest remainders
+                        let remaining_slots = MAX_MAGLEV_BACKENDS - allocated_slots;
+                        let mut indexed_remainders: Vec<(usize, f64)> = slot_allocations
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, (_, _, remainder))| (idx, *remainder))
+                            .collect();
+
+                        // Sort by remainder descending (largest first)
+                        indexed_remainders.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+                        // Give one extra slot to top N services (where N = remaining_slots)
+                        for i in 0..remaining_slots.min(indexed_remainders.len()) {
+                            let idx = indexed_remainders[i].0;
+                            slot_allocations[idx].1 += 1;
+                        }
+
+                        // Step 3: Calculate replicas per pod for each service
+                        for (service_backends, service_slots, _) in slot_allocations {
                             let pods_count = service_backends.len();
-                            let service_slots = ((*weight as f64 / total_weight as f64)
-                                * MAX_MAGLEV_BACKENDS as f64)
-                                .round() as usize;
                             let replicas_per_pod =
                                 (service_slots as f64 / pods_count as f64).ceil().max(1.0) as usize;
 
                             info!(
-                                "  - Service weight {} gets {} slots, {} replicas per pod ({} pods)",
-                                weight, service_slots, replicas_per_pod, pods_count
+                                "  - Service gets {} slots, {} replicas per pod ({} pods)",
+                                service_slots, replicas_per_pod, pods_count
                             );
 
                             service_targets.push((service_backends.clone(), replicas_per_pod));

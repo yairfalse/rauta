@@ -523,34 +523,7 @@ fn apply_request_filters(
     req: &mut Request<hyper::body::Incoming>,
     filters: &RequestHeaderModifier,
 ) -> Result<(), String> {
-    for op in &filters.operations {
-        match op {
-            HeaderModifierOp::Set { name, value } => {
-                // Set replaces existing header or adds new one
-                // Note: hyper's HeaderName/HeaderValue types reject CRLF and other invalid chars
-                let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
-                    .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
-                let header_value = hyper::header::HeaderValue::from_str(value)
-                    .map_err(|e| format!("Invalid header value '{}': {}", value, e))?;
-                req.headers_mut().insert(header_name, header_value);
-            }
-            HeaderModifierOp::Add { name, value } => {
-                // Add appends header (allows multiple values)
-                let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
-                    .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
-                let header_value = hyper::header::HeaderValue::from_str(value)
-                    .map_err(|e| format!("Invalid header value '{}': {}", value, e))?;
-                req.headers_mut().append(header_name, header_value);
-            }
-            HeaderModifierOp::Remove { name } => {
-                // Remove deletes all values for this header
-                let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
-                    .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
-                req.headers_mut().remove(header_name);
-            }
-        }
-    }
-    Ok(())
+    apply_header_filters(req, &filters.operations)
 }
 
 /// Trait for types that provide mutable access to headers
