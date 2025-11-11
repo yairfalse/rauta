@@ -3,7 +3,9 @@
 //! Supports both exact and prefix matching for K8s Ingress compatibility.
 //! Includes passive health checking (circuit breaker) and connection draining (graceful removal).
 
-use crate::proxy::filters::{RequestHeaderModifier, RequestRedirect, ResponseHeaderModifier};
+use crate::proxy::filters::{
+    RequestHeaderModifier, RequestRedirect, ResponseHeaderModifier, Timeout,
+};
 use common::{fnv1a_hash, maglev_build_compact_table, maglev_lookup_compact, Backend, HttpMethod};
 use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -90,6 +92,8 @@ struct Route {
     response_filters: Option<ResponseHeaderModifier>, // Gateway API response header filters
     #[allow(dead_code)] // Used in GREEN phase for Feature 6
     redirect: Option<RequestRedirect>, // Gateway API redirect filter (Core feature)
+    #[allow(dead_code)] // Used in GREEN phase for Feature 7
+    timeout: Option<Timeout>, // Gateway API timeout configuration (Extended feature)
 }
 
 /// Route match result (backend + pattern for metrics)
@@ -102,6 +106,8 @@ pub struct RouteMatch {
     pub response_filters: Option<ResponseHeaderModifier>,
     #[allow(dead_code)] // Used in server.rs to send redirect response
     pub redirect: Option<RequestRedirect>,
+    #[allow(dead_code)] // Used in server.rs to enforce request/backend timeouts
+    pub timeout: Option<Timeout>,
 }
 
 /// Header match type for Gateway API conformance
@@ -224,6 +230,7 @@ impl Router {
             request_filters: None,      // No request header filters
             response_filters: None,     // No response header filters
             redirect: None,             // No redirect filter
+            timeout: None,              // No timeout configuration
         };
 
         // Update routes HashMap (minimize write lock duration)
@@ -407,6 +414,7 @@ impl Router {
                 request_filters: route.request_filters.clone(),
                 response_filters: route.response_filters.clone(),
                 redirect: route.redirect.clone(),
+                timeout: route.timeout.clone(),
             });
         }
 
@@ -459,6 +467,7 @@ impl Router {
             request_filters: None,           // No request header filters
             response_filters: None,          // No response header filters
             redirect: None,                  // No redirect filter
+            timeout: None,                   // No timeout configuration
         };
 
         // Update routes HashMap
@@ -524,6 +533,7 @@ impl Router {
             request_filters: None,                // No request header filters
             response_filters: None,               // No response header filters
             redirect: None,                       // No redirect filter
+            timeout: None,                        // No timeout configuration
         };
 
         // Update routes HashMap
@@ -589,6 +599,7 @@ impl Router {
             request_filters: None,      // No request header filters
             response_filters: None,     // No response header filters
             redirect: None,             // No redirect filter
+            timeout: None,              // No timeout configuration
         };
 
         // Update routes HashMap
@@ -654,6 +665,7 @@ impl Router {
             request_filters: Some(filters),  // Store filters for server.rs to apply
             response_filters: None,          // No response header filters
             redirect: None,                  // No redirect filter
+            timeout: None,                   // No timeout configuration
         };
 
         // Update routes HashMap
@@ -720,6 +732,7 @@ impl Router {
             request_filters: None,           // No request header filters
             response_filters: Some(filters), // Store filters for server.rs to apply after backend response
             redirect: None,                  // No redirect filter
+            timeout: None,                   // No timeout configuration
         };
 
         // Update routes HashMap
@@ -786,6 +799,76 @@ impl Router {
             request_filters: None,           // No request header filters
             response_filters: None,          // No response header filters
             redirect: Some(redirect_filter), // Store redirect filter for server.rs to apply
+            timeout: None,                   // No timeout configuration
+        };
+
+        // Update routes HashMap
+        {
+            let mut routes = self.routes.write().unwrap();
+            routes.insert(key, route);
+        }
+
+        // Rebuild matchit router from scratch (since matchit doesn't support updates)
+        let routes = self.routes.read().unwrap();
+        let mut new_prefix_router = matchit::Router::new();
+
+        for (route_key, route) in routes.iter() {
+            let path_str = route.pattern.as_ref();
+
+            // Add exact match route
+            new_prefix_router
+                .insert(path_str.to_string(), *route_key)
+                .map_err(|e| format!("Failed to add route {}: {}", path_str, e))?;
+
+            // Add prefix match route (/{*rest} pattern)
+            let prefix_pattern = if path_str == "/" {
+                "/{*rest}".to_string()
+            } else {
+                format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
+            };
+
+            new_prefix_router
+                .insert(prefix_pattern, *route_key)
+                .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
+        }
+
+        {
+            let mut prefix_router = self.prefix_router.write().unwrap();
+            *prefix_router = new_prefix_router;
+        }
+
+        Ok(())
+    }
+
+    /// Add route with timeout configuration (Gateway API HTTPRouteTimeouts - Extended feature)
+    ///
+    /// Stores timeout configuration per route. The server layer enforces these timeouts
+    /// during request processing and backend communication.
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn add_route_with_timeout(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        backends: Vec<Backend>,
+        timeout_config: Timeout,
+    ) -> Result<(), String> {
+        let path_hash = fnv1a_hash(path.as_bytes());
+        let key = RouteKey { method, path_hash };
+
+        // Build Maglev table
+        let maglev_table = maglev_build_compact_table(&backends);
+
+        let route = Route {
+            pattern: Arc::from(path),
+            backends,
+            maglev_table,
+            header_matches: Vec::new(),      // No header constraints
+            method_matches: None,            // No method constraints
+            query_param_matches: Vec::new(), // No query param constraints
+            request_filters: None,           // No request header filters
+            response_filters: None,          // No response header filters
+            redirect: None,                  // No redirect filter
+            timeout: Some(timeout_config),   // Store timeout config for server.rs to enforce
         };
 
         // Update routes HashMap
@@ -904,6 +987,7 @@ impl Router {
                 request_filters: route.request_filters.clone(),
                 response_filters: route.response_filters.clone(),
                 redirect: route.redirect.clone(),
+                timeout: route.timeout.clone(),
             });
         }
 
@@ -987,6 +1071,7 @@ impl Router {
                 request_filters: route.request_filters.clone(),
                 response_filters: route.response_filters.clone(),
                 redirect: route.redirect.clone(),
+                timeout: route.timeout.clone(),
             });
         }
 
