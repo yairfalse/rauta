@@ -2493,4 +2493,172 @@ mod tests {
             error_count
         );
     }
+
+    /// RED: Test HTTP → HTTPS redirect with 301 status code
+    ///
+    /// This test verifies that the proxy server returns a 301 redirect response
+    /// when a RequestRedirect filter is configured to upgrade HTTP to HTTPS.
+    /// The Location header should contain the HTTPS URL, and the backend
+    /// should NOT be called (request is handled by the proxy).
+    #[tokio::test]
+    async fn test_redirect_https_upgrade() {
+        use crate::proxy::filters::{RedirectStatusCode, RequestRedirect};
+        use crate::proxy::router::Router;
+
+        // Create router with redirect filter (HTTP → HTTPS with 301)
+        let router = Arc::new(Router::new());
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+
+        // Create redirect filter: scheme="https", status_code=301
+        let redirect = RequestRedirect::new()
+            .scheme("https".to_string())
+            .status_code(RedirectStatusCode::MovedPermanently);
+
+        router
+            .add_route_with_redirect(HttpMethod::GET, "/old-path", backends, redirect)
+            .expect("Should add route with redirect");
+
+        // Start proxy server
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::clone(&router)).unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Send HTTP request to /old-path
+        let client = Client::builder(TokioExecutor::new()).build_http();
+
+        let uri = format!("http://{}/old-path", proxy_addr);
+        let req = Request::builder()
+            .uri(&uri)
+            .header("Host", "example.com")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let response = client.request(req).await.unwrap();
+
+        // Verify redirect response (will FAIL - not implemented yet)
+        assert_eq!(
+            response.status(),
+            StatusCode::MOVED_PERMANENTLY,
+            "Expected 301 redirect response"
+        );
+
+        // Verify Location header exists with HTTPS scheme
+        let location = response
+            .headers()
+            .get("Location")
+            .expect("Location header should be present");
+
+        let location_str = location.to_str().unwrap();
+        assert!(
+            location_str.starts_with("https://"),
+            "Location should start with https://, got: {}",
+            location_str
+        );
+        assert!(
+            location_str.contains("example.com"),
+            "Location should preserve hostname, got: {}",
+            location_str
+        );
+        assert!(
+            location_str.contains("/old-path"),
+            "Location should preserve path, got: {}",
+            location_str
+        );
+    }
+
+    /// RED: Test hostname redirect with 302 status code
+    ///
+    /// This test verifies that the proxy server returns a 302 redirect response
+    /// when a RequestRedirect filter is configured to change the hostname.
+    /// The Location header should contain the new hostname while preserving
+    /// the scheme and path.
+    #[tokio::test]
+    async fn test_redirect_hostname_change() {
+        use crate::proxy::filters::{RedirectStatusCode, RequestRedirect};
+        use crate::proxy::router::Router;
+
+        // Create router with redirect filter (hostname change with 302)
+        let router = Arc::new(Router::new());
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+
+        // Create redirect filter: hostname="new.example.com", status_code=302
+        let redirect = RequestRedirect::new()
+            .hostname("new.example.com".to_string())
+            .status_code(RedirectStatusCode::Found);
+
+        router
+            .add_route_with_redirect(HttpMethod::GET, "/api/test", backends, redirect)
+            .expect("Should add route with redirect");
+
+        // Start proxy server
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::clone(&router)).unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Send request to /api/test with original hostname
+        let client = Client::builder(TokioExecutor::new()).build_http();
+
+        let uri = format!("http://{}/api/test", proxy_addr);
+        let req = Request::builder()
+            .uri(&uri)
+            .header("Host", "old.example.com")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let response = client.request(req).await.unwrap();
+
+        // Verify redirect response (will FAIL - not implemented yet)
+        assert_eq!(
+            response.status(),
+            StatusCode::FOUND,
+            "Expected 302 redirect response"
+        );
+
+        // Verify Location header has new hostname
+        let location = response
+            .headers()
+            .get("Location")
+            .expect("Location header should be present");
+
+        let location_str = location.to_str().unwrap();
+        assert!(
+            location_str.contains("new.example.com"),
+            "Location should contain new hostname, got: {}",
+            location_str
+        );
+        assert!(
+            location_str.contains("/api/test"),
+            "Location should preserve path, got: {}",
+            location_str
+        );
+        assert!(
+            location_str.starts_with("http://"),
+            "Location should preserve HTTP scheme, got: {}",
+            location_str
+        );
+    }
 }
