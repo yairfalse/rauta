@@ -398,6 +398,9 @@ fn is_hop_by_hop_header(name: &str) -> bool {
 
 /// Apply request header filters before forwarding to backend
 /// Gateway API HTTPRouteBackendRequestHeaderModification
+///
+/// Security: HeaderName::from_bytes() and HeaderValue::from_str() validate input and reject
+/// CRLF characters (\r\n), preventing header injection attacks. Invalid headers return errors.
 fn apply_request_filters(
     req: &mut Request<hyper::body::Incoming>,
     filters: &RequestHeaderModifier,
@@ -406,6 +409,7 @@ fn apply_request_filters(
         match op {
             HeaderModifierOp::Set { name, value } => {
                 // Set replaces existing header or adds new one
+                // Note: hyper's HeaderName/HeaderValue types reject CRLF and other invalid chars
                 let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
                     .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
                 let header_value = hyper::header::HeaderValue::from_str(value)
@@ -467,6 +471,16 @@ fn apply_response_filters<B>(
 }
 
 /// Build redirect response (Gateway API HTTPRequestRedirectFilter - Core)
+///
+/// Security Note: Redirect configuration is controlled by cluster operators via Gateway API
+/// HTTPRoute resources. While this function doesn't validate redirect targets against an allowlist,
+/// operators must ensure that redirect filters only point to trusted destinations. Redirects
+/// configured via HTTPRoute are considered intentional by the cluster operator.
+///
+/// For production deployments, operators should:
+/// 1. Use RBAC to restrict who can create/modify HTTPRoutes
+/// 2. Review redirect configurations during deployment
+/// 3. Implement admission webhooks for additional validation if needed
 fn build_redirect_response(
     req: &Request<hyper::body::Incoming>,
     redirect: &RequestRedirect,
@@ -511,7 +525,7 @@ fn build_redirect_response(
         .header("Location", location)
         .body(
             Empty::<Bytes>::new()
-                .map_err(|never| match never {})
+                .map_err(|never| match never {}) // Handle infallible error type
                 .boxed(),
         )
         .unwrap())
