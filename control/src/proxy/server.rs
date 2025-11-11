@@ -1,9 +1,11 @@
 //! HTTP Server - proxies requests to backends
 
 use crate::apis::metrics::CONTROLLER_METRICS_REGISTRY;
-use crate::proxy::filters::{HeaderModifierOp, RequestHeaderModifier, ResponseHeaderModifier};
+use crate::proxy::filters::{
+    HeaderModifierOp, RequestHeaderModifier, RequestRedirect, ResponseHeaderModifier,
+};
 use crate::proxy::router::Router;
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::body::Bytes;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
@@ -462,6 +464,57 @@ fn apply_response_filters<B>(
         }
     }
     Ok(())
+}
+
+/// Build redirect response (Gateway API HTTPRequestRedirectFilter - Core)
+fn build_redirect_response(
+    req: &Request<hyper::body::Incoming>,
+    redirect: &RequestRedirect,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, String> {
+    let uri = req.uri();
+
+    // Extract components with fallbacks
+    let scheme = redirect
+        .scheme
+        .as_deref()
+        .or_else(|| uri.scheme_str())
+        .unwrap_or("http");
+
+    let host = redirect
+        .hostname
+        .as_deref()
+        .or_else(|| uri.host())
+        .or_else(|| req.headers().get("host").and_then(|h| h.to_str().ok()))
+        .ok_or_else(|| "Cannot determine redirect host".to_string())?;
+
+    let port = redirect
+        .port
+        .or_else(|| uri.port_u16())
+        .map(|p| format!(":{}", p))
+        .unwrap_or_default();
+
+    let path = redirect.path.as_deref().unwrap_or_else(|| uri.path());
+
+    // Build Location header
+    let location = format!("{}://{}{}{}", scheme, host, port, path);
+
+    // Map status code
+    use crate::proxy::filters::RedirectStatusCode;
+    let status = match redirect.status_code {
+        RedirectStatusCode::MovedPermanently => StatusCode::MOVED_PERMANENTLY,
+        RedirectStatusCode::Found => StatusCode::FOUND,
+    };
+
+    // Build response
+    Ok(Response::builder()
+        .status(status)
+        .header("Location", location)
+        .body(
+            Empty::<Bytes>::new()
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap())
 }
 
 /// Forward request to backend server
@@ -936,6 +989,38 @@ async fn handle_request(
         Some(route_match) => {
             // Select worker for this request (lock-free round-robin)
             let worker_index = worker_selector.as_ref().map(|selector| selector.select());
+
+            // Check for redirect filter (Gateway API HTTPRequestRedirectFilter - Core)
+            // Redirects return immediately - NEVER forward to backend
+            if let Some(redirect) = &route_match.redirect {
+                match build_redirect_response(&req, redirect) {
+                    Ok(resp) => {
+                        info!(
+                            request_id = %request_id,
+                            status = %resp.status().as_u16(),
+                            location = ?resp.headers().get("Location"),
+                            "Redirect response generated"
+                        );
+                        return Ok(resp);
+                    }
+                    Err(e) => {
+                        error!(
+                            request_id = %request_id,
+                            error = %e,
+                            "Failed to build redirect response"
+                        );
+                        return Ok(Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .header("Content-Type", "text/plain")
+                            .body(
+                                Full::new(Bytes::from(format!("Redirect error: {}", e)))
+                                    .map_err(|never| match never {})
+                                    .boxed(),
+                            )
+                            .unwrap());
+                    }
+                }
+            }
 
             // Apply request header filters if configured (Gateway API HTTPRouteBackendRequestHeaderModification)
             if let Some(filters) = &route_match.request_filters {
