@@ -553,41 +553,66 @@ fn apply_request_filters(
     Ok(())
 }
 
-/// Apply response header filters after receiving response from backend
-/// Gateway API HTTPResponseHeaderModifier
-fn apply_response_filters<B>(
-    resp: &mut Response<B>,
-    filters: &ResponseHeaderModifier,
-) -> Result<(), String> {
-    for op in &filters.operations {
+/// Trait for types that provide mutable access to headers
+trait HasHeadersMut {
+    fn headers_mut(&mut self) -> &mut hyper::header::HeaderMap;
+}
+
+impl<B> HasHeadersMut for hyper::Request<B> {
+    fn headers_mut(&mut self) -> &mut hyper::header::HeaderMap {
+        self.headers_mut()
+    }
+}
+
+impl<B> HasHeadersMut for hyper::Response<B> {
+    fn headers_mut(&mut self) -> &mut hyper::header::HeaderMap {
+        self.headers_mut()
+    }
+}
+
+/// Generic helper to apply header filters
+fn apply_header_filters<T, F>(
+    target: &mut T,
+    filters: &F,
+) -> Result<(), String>
+where
+    T: HasHeadersMut,
+    F: std::ops::Deref<Target = [HeaderModifierOp]>,
+{
+    for op in filters.iter() {
         match op {
             HeaderModifierOp::Set { name, value } => {
-                // Set replaces existing header or adds new one
                 let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
                     .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
                 let header_value = hyper::header::HeaderValue::from_str(value)
                     .map_err(|e| format!("Invalid header value '{}': {}", value, e))?;
-                resp.headers_mut().insert(header_name, header_value);
+                target.headers_mut().insert(header_name, header_value);
             }
             HeaderModifierOp::Add { name, value } => {
-                // Add appends header (allows multiple values)
                 let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
                     .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
                 let header_value = hyper::header::HeaderValue::from_str(value)
                     .map_err(|e| format!("Invalid header value '{}': {}", value, e))?;
-                resp.headers_mut().append(header_name, header_value);
+                target.headers_mut().append(header_name, header_value);
             }
             HeaderModifierOp::Remove { name } => {
-                // Remove deletes all values for this header
                 let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
                     .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
-                resp.headers_mut().remove(header_name);
+                target.headers_mut().remove(header_name);
             }
         }
     }
     Ok(())
 }
 
+/// Apply response header filters after receiving response from backend
+/// Gateway API HTTPResponseHeaderModifier
+fn apply_response_filters<B>(
+    resp: &mut Response<B>,
+    filters: &ResponseHeaderModifier,
+) -> Result<(), String> {
+    apply_header_filters(resp, &filters.operations)
+}
 /// Build redirect response (Gateway API HTTPRequestRedirectFilter - Core)
 ///
 /// Security Note: Redirect configuration is controlled by cluster operators via Gateway API
