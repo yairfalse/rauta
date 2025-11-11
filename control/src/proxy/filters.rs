@@ -5,6 +5,76 @@
 //! - ResponseHeaderModifier: Modify response headers after proxying
 //! - RequestRedirect: Redirect requests (status codes 301, 302)
 
+/// HTTP redirect status code (Gateway API HTTPRequestRedirectFilter)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(dead_code)] // Used in tests during TDD implementation
+pub enum RedirectStatusCode {
+    /// 301 Moved Permanently
+    MovedPermanently = 301,
+    /// 302 Found (default)
+    #[default]
+    Found = 302,
+}
+
+/// Request redirect filter (Gateway API HTTPRequestRedirectFilter - Core feature)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(dead_code)] // Used in tests during TDD implementation
+pub struct RequestRedirect {
+    /// HTTP status code (301 or 302)
+    pub status_code: RedirectStatusCode,
+    /// Scheme to redirect to (e.g., "https")
+    pub scheme: Option<String>,
+    /// Hostname to redirect to (e.g., "new.example.com")
+    pub hostname: Option<String>,
+    /// Port to redirect to (e.g., 443)
+    pub port: Option<u16>,
+    /// Path to redirect to (replaces entire path)
+    pub path: Option<String>,
+}
+
+impl RequestRedirect {
+    /// Create a new redirect filter with default status code (302)
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set status code (301 or 302)
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn status_code(mut self, code: RedirectStatusCode) -> Self {
+        self.status_code = code;
+        self
+    }
+
+    /// Set scheme (e.g., "https")
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn scheme(mut self, scheme: String) -> Self {
+        self.scheme = Some(scheme);
+        self
+    }
+
+    /// Set hostname (e.g., "new.example.com")
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn hostname(mut self, hostname: String) -> Self {
+        self.hostname = Some(hostname);
+        self
+    }
+
+    /// Set port (e.g., 443)
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = Some(port);
+        self
+    }
+
+    /// Set path (replaces entire path)
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn path(mut self, path: String) -> Self {
+        self.path = Some(path);
+        self
+    }
+}
+
 /// Request header modification operation
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // Used in tests during TDD implementation
