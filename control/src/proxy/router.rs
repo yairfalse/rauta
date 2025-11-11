@@ -434,13 +434,14 @@ impl Router {
             let backend = route.backends.get(backend_idx as usize).copied()?;
 
             // Check if backend is healthy (passive health checking)
+            let backend_ipv4 = u32::from(backend.as_ipv4().unwrap());
             let is_healthy = health
-                .get(&backend.ipv4)
+                .get(&backend_ipv4)
                 .map(|h| h.is_healthy())
                 .unwrap_or(true); // Default to healthy if no health data
 
             // Check if backend is draining (connection draining)
-            let is_draining = draining.contains_key(&backend.ipv4);
+            let is_draining = draining.contains_key(&backend_ipv4);
 
             // Skip if unhealthy OR draining
             if !is_healthy || is_draining {
@@ -1010,12 +1011,13 @@ impl Router {
 
             let backend = route.backends.get(backend_idx as usize).copied()?;
 
+            let backend_ipv4 = u32::from(backend.as_ipv4().unwrap());
             let is_healthy = health
-                .get(&backend.ipv4)
+                .get(&backend_ipv4)
                 .map(|h| h.is_healthy())
                 .unwrap_or(true);
 
-            let is_draining = draining.contains_key(&backend.ipv4);
+            let is_draining = draining.contains_key(&backend_ipv4);
 
             if !is_healthy || is_draining {
                 if tried_indices.len() == route.backends.len() {
@@ -1094,12 +1096,13 @@ impl Router {
 
             let backend = route.backends.get(backend_idx as usize).copied()?;
 
+            let backend_ipv4 = u32::from(backend.as_ipv4().unwrap());
             let is_healthy = health
-                .get(&backend.ipv4)
+                .get(&backend_ipv4)
                 .map(|h| h.is_healthy())
                 .unwrap_or(true);
 
-            let is_draining = draining.contains_key(&backend.ipv4);
+            let is_draining = draining.contains_key(&backend_ipv4);
 
             if !is_healthy || is_draining {
                 if tried_indices.len() == route.backends.len() {
@@ -1207,8 +1210,8 @@ mod tests {
 
         // Add a route: GET /api/users -> [10.0.1.1:8080, 10.0.1.2:8080]
         let backends = vec![
-            Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 1)), 8080, 100),
-            Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 2)), 8080, 100),
+            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100),
+            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100),
         ];
 
         router
@@ -1221,7 +1224,7 @@ mod tests {
             .expect("Should find backend");
 
         // Should select one of the two backends
-        let backend_ip = Ipv4Addr::from(route_match.backend.ipv4);
+        let backend_ip = route_match.backend.as_ipv4().unwrap();
         assert!(
             backend_ip == Ipv4Addr::new(10, 0, 1, 1) || backend_ip == Ipv4Addr::new(10, 0, 1, 2)
         );
@@ -1244,11 +1247,7 @@ mod tests {
         let router = Router::new();
 
         // Add route: GET /api/users -> backend (Prefix match)
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100)];
 
         router
             .add_route(HttpMethod::GET, "/api/users", backends)
@@ -1259,7 +1258,7 @@ mod tests {
             .select_backend(HttpMethod::GET, "/api/users", None, None)
             .expect("Exact match should work");
         assert_eq!(
-            Ipv4Addr::from(route_match.backend.ipv4),
+            route_match.backend.as_ipv4().unwrap(),
             Ipv4Addr::new(10, 0, 1, 1)
         );
         assert_eq!(route_match.pattern.as_ref(), "/api/users");
@@ -1269,7 +1268,7 @@ mod tests {
             .select_backend(HttpMethod::GET, "/api/users/123", None, None)
             .expect("Prefix match should work");
         assert_eq!(
-            Ipv4Addr::from(route_match.backend.ipv4),
+            route_match.backend.as_ipv4().unwrap(),
             Ipv4Addr::new(10, 0, 1, 1)
         );
         assert_eq!(
@@ -1283,7 +1282,7 @@ mod tests {
             .select_backend(HttpMethod::GET, "/api/users/123/posts", None, None)
             .expect("Deep prefix match should work");
         assert_eq!(
-            Ipv4Addr::from(route_match.backend.ipv4),
+            route_match.backend.as_ipv4().unwrap(),
             Ipv4Addr::new(10, 0, 1, 1)
         );
         assert_eq!(
@@ -1307,9 +1306,9 @@ mod tests {
 
         // Add route with 3 backends (shared by multiple paths)
         let backends = vec![
-            Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 1)), 8080, 100),
-            Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 2)), 8080, 100),
-            Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 3)), 8080, 100),
+            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100),
+            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100),
+            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 3), 8080, 100),
         ];
 
         // Add 100 different paths with same backends
@@ -1334,7 +1333,7 @@ mod tests {
                 .select_backend(HttpMethod::GET, &path, Some(src_ip), Some(src_port))
                 .expect("Should find backend");
 
-            let ip = Ipv4Addr::from(route_match.backend.ipv4);
+            let ip = route_match.backend.as_ipv4().unwrap();
             *distribution.entry(ip).or_insert(0) += 1;
         }
 
@@ -1357,11 +1356,7 @@ mod tests {
         // Verify Router is idempotent - adding same route twice should succeed
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100)];
 
         // Add route first time
         router
@@ -1378,7 +1373,7 @@ mod tests {
             .select_backend(HttpMethod::GET, "/api/test", None, None)
             .expect("Should find backend after duplicate add");
         assert_eq!(
-            Ipv4Addr::from(route_match.backend.ipv4),
+            route_match.backend.as_ipv4().unwrap(),
             Ipv4Addr::new(10, 0, 1, 1)
         );
     }
@@ -1389,21 +1384,13 @@ mod tests {
         let router = Router::new();
 
         // Add route with first backend
-        let backends_v1 = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
-            8080,
-            100,
-        )];
+        let backends_v1 = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100)];
         router
             .add_route(HttpMethod::GET, "/api/test", backends_v1)
             .expect("First add should succeed");
 
         // Update route with different backend
-        let backends_v2 = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 2)),
-            8080,
-            100,
-        )];
+        let backends_v2 = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100)];
         router
             .add_route(HttpMethod::GET, "/api/test", backends_v2)
             .expect("Update should succeed");
@@ -1413,7 +1400,7 @@ mod tests {
             .select_backend(HttpMethod::GET, "/api/test", None, None)
             .expect("Should find backend after update");
         assert_eq!(
-            Ipv4Addr::from(route_match.backend.ipv4),
+            route_match.backend.as_ipv4().unwrap(),
             Ipv4Addr::new(10, 0, 1, 2),
             "Should use updated backend"
         );
@@ -1426,8 +1413,8 @@ mod tests {
 
         // Add route with 2 backends
         let backends = vec![
-            Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 1)), 8080, 100), // Backend 1
-            Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 2)), 8080, 100), // Backend 2
+            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100), // Backend 1
+            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100), // Backend 2
         ];
 
         router
@@ -1459,7 +1446,7 @@ mod tests {
                 )
                 .expect("Should find backend");
 
-            selected_backends.insert(Ipv4Addr::from(route_match.backend.ipv4));
+            selected_backends.insert(route_match.backend.as_ipv4().unwrap());
         }
 
         // Should ONLY see the healthy backend (10.0.1.2)
@@ -1489,8 +1476,8 @@ mod tests {
 
         // Add route with 2 backends
         let backends = vec![
-            Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 1)), 8080, 100),
-            Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 2)), 8080, 100),
+            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100),
+            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100),
         ];
         router
             .add_route(HttpMethod::GET, "/api/users", backends)
@@ -1511,12 +1498,13 @@ mod tests {
                 .expect("Should find backend");
 
             assert_ne!(
-                route_match.backend.ipv4, backend_to_drain,
+                u32::from(route_match.backend.as_ipv4().unwrap()),
+                backend_to_drain,
                 "New connections should NOT go to draining backend (attempt {})",
                 i
             );
             assert_eq!(
-                Ipv4Addr::from(route_match.backend.ipv4),
+                route_match.backend.as_ipv4().unwrap(),
                 Ipv4Addr::new(10, 0, 1, 2),
                 "Should route to healthy backend only"
             );
@@ -1539,8 +1527,8 @@ mod tests {
         let router = Router::new();
 
         // 90% stable, 10% canary
-        let stable_backend = Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 1)), 8080, 90);
-        let canary_backend = Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 2)), 8080, 10);
+        let stable_backend = Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 90);
+        let canary_backend = Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 10);
 
         let backends = vec![stable_backend, canary_backend];
 
@@ -1558,12 +1546,20 @@ mod tests {
                 .select_backend(HttpMethod::GET, "/api/users", src_ip, src_port)
                 .expect("Should find backend");
 
-            *distribution.entry(route_match.backend.ipv4).or_insert(0) += 1;
+            *distribution
+                .entry(u32::from(route_match.backend.as_ipv4().unwrap()))
+                .or_insert(0) += 1;
         }
 
         // Check distribution matches weights (within 10% variance for 1000 samples)
-        let stable_count = distribution.get(&stable_backend.ipv4).copied().unwrap_or(0);
-        let canary_count = distribution.get(&canary_backend.ipv4).copied().unwrap_or(0);
+        let stable_count = distribution
+            .get(&u32::from(stable_backend.as_ipv4().unwrap()))
+            .copied()
+            .unwrap_or(0);
+        let canary_count = distribution
+            .get(&u32::from(canary_backend.as_ipv4().unwrap()))
+            .copied()
+            .unwrap_or(0);
 
         let stable_pct = (stable_count as f64) / 1000.0;
         let canary_pct = (canary_count as f64) / 1000.0;
@@ -1598,11 +1594,7 @@ mod tests {
         // HTTPRoute spec: headers.type = "Exact" (default)
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100)];
 
         // Add route with header match: X-Version = "v1"
         let header_matches = vec![HeaderMatch {
@@ -1622,7 +1614,7 @@ mod tests {
             .expect("Should match with correct header");
 
         assert_eq!(
-            Ipv4Addr::from(route_match.backend.ipv4),
+            route_match.backend.as_ipv4().unwrap(),
             Ipv4Addr::new(10, 0, 1, 1)
         );
 
@@ -1643,11 +1635,7 @@ mod tests {
         // HTTPRoute spec: headers.type = "RegularExpression"
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 2)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100)];
 
         // Add route with regex header match: X-Version matches "v[0-9]+"
         let header_matches = vec![HeaderMatch {
@@ -1668,7 +1656,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("Should match header {}", version));
 
             assert_eq!(
-                Ipv4Addr::from(route_match.backend.ipv4),
+                route_match.backend.as_ipv4().unwrap(),
                 Ipv4Addr::new(10, 0, 1, 2)
             );
         }
@@ -1690,11 +1678,7 @@ mod tests {
         // HTTPRoute spec: ALL headers must match
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 3)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 3), 8080, 100)];
 
         // Add route with multiple header matches
         let header_matches = vec![
@@ -1721,7 +1705,7 @@ mod tests {
             .expect("Should match with all headers");
 
         assert_eq!(
-            Ipv4Addr::from(route_match.backend.ipv4),
+            route_match.backend.as_ipv4().unwrap(),
             Ipv4Addr::new(10, 0, 1, 3)
         );
 
@@ -1742,11 +1726,7 @@ mod tests {
         // HTTPRoute spec: Header names are case-insensitive (RFC 7230)
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 4)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 4), 8080, 100)];
 
         // Add route with header match: x-version = "v1" (lowercase)
         let header_matches = vec![HeaderMatch {
@@ -1766,7 +1746,7 @@ mod tests {
             .expect("Should match with case-insensitive header name");
 
         assert_eq!(
-            Ipv4Addr::from(route_match.backend.ipv4),
+            route_match.backend.as_ipv4().unwrap(),
             Ipv4Addr::new(10, 0, 1, 4)
         );
     }
@@ -1781,11 +1761,7 @@ mod tests {
         // HTTPRoute spec: matches[].method field
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 2, 1)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 2, 1), 8080, 100)];
 
         // Add route that ONLY matches POST requests
         let method_matches = vec![HttpMethod::POST];
@@ -1798,7 +1774,7 @@ mod tests {
             .select_backend(HttpMethod::POST, "/api/test", None, None)
             .expect("Should match POST request");
         assert_eq!(
-            Ipv4Addr::from(route_match.backend.ipv4),
+            route_match.backend.as_ipv4().unwrap(),
             Ipv4Addr::new(10, 0, 2, 1)
         );
 
@@ -1816,11 +1792,7 @@ mod tests {
         // HTTPRoute spec: can specify multiple methods in matches
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 2, 2)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 2, 2), 8080, 100)];
 
         // Add route that matches GET, POST, PUT
         let method_matches = vec![HttpMethod::GET, HttpMethod::POST, HttpMethod::PUT];
@@ -1834,7 +1806,7 @@ mod tests {
                 .select_backend(*method, "/api/test", None, None)
                 .unwrap_or_else(|| panic!("Should match {:?} request", method));
             assert_eq!(
-                Ipv4Addr::from(route_match.backend.ipv4),
+                route_match.backend.as_ipv4().unwrap(),
                 Ipv4Addr::new(10, 0, 2, 2)
             );
         }
@@ -1853,11 +1825,7 @@ mod tests {
         // HTTPRoute spec: if matches[].method is omitted, match all methods
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 2, 3)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 2, 3), 8080, 100)];
 
         // Add route with NO method constraints (should match all methods)
         router
@@ -1878,7 +1846,7 @@ mod tests {
                 .select_backend(*method, "/api/test", None, None)
                 .unwrap_or_else(|| panic!("Should match {:?} request", method));
             assert_eq!(
-                Ipv4Addr::from(route_match.backend.ipv4),
+                route_match.backend.as_ipv4().unwrap(),
                 Ipv4Addr::new(10, 0, 2, 3),
                 "Route without method constraints should match {:?}",
                 method
@@ -1896,11 +1864,7 @@ mod tests {
         // HTTPRoute spec: queryParams[].type = "Exact" (default)
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 3, 1)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 3, 1), 8080, 100)];
 
         // Add route that ONLY matches requests with ?version=v1
         let query_param_matches = vec![QueryParamMatch {
@@ -1930,7 +1894,7 @@ mod tests {
             .expect("Should match with correct query param");
 
         assert_eq!(
-            Ipv4Addr::from(route_match.backend.ipv4),
+            route_match.backend.as_ipv4().unwrap(),
             Ipv4Addr::new(10, 0, 3, 1)
         );
 
@@ -1955,11 +1919,7 @@ mod tests {
         // HTTPRoute spec: queryParams[].type = "RegularExpression"
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 3, 2)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 3, 2), 8080, 100)];
 
         // Add route with regex: page matches digits only
         let query_param_matches = vec![QueryParamMatch {
@@ -1990,7 +1950,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("Should match page={}", page));
 
             assert_eq!(
-                Ipv4Addr::from(route_match.backend.ipv4),
+                route_match.backend.as_ipv4().unwrap(),
                 Ipv4Addr::new(10, 0, 3, 2)
             );
         }
@@ -2016,11 +1976,7 @@ mod tests {
         // HTTPRoute spec: ALL queryParams must match
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 3, 3)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 3, 3), 8080, 100)];
 
         // Add route requiring BOTH version=v1 AND format=json
         let query_param_matches = vec![
@@ -2057,7 +2013,7 @@ mod tests {
             .expect("Should match with all query params present");
 
         assert_eq!(
-            Ipv4Addr::from(route_match.backend.ipv4),
+            route_match.backend.as_ipv4().unwrap(),
             Ipv4Addr::new(10, 0, 3, 3)
         );
 
@@ -2084,11 +2040,7 @@ mod tests {
 
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100)];
 
         // Create filter that sets X-Custom-Header
         let filter = RequestHeaderModifier::new()
@@ -2122,11 +2074,7 @@ mod tests {
 
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100)];
 
         // Create filter that adds multiple X-Trace-Id headers
         let filter = RequestHeaderModifier::new()
@@ -2161,11 +2109,7 @@ mod tests {
 
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100)];
 
         // Create filter that removes Authorization header
         let filter = RequestHeaderModifier::new().remove("Authorization".to_string());
@@ -2199,11 +2143,7 @@ mod tests {
 
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100)];
 
         // Create filter that sets Server header
         let filter =
@@ -2237,11 +2177,7 @@ mod tests {
 
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100)];
 
         // Create filter that adds CORS headers
         let filter = ResponseHeaderModifier::new()
@@ -2279,11 +2215,7 @@ mod tests {
 
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100)];
 
         // Create filter that removes Server header
         let filter = ResponseHeaderModifier::new().remove("Server".to_string());
@@ -2323,11 +2255,7 @@ mod tests {
         let router = Router::new();
 
         #[allow(dead_code)]
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100)];
 
         // Create redirect filter: HTTP → HTTPS (301 Moved Permanently)
         let redirect = RequestRedirect::new()
@@ -2368,11 +2296,7 @@ mod tests {
         let router = Router::new();
 
         #[allow(dead_code)]
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 2)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100)];
 
         // Create redirect filter: hostname change (302 Found - default)
         let redirect = RequestRedirect::new().hostname("new.example.com".to_string());
@@ -2411,11 +2335,7 @@ mod tests {
         let router = Router::new();
 
         #[allow(dead_code)]
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 3)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 3), 8080, 100)];
 
         // Create redirect filter: complete URL redirect (scheme + hostname + port + path)
         let redirect = RequestRedirect::new()
@@ -2480,11 +2400,7 @@ mod tests {
 
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100)];
 
         // Create timeout config: backend_request = 5s
         let timeout = Timeout::new().backend_request(Duration::from_secs(5));
@@ -2522,11 +2438,7 @@ mod tests {
 
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 2)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100)];
 
         // Create timeout config: request = 30s
         let timeout = Timeout::new().request(Duration::from_secs(30));
@@ -2564,11 +2476,7 @@ mod tests {
 
         let router = Router::new();
 
-        let backends = vec![Backend::new(
-            u32::from(Ipv4Addr::new(10, 0, 1, 3)),
-            8080,
-            100,
-        )];
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 3), 8080, 100)];
 
         // Create timeout config: request = 60s, backend_request = 10s
         // Gateway API spec: backend_request <= request (enforced by server)
