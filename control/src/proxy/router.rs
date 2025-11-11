@@ -2103,4 +2103,161 @@ mod tests {
             "Should have 1 filter operation"
         );
     }
+
+    // =============================================================================
+    // Gateway API RequestRedirect Filter Tests (Core Feature) - RED PHASE
+    // =============================================================================
+    // These tests will NOT compile until add_route_with_redirect() is implemented
+    // and RouteMatch.redirect field is added. This is intentional (TDD RED phase).
+
+    #[tokio::test]
+    async fn test_redirect_filter_https_upgrade() {
+        use crate::proxy::filters::{RedirectStatusCode, RequestRedirect};
+
+        let router = Router::new();
+
+        #[allow(dead_code)]
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+
+        // Create redirect filter: HTTP → HTTPS (301 Moved Permanently)
+        let redirect = RequestRedirect::new()
+            .scheme("https".to_string())
+            .status_code(RedirectStatusCode::MovedPermanently);
+
+        router
+            .add_route_with_redirect(HttpMethod::GET, "/old-path", backends, redirect.clone())
+            .expect("Should add route with redirect filter");
+
+        // Select backend and verify redirect filter is attached
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/old-path", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.redirect.is_some(),
+            "RouteMatch should have redirect filter attached"
+        );
+
+        let redirect_filter = route_match.redirect.unwrap();
+        assert_eq!(
+            redirect_filter.scheme,
+            Some("https".to_string()),
+            "Redirect scheme should be https"
+        );
+        assert_eq!(
+            redirect_filter.status_code,
+            RedirectStatusCode::MovedPermanently,
+            "Status code should be 301"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_redirect_filter_hostname_change() {
+        use crate::proxy::filters::{RedirectStatusCode, RequestRedirect};
+
+        let router = Router::new();
+
+        #[allow(dead_code)]
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 2)),
+            8080,
+            100,
+        )];
+
+        // Create redirect filter: hostname change (302 Found - default)
+        let redirect = RequestRedirect::new().hostname("new.example.com".to_string());
+
+        router
+            .add_route_with_redirect(HttpMethod::GET, "/api/v1", backends, redirect.clone())
+            .expect("Should add route with redirect filter");
+
+        // Select backend and verify redirect filter
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/api/v1", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.redirect.is_some(),
+            "RouteMatch should have redirect filter attached"
+        );
+
+        let redirect_filter = route_match.redirect.unwrap();
+        assert_eq!(
+            redirect_filter.hostname,
+            Some("new.example.com".to_string()),
+            "Redirect hostname should be new.example.com"
+        );
+        assert_eq!(
+            redirect_filter.status_code,
+            RedirectStatusCode::Found,
+            "Status code should be 302 (default)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_redirect_filter_full_url() {
+        use crate::proxy::filters::{RedirectStatusCode, RequestRedirect};
+
+        let router = Router::new();
+
+        #[allow(dead_code)]
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 3)),
+            8080,
+            100,
+        )];
+
+        // Create redirect filter: complete URL redirect (scheme + hostname + port + path)
+        let redirect = RequestRedirect::new()
+            .scheme("https".to_string())
+            .hostname("secure.example.com".to_string())
+            .port(8443)
+            .path("/v2/api".to_string())
+            .status_code(RedirectStatusCode::MovedPermanently);
+
+        router
+            .add_route_with_redirect(HttpMethod::GET, "/legacy", backends, redirect.clone())
+            .expect("Should add route with redirect filter");
+
+        // Select backend and verify redirect filter
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/legacy", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.redirect.is_some(),
+            "RouteMatch should have redirect filter attached"
+        );
+
+        let redirect_filter = route_match.redirect.unwrap();
+        assert_eq!(
+            redirect_filter.scheme,
+            Some("https".to_string()),
+            "Redirect scheme should be https"
+        );
+        assert_eq!(
+            redirect_filter.hostname,
+            Some("secure.example.com".to_string()),
+            "Redirect hostname should be secure.example.com"
+        );
+        assert_eq!(
+            redirect_filter.port,
+            Some(8443),
+            "Redirect port should be 8443"
+        );
+        assert_eq!(
+            redirect_filter.path,
+            Some("/v2/api".to_string()),
+            "Redirect path should be /v2/api"
+        );
+        assert_eq!(
+            redirect_filter.status_code,
+            RedirectStatusCode::MovedPermanently,
+            "Status code should be 301"
+        );
+    }
 }
