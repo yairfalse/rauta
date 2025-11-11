@@ -2340,4 +2340,140 @@ mod tests {
             "Status code should be 301"
         );
     }
+
+    /// Router RED Phase: Timeout Support (Gateway API HTTPRouteTimeouts - Extended)
+    ///
+    /// These tests verify timeout configuration at the router layer.
+    /// The router stores timeout configuration per route and returns it in RouteMatch.
+    /// The server layer will enforce these timeouts during request/backend processing.
+
+    #[tokio::test]
+    async fn test_timeout_backend_request_only() {
+        use crate::proxy::filters::Timeout;
+        use std::time::Duration;
+
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+
+        // Create timeout config: backend_request = 5s
+        let timeout = Timeout::new().backend_request(Duration::from_secs(5));
+
+        router
+            .add_route_with_timeout(HttpMethod::GET, "/api/slow", backends, timeout.clone())
+            .expect("Should add route with timeout config");
+
+        // Select backend and verify timeout config is attached
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/api/slow", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.timeout.is_some(),
+            "RouteMatch should have timeout config attached"
+        );
+
+        let timeout_config = route_match.timeout.unwrap();
+        assert_eq!(
+            timeout_config.backend_request,
+            Some(Duration::from_secs(5)),
+            "Backend request timeout should be 5s"
+        );
+        assert_eq!(
+            timeout_config.request, None,
+            "Overall request timeout should be None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timeout_request_only() {
+        use crate::proxy::filters::Timeout;
+        use std::time::Duration;
+
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 2)),
+            8080,
+            100,
+        )];
+
+        // Create timeout config: request = 30s
+        let timeout = Timeout::new().request(Duration::from_secs(30));
+
+        router
+            .add_route_with_timeout(HttpMethod::POST, "/api/upload", backends, timeout.clone())
+            .expect("Should add route with timeout config");
+
+        // Select backend and verify timeout config
+        let route_match = router
+            .select_backend(HttpMethod::POST, "/api/upload", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.timeout.is_some(),
+            "RouteMatch should have timeout config attached"
+        );
+
+        let timeout_config = route_match.timeout.unwrap();
+        assert_eq!(
+            timeout_config.request,
+            Some(Duration::from_secs(30)),
+            "Overall request timeout should be 30s"
+        );
+        assert_eq!(
+            timeout_config.backend_request, None,
+            "Backend request timeout should be None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timeout_both_request_and_backend() {
+        use crate::proxy::filters::Timeout;
+        use std::time::Duration;
+
+        let router = Router::new();
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 3)),
+            8080,
+            100,
+        )];
+
+        // Create timeout config: request = 60s, backend_request = 10s
+        // Gateway API spec: backend_request <= request (enforced by server)
+        let timeout = Timeout::new()
+            .request(Duration::from_secs(60))
+            .backend_request(Duration::from_secs(10));
+
+        router
+            .add_route_with_timeout(HttpMethod::GET, "/api/data", backends, timeout.clone())
+            .expect("Should add route with timeout config");
+
+        // Select backend and verify timeout config
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/api/data", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.timeout.is_some(),
+            "RouteMatch should have timeout config attached"
+        );
+
+        let timeout_config = route_match.timeout.unwrap();
+        assert_eq!(
+            timeout_config.request,
+            Some(Duration::from_secs(60)),
+            "Overall request timeout should be 60s"
+        );
+        assert_eq!(
+            timeout_config.backend_request,
+            Some(Duration::from_secs(10)),
+            "Backend request timeout should be 10s"
+        );
+    }
 }
