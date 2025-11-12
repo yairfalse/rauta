@@ -634,7 +634,7 @@ mod tests {
             std::net::IpAddr::V4(ipv4) => ipv4,
             std::net::IpAddr::V6(_) => {
                 eprintln!(
-                    "Test skipped: IPv6 not supported (Backend struct uses u32 for IPv4-only)"
+                    "Test skipped: IPv6 not supported (connection pooling is IPv4-only currently)"
                 );
                 return;
             }
