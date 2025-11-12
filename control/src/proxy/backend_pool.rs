@@ -427,21 +427,18 @@ impl Http2Pool {
 
     /// Create new HTTP/2 connection to backend
     async fn create_connection(&mut self) -> Result<Http2Connection, PoolError> {
-        let backend_addr = format!(
-            "{}:{}",
-            ipv4_to_string(u32::from(self.backend.as_ipv4().unwrap())),
-            self.backend.port
-        );
+        // Convert Backend to SocketAddr (supports both IPv4 and IPv6)
+        let socket_addr = self.backend.to_socket_addr();
 
         debug!(
-            backend = %backend_addr,
+            backend = %socket_addr,
             pool_size = self.connections.len(),
             "Creating new HTTP/2 connection"
         );
 
         // Connect TCP with timeout (5 seconds - fail fast on dead backends)
         let connect_timeout = Duration::from_secs(5);
-        let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(&backend_addr))
+        let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(socket_addr))
             .await
             .map_err(|_| {
                 self.record_failure();
@@ -479,13 +476,13 @@ impl Http2Pool {
         self.metrics.connections_created += 1;
 
         // Update Prometheus metrics
-        let backend_label = backend_addr.as_str();
+        let backend_label = socket_addr.to_string();
         let worker_label = self.worker_id.to_string();
         POOL_CONNECTIONS_CREATED
-            .with_label_values(&[backend_label, &worker_label])
+            .with_label_values(&[&backend_label, &worker_label])
             .inc();
         POOL_CONNECTIONS_ACTIVE
-            .with_label_values(&[backend_label, &worker_label])
+            .with_label_values(&[&backend_label, &worker_label])
             .set(self.connections.len() as i64 + 1); // +1 for the new connection
 
         Ok(Http2Connection {
