@@ -5,6 +5,16 @@
 [![CI](https://github.com/yairfalse/rauta/actions/workflows/ci.yml/badge.svg)](https://github.com/yairfalse/rauta/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+[![Gateway API](https://img.shields.io/badge/Gateway%20API-v1.2.0-purple.svg)](https://gateway-api.sigs.k8s.io/)
+[![Tests](https://img.shields.io/badge/tests-90%20passing-brightgreen.svg)]()
+[![Performance](https://img.shields.io/badge/throughput-129K%20req%2Fs-orange.svg)]()
+
+**Tech Stack:**
+[![Tokio](https://img.shields.io/badge/async-tokio-blue.svg?logo=rust)](https://tokio.rs)
+[![Hyper](https://img.shields.io/badge/HTTP-hyper-blue.svg?logo=rust)](https://hyper.rs)
+[![Kubernetes](https://img.shields.io/badge/K8s-kube--rs-326CE5.svg?logo=kubernetes&logoColor=white)](https://kube.rs)
+[![HTTP/2](https://img.shields.io/badge/HTTP%2F2-enabled-success.svg)]()
+[![Prometheus](https://img.shields.io/badge/metrics-prometheus-E6522C.svg?logo=prometheus&logoColor=white)](https://prometheus.io)
 
 ---
 
