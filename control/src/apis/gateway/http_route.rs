@@ -503,11 +503,7 @@ fn parse_endpointslice_to_backends(
         for address in &endpoint.addresses {
             match address.parse::<std::net::Ipv4Addr>() {
                 Ok(ipv4) => {
-                    backends.push(Backend {
-                        ipv4: u32::from(ipv4),
-                        port,
-                        weight: 100, // Default weight
-                    });
+                    backends.push(Backend::from_ipv4(ipv4, port, 100));
                 }
                 Err(e) => {
                     warn!("Failed to parse IP address {}: {}", address, e);
@@ -659,7 +655,7 @@ mod tests {
 
         // Verify first backend
         assert_eq!(
-            std::net::Ipv4Addr::from(backends[0].ipv4),
+            backends[0].as_ipv4().unwrap(),
             "10.0.1.1".parse::<std::net::Ipv4Addr>().unwrap()
         );
         assert_eq!(backends[0].port, 8080);
@@ -667,13 +663,13 @@ mod tests {
 
         // Verify second backend
         assert_eq!(
-            std::net::Ipv4Addr::from(backends[1].ipv4),
+            backends[1].as_ipv4().unwrap(),
             "10.0.1.2".parse::<std::net::Ipv4Addr>().unwrap()
         );
 
         // Verify third backend
         assert_eq!(
-            std::net::Ipv4Addr::from(backends[2].ipv4),
+            backends[2].as_ipv4().unwrap(),
             "10.0.1.3".parse::<std::net::Ipv4Addr>().unwrap()
         );
     }
@@ -748,7 +744,7 @@ mod tests {
         // Verify we got the right IPs (not the not-ready one)
         let ips: Vec<String> = backends
             .iter()
-            .map(|b| std::net::Ipv4Addr::from(b.ipv4).to_string())
+            .map(|b| b.as_ipv4().unwrap().to_string())
             .collect();
         assert!(ips.contains(&"10.0.1.1".to_string()));
         assert!(!ips.contains(&"10.0.1.2".to_string())); // Not ready

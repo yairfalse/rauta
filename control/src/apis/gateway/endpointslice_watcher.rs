@@ -253,8 +253,11 @@ fn aggregate_backends_for_service(
 
             // Deduplicate by IP (a backend might appear in multiple slices)
             for backend in slice_backends {
-                if seen_ips.insert(backend.ipv4) {
-                    backends.push(backend);
+                // Only use IPv4 backends for now (parsing IPv6 endpoints is TODO)
+                if let Some(ipv4) = backend.as_ipv4() {
+                    if seen_ips.insert(u32::from(ipv4)) {
+                        backends.push(backend);
+                    }
                 }
             }
         }
@@ -304,11 +307,7 @@ fn parse_endpointslice_to_backends(
         for address in &endpoint.addresses {
             match address.parse::<std::net::Ipv4Addr>() {
                 Ok(ipv4) => {
-                    backends.push(Backend {
-                        ipv4: u32::from(ipv4),
-                        port,
-                        weight: 100, // Default weight
-                    });
+                    backends.push(Backend::from_ipv4(ipv4, port, 100));
                 }
                 Err(_) => {
                     // IPv6 addresses contain colons, IPv4 addresses do not
@@ -343,8 +342,8 @@ mod tests {
         // Create Router with initial route
         let router = Arc::new(Router::new());
 
-        let initial_backends = vec![Backend::new(
-            u32::from(std::net::Ipv4Addr::new(10, 0, 1, 1)),
+        let initial_backends = vec![Backend::from_ipv4(
+            std::net::Ipv4Addr::new(10, 0, 1, 1),
             8080,
             100,
         )];
@@ -359,7 +358,7 @@ mod tests {
             .expect("Should find initial backend");
 
         assert_eq!(
-            std::net::Ipv4Addr::from(route_match.backend.ipv4),
+            route_match.backend.as_ipv4().unwrap(),
             std::net::Ipv4Addr::new(10, 0, 1, 1),
             "Initial backend should be 10.0.1.1"
         );
@@ -451,7 +450,7 @@ mod tests {
                 )
                 .expect("Should find backend");
 
-            backend_ips.insert(std::net::Ipv4Addr::from(route_match.backend.ipv4));
+            backend_ips.insert(route_match.backend.as_ipv4().unwrap());
         }
 
         // Should see BOTH new backends (10.0.1.2 and 10.0.1.3), NOT the old one (10.0.1.1)
@@ -483,8 +482,8 @@ mod tests {
         // Create Router with initial route
         let router = Arc::new(Router::new());
 
-        let initial_backends = vec![Backend::new(
-            u32::from(std::net::Ipv4Addr::new(10, 0, 1, 1)),
+        let initial_backends = vec![Backend::from_ipv4(
+            std::net::Ipv4Addr::new(10, 0, 1, 1),
             8080,
             100,
         )];
@@ -688,7 +687,7 @@ mod tests {
                 )
                 .expect("Should find backend");
 
-            backend_ips.insert(std::net::Ipv4Addr::from(route_match.backend.ipv4));
+            backend_ips.insert(route_match.backend.as_ipv4().unwrap());
         }
 
         // Must see ALL 5 backends (aggregated from 3 slices)
@@ -793,7 +792,7 @@ mod tests {
             "Should only have IPv4 backend, IPv6 addresses skipped"
         );
         assert_eq!(
-            std::net::Ipv4Addr::from(backends[0].ipv4),
+            backends[0].as_ipv4().unwrap(),
             std::net::Ipv4Addr::new(10, 0, 1, 1),
             "Should have IPv4 backend 10.0.1.1"
         );

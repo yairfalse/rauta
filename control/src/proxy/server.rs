@@ -711,7 +711,7 @@ async fn forward_to_backend(
 
     let backend_uri = format!(
         "http://{}:{}{}",
-        ipv4_to_string(backend.ipv4),
+        ipv4_to_string(backend.ipv4_as_u32()),
         backend.port,
         path_and_query
     );
@@ -731,11 +731,11 @@ async fn forward_to_backend(
     }
 
     // Set Host header to match backend address
-    let backend_host = format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port);
+    let backend_host = format!("{}:{}", ipv4_to_string(backend.ipv4_as_u32()), backend.port);
     backend_req_builder = backend_req_builder.header("Host", backend_host);
 
     // Check protocol cache BEFORE cloning body (optimization: avoid clone on hot path)
-    let backend_key = format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port);
+    let backend_key = format!("{}:{}", ipv4_to_string(backend.ipv4_as_u32()), backend.port);
     let protocol_cached = {
         let cache = protocol_cache.lock().await;
         cache.get(&backend_key).copied()
@@ -800,7 +800,7 @@ async fn forward_to_backend(
     info!(
         request_id = %request_id,
         stage = "backend_request_built",
-        network.peer.address = %ipv4_to_string(backend.ipv4),
+        network.peer.address = %ipv4_to_string(backend.ipv4_as_u32()),
         network.peer.port = backend.port,
         url.full = %backend_uri,
         http.request.method = %method_str,
@@ -891,7 +891,11 @@ async fn forward_to_backend(
                             .uri(&backend_uri)
                             .header(
                                 "Host",
-                                format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port),
+                                format!(
+                                    "{}:{}",
+                                    ipv4_to_string(backend.ipv4_as_u32()),
+                                    backend.port
+                                ),
                             )
                             .body(Full::new(fallback_body))
                             .map_err(|e| format!("Failed to build fallback request: {}", e))?;
@@ -929,7 +933,7 @@ async fn forward_to_backend(
                     request_id = %request_id,
                     error.message = %e,
                     error.type = "backend_connection",
-                    network.peer.address = %ipv4_to_string(backend.ipv4),
+                    network.peer.address = %ipv4_to_string(backend.ipv4_as_u32()),
                     network.peer.port = backend.port,
                     elapsed_us = backend_connect_start.elapsed().as_micros() as u64,
                     "Backend connection failed"
@@ -946,7 +950,7 @@ async fn forward_to_backend(
         request_id = %request_id,
         stage = "backend_response_received",
         http.response.status_code = response_status,
-        network.peer.address = %ipv4_to_string(backend.ipv4),
+        network.peer.address = %ipv4_to_string(backend.ipv4_as_u32()),
         network.peer.port = backend.port,
         elapsed_us = backend_connect_duration.as_micros() as u64,
         "Backend responded"
@@ -973,7 +977,7 @@ async fn forward_to_backend(
         request_id = %request_id,
         stage = "request_complete",
         http.response.status_code = response_status,
-        network.peer.address = %ipv4_to_string(backend.ipv4),
+        network.peer.address = %ipv4_to_string(backend.ipv4_as_u32()),
         network.peer.port = backend.port,
         timing.total_us = total_duration.as_micros() as u64,
         timing.backend_us = backend_connect_duration.as_micros() as u64,
@@ -1173,7 +1177,7 @@ async fn handle_request(
                 request_id = %request_id,
                 stage = "route_matched",
                 route.pattern = %route_match.pattern,
-                network.peer.address = %ipv4_to_string(route_match.backend.ipv4),
+                network.peer.address = %ipv4_to_string(u32::from(route_match.backend.as_ipv4().unwrap())),
                 network.peer.port = route_match.backend.port,
                 worker_index = ?worker_index,
                 "Route matched, forwarding to backend"
@@ -1211,7 +1215,10 @@ async fn handle_request(
                         .observe(duration.as_secs_f64());
 
                     // Record backend health for passive health checking
-                    router.record_backend_response(route_match.backend.ipv4, status_code);
+                    router.record_backend_response(
+                        u32::from(route_match.backend.as_ipv4().unwrap()),
+                        status_code,
+                    );
                 }
                 Err(e) => {
                     HTTP_REQUESTS_TOTAL
@@ -1222,7 +1229,10 @@ async fn handle_request(
                         .observe(duration.as_secs_f64());
 
                     // Record backend health (treat connection errors as 500)
-                    router.record_backend_response(route_match.backend.ipv4, 500);
+                    router.record_backend_response(
+                        u32::from(route_match.backend.as_ipv4().unwrap()),
+                        500,
+                    );
 
                     error!(
                         request_id = %request_id,

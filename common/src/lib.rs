@@ -144,27 +144,153 @@ impl RouteKey {
 
 /// Backend server (IP + port)
 ///
-/// **IPv4-only limitation**: This struct stores IP addresses as `u32` to maintain
-/// POD-compatible (Plain Old Data) constraints required for eBPF map usage.
-/// IPv6 addresses are not supported and will be gracefully skipped during
-/// EndpointSlice parsing with a warning logged.
+/// Supports both IPv4 and IPv6 addresses. IPv4 addresses are stored directly
+/// in the first 4 bytes of the `ip` array.
+///
+/// **Memory Layout**:
+/// - `ip`: 16 bytes (IPv6 address, or IPv4 in first 4 bytes)
+/// - `port`: 2 bytes
+/// - `weight`: 2 bytes
+/// - `is_ipv6`: 1 byte (flag)
+/// - `_pad`: 3 bytes (alignment padding)
+/// - **Total**: 24 bytes
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Backend {
-    /// IPv4 address in network byte order (IPv6 not supported - see struct docs)
-    pub ipv4: u32,
-    /// Port in host byte order (will be converted to network order when used)
+    /// IP address (16 bytes)
+    /// - IPv4: stored in first 4 bytes (network byte order)
+    /// - IPv6: full 16 bytes (network byte order)
+    ip: [u8; 16],
+
+    /// Port in host byte order
     pub port: u16,
-    /// Weight for weighted load balancing (future use)
+
+    /// Weight for weighted load balancing (1-65535)
     pub weight: u16,
+
+    /// True if this is an IPv6 address
+    is_ipv6: bool,
+
+    /// Padding for 8-byte alignment
+    _pad: [u8; 3],
 }
 
 // Safety: Backend is a POD type with no padding or pointers
 unsafe impl Pod for Backend {}
 
 impl Backend {
+    /// Create Backend from IPv4 address
+    pub fn from_ipv4(ipv4: core::net::Ipv4Addr, port: u16, weight: u16) -> Self {
+        let mut ip = [0u8; 16];
+        ip[0..4].copy_from_slice(&ipv4.octets());
+
+        Self {
+            ip,
+            port,
+            weight,
+            is_ipv6: false,
+            _pad: [0; 3],
+        }
+    }
+
+    /// Create Backend from IPv6 address
+    pub fn from_ipv6(ipv6: core::net::Ipv6Addr, port: u16, weight: u16) -> Self {
+        Self {
+            ip: ipv6.octets(),
+            port,
+            weight,
+            is_ipv6: true,
+            _pad: [0; 3],
+        }
+    }
+
+    /// Legacy constructor for compatibility (IPv4 only)
+    ///
+    /// **Deprecated**: Use `from_ipv4` instead for clarity
     pub const fn new(ipv4: u32, port: u16, weight: u16) -> Self {
-        Self { ipv4, port, weight }
+        let bytes = ipv4.to_be_bytes();
+        let mut ip = [0u8; 16];
+        ip[0] = bytes[0];
+        ip[1] = bytes[1];
+        ip[2] = bytes[2];
+        ip[3] = bytes[3];
+
+        Self {
+            ip,
+            port,
+            weight,
+            is_ipv6: false,
+            _pad: [0; 3],
+        }
+    }
+
+    /// Check if this backend uses IPv6
+    pub fn is_ipv6(&self) -> bool {
+        self.is_ipv6
+    }
+
+    /// Get IPv4 address (returns None if this is IPv6)
+    pub fn as_ipv4(&self) -> Option<core::net::Ipv4Addr> {
+        if self.is_ipv6 {
+            return None;
+        }
+
+        Some(core::net::Ipv4Addr::new(
+            self.ip[0], self.ip[1], self.ip[2], self.ip[3],
+        ))
+    }
+
+    /// Get IPv6 address (returns None if this is IPv4)
+    pub fn as_ipv6(&self) -> Option<core::net::Ipv6Addr> {
+        if !self.is_ipv6 {
+            return None;
+        }
+
+        Some(core::net::Ipv6Addr::from(self.ip))
+    }
+
+    /// Get IPv4 address as u32 (for logging and legacy code)
+    ///
+    /// **Panics** if this is an IPv6 backend. Use only in contexts where IPv4 is guaranteed.
+    ///
+    /// **Note**: This helper reduces code duplication from the common pattern:
+    /// `u32::from(backend.as_ipv4().unwrap())`
+    pub fn ipv4_as_u32(&self) -> u32 {
+        u32::from(self.as_ipv4().expect("Backend must be IPv4"))
+    }
+
+    /// Convert IPv4 backend to IPv4-mapped IPv6 address (::ffff:x.x.x.x)
+    pub fn to_ipv4_mapped(&self) -> core::net::Ipv6Addr {
+        if self.is_ipv6 {
+            // Already IPv6, return as-is
+            core::net::Ipv6Addr::from(self.ip)
+        } else {
+            // IPv4 - convert to IPv4-mapped IPv6
+            let ipv4 = self.as_ipv4().unwrap();
+            ipv4.to_ipv6_mapped()
+        }
+    }
+
+    /// Get the raw IP bytes (for Maglev hashing)
+    pub fn ip_bytes(&self) -> &[u8; 16] {
+        &self.ip
+    }
+}
+
+impl core::fmt::Display for Backend {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.is_ipv6 {
+            // IPv6 format: [2001:db8::1]:8080
+            let ipv6 = core::net::Ipv6Addr::from(self.ip);
+            write!(f, "[{}]:{}", ipv6, self.port)
+        } else {
+            // IPv4 format: 192.168.1.100:8080
+            write!(
+                f,
+                "{}.{}.{}.{}:{}",
+                self.ip[0], self.ip[1], self.ip[2], self.ip[3], self.port
+            )
+        }
     }
 }
 
@@ -195,9 +321,11 @@ unsafe impl Pod for BackendList {}
 impl BackendList {
     pub const fn empty() -> Self {
         const ZERO_BACKEND: Backend = Backend {
-            ipv4: 0,
+            ip: [0u8; 16],
             port: 0,
             weight: 0,
+            is_ipv6: false,
+            _pad: [0; 3],
         };
         Self {
             backends: [ZERO_BACKEND; MAX_BACKENDS],
@@ -366,8 +494,13 @@ pub fn maglev_build_table(backends: &[Backend]) -> Vec<Option<u32>> {
 #[cfg(not(target_arch = "bpf"))]
 fn generate_permutation(backend: &Backend, backend_idx: u32) -> Vec<usize> {
     // Generate two hash values for offset and skip
-    // Use backend IP + port as key, backend_idx as additional seed to avoid collisions
-    let key = ((backend.ipv4 as u64) << 16) | (backend.port as u64);
+    // Hash full 16-byte IP + port for both IPv4 and IPv6 support
+    let mut hasher_bytes = [0u8; 18];
+    hasher_bytes[0..16].copy_from_slice(backend.ip_bytes());
+    hasher_bytes[16..18].copy_from_slice(&backend.port.to_be_bytes());
+
+    // Use FNV-1a hash over the full IP+port
+    let key = fnv1a_hash(&hasher_bytes);
 
     let offset = (hash_backend(key, backend_idx as u64) % (MAGLEV_TABLE_SIZE as u64)) as usize;
     let skip =
@@ -491,7 +624,13 @@ pub fn maglev_build_compact_table(backends: &[Backend]) -> Vec<u8> {
 #[cfg(not(target_arch = "bpf"))]
 fn generate_permutation_compact(backend: &Backend, backend_idx: u32) -> Vec<usize> {
     // Generate two hash values for offset and skip
-    let key = ((backend.ipv4 as u64) << 16) | (backend.port as u64);
+    // Hash full 16-byte IP + port for both IPv4 and IPv6 support
+    let mut hasher_bytes = [0u8; 18];
+    hasher_bytes[0..16].copy_from_slice(backend.ip_bytes());
+    hasher_bytes[16..18].copy_from_slice(&backend.port.to_be_bytes());
+
+    // Use FNV-1a hash over the full IP+port
+    let key = fnv1a_hash(&hasher_bytes);
 
     let offset = (hash_backend(key, backend_idx as u64) % (COMPACT_MAGLEV_SIZE as u64)) as usize;
     let skip = ((hash_backend(key, backend_idx as u64 + 1) % (COMPACT_MAGLEV_SIZE as u64 - 1)) + 1)
@@ -523,7 +662,9 @@ pub fn maglev_lookup_compact(flow_key: u64, table: &[u8]) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
+    use alloc::format;
 
     #[test]
     fn test_http_method_from_bytes() {
@@ -550,8 +691,8 @@ mod tests {
 
     #[test]
     fn test_backend_size() {
-        // Ensure Backend is exactly 8 bytes (compact)
-        assert_eq!(core::mem::size_of::<Backend>(), 8);
+        // Backend is 24 bytes after IPv6 support (16 bytes IP + 2 port + 2 weight + 1 is_ipv6 + 3 padding)
+        assert_eq!(core::mem::size_of::<Backend>(), 24);
     }
 
     #[test]
@@ -585,5 +726,147 @@ mod tests {
         metrics.packets_dropped = 5;
 
         assert_eq!(metrics.drop_rate(), 0.005);
+    }
+
+    // ============================================================================
+    // RED: IPv6 Backend Support Tests
+    // These tests will FAIL until Backend struct is updated to support IPv6
+    // ============================================================================
+
+    #[test]
+    fn test_backend_ipv4_construction() {
+        use std::net::Ipv4Addr;
+
+        // RED: This test will fail because Backend::from_ipv4 doesn't exist yet
+        let backend = Backend::from_ipv4(Ipv4Addr::new(192, 168, 1, 100), 8080, 100);
+
+        assert_eq!(backend.port, 8080);
+        assert_eq!(backend.weight, 100);
+        assert!(!backend.is_ipv6());
+
+        // Should be able to convert back to IPv4
+        assert_eq!(backend.as_ipv4().unwrap(), Ipv4Addr::new(192, 168, 1, 100));
+    }
+
+    #[test]
+    fn test_backend_ipv6_construction() {
+        use std::net::Ipv6Addr;
+
+        // RED: This test will fail because Backend::from_ipv6 doesn't exist yet
+        let backend = Backend::from_ipv6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 8080, 100);
+
+        assert_eq!(backend.port, 8080);
+        assert_eq!(backend.weight, 100);
+        assert!(backend.is_ipv6());
+
+        // Should be able to convert back to IPv6
+        assert_eq!(
+            backend.as_ipv6().unwrap(),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)
+        );
+    }
+
+    #[test]
+    fn test_backend_ipv4_mapped_to_ipv6() {
+        use std::net::Ipv4Addr;
+
+        // RED: Test IPv4-mapped IPv6 address (::ffff:192.168.1.100)
+        let ipv4 = Ipv4Addr::new(192, 168, 1, 100);
+        let backend_v4 = Backend::from_ipv4(ipv4, 8080, 100);
+
+        // IPv4 addresses should NOT be treated as IPv6
+        assert!(!backend_v4.is_ipv6());
+
+        // Should be able to convert to IPv4-mapped IPv6
+        let ipv6_mapped = backend_v4.to_ipv4_mapped();
+        assert_eq!(ipv6_mapped, ipv4.to_ipv6_mapped());
+    }
+
+    #[test]
+    fn test_backend_equality_ipv4() {
+        use std::net::Ipv4Addr;
+
+        // RED: Test that two IPv4 backends with same IP are equal
+        let backend1 = Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100);
+        let backend2 = Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100);
+        let backend3 = Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100);
+
+        assert_eq!(backend1, backend2);
+        assert_ne!(backend1, backend3);
+    }
+
+    #[test]
+    fn test_backend_equality_ipv6() {
+        use std::net::Ipv6Addr;
+
+        // RED: Test that two IPv6 backends with same IP are equal
+        let backend1 =
+            Backend::from_ipv6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 8080, 100);
+        let backend2 =
+            Backend::from_ipv6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 8080, 100);
+        let backend3 =
+            Backend::from_ipv6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2), 8080, 100);
+
+        assert_eq!(backend1, backend2);
+        assert_ne!(backend1, backend3);
+    }
+
+    #[test]
+    fn test_backend_hash_consistency() {
+        use std::collections::HashSet;
+        use std::net::Ipv4Addr;
+
+        // RED: Test that Backend can be used in HashSet
+        let mut backends = HashSet::new();
+
+        let backend1 = Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100);
+        let backend2 = Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100);
+        let backend3 = Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100);
+
+        backends.insert(backend1);
+        backends.insert(backend2); // Should not add duplicate
+
+        assert_eq!(backends.len(), 1);
+
+        backends.insert(backend3);
+        assert_eq!(backends.len(), 2);
+    }
+
+    #[test]
+    fn test_backend_size_after_ipv6() {
+        // RED: Backend should be 24 bytes after IPv6 support
+        // Current: 8 bytes (u32 + u16 + u16)
+        // New: 24 bytes ([u8; 16] + u16 + u16 + bool + [u8; 3])
+        assert_eq!(core::mem::size_of::<Backend>(), 24);
+    }
+
+    #[test]
+    fn test_backend_list_size_after_ipv6() {
+        // RED: BackendList size should be updated
+        // 32 backends × 24 bytes = 768 bytes
+        // + 4 bytes (count) + 4 bytes (_pad) = 776 bytes
+        assert_eq!(core::mem::size_of::<BackendList>(), 776);
+    }
+
+    #[test]
+    fn test_backend_display_ipv4() {
+        use std::net::Ipv4Addr;
+
+        // RED: Test Display trait for IPv4 backends
+        let backend = Backend::from_ipv4(Ipv4Addr::new(192, 168, 1, 100), 8080, 100);
+        let display = format!("{}", backend);
+
+        assert_eq!(display, "192.168.1.100:8080");
+    }
+
+    #[test]
+    fn test_backend_display_ipv6() {
+        use std::net::Ipv6Addr;
+
+        // RED: Test Display trait for IPv6 backends
+        let backend = Backend::from_ipv6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 8080, 100);
+        let display = format!("{}", backend);
+
+        assert_eq!(display, "[2001:db8::1]:8080");
     }
 }
