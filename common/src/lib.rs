@@ -249,6 +249,16 @@ impl Backend {
         Some(core::net::Ipv6Addr::from(self.ip))
     }
 
+    /// Get IPv4 address as u32 (for logging and legacy code)
+    ///
+    /// **Panics** if this is an IPv6 backend. Use only in contexts where IPv4 is guaranteed.
+    ///
+    /// **Note**: This helper reduces code duplication from the common pattern:
+    /// `u32::from(backend.as_ipv4().unwrap())`
+    pub fn ipv4_as_u32(&self) -> u32 {
+        u32::from(self.as_ipv4().expect("Backend must be IPv4"))
+    }
+
     /// Convert IPv4 backend to IPv4-mapped IPv6 address (::ffff:x.x.x.x)
     pub fn to_ipv4_mapped(&self) -> core::net::Ipv6Addr {
         if self.is_ipv6 {

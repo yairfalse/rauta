@@ -434,7 +434,7 @@ impl Router {
             let backend = route.backends.get(backend_idx as usize).copied()?;
 
             // Check if backend is healthy (passive health checking)
-            let backend_ipv4 = u32::from(backend.as_ipv4().unwrap());
+            let backend_ipv4 = backend.ipv4_as_u32();
             let is_healthy = health
                 .get(&backend_ipv4)
                 .map(|h| h.is_healthy())
@@ -1011,7 +1011,7 @@ impl Router {
 
             let backend = route.backends.get(backend_idx as usize).copied()?;
 
-            let backend_ipv4 = u32::from(backend.as_ipv4().unwrap());
+            let backend_ipv4 = backend.ipv4_as_u32();
             let is_healthy = health
                 .get(&backend_ipv4)
                 .map(|h| h.is_healthy())
@@ -1096,7 +1096,7 @@ impl Router {
 
             let backend = route.backends.get(backend_idx as usize).copied()?;
 
-            let backend_ipv4 = u32::from(backend.as_ipv4().unwrap());
+            let backend_ipv4 = backend.ipv4_as_u32();
             let is_healthy = health
                 .get(&backend_ipv4)
                 .map(|h| h.is_healthy())

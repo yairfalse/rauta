@@ -106,16 +106,19 @@ pub struct BackendConnectionPools {
 }
 
 /// Backend identifier (IP:port)
+///
+/// Uses full 16-byte IP address to support both IPv4 and IPv6.
+/// IPv4 addresses use only the first 4 bytes (same as Backend struct).
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 struct BackendKey {
-    ipv4: u32,
+    ip: [u8; 16],
     port: u16,
 }
 
 impl From<Backend> for BackendKey {
     fn from(backend: Backend) -> Self {
         Self {
-            ipv4: u32::from(backend.as_ipv4().expect("Backend must be IPv4")),
+            ip: *backend.ip_bytes(),
             port: backend.port,
         }
     }
@@ -234,7 +237,7 @@ impl BackendConnectionPools {
         let worker_id = self.worker_id; // Capture for closure
         self.pools.entry(key).or_insert_with(|| {
             debug!(
-                backend_ip = %ipv4_to_string(u32::from(backend.as_ipv4().unwrap())),
+                backend_ip = %ipv4_to_string(backend.ipv4_as_u32()),
                 backend_port = backend.port,
                 worker_id = worker_id,
                 "Creating new HTTP/2 pool for backend"
@@ -262,11 +265,7 @@ impl Http2Pool {
         let header_table_size = 8192; // RFC 7541 - doubled from default 4096 for proxy use
 
         // Set max_concurrent_streams metric
-        let backend_label = format!(
-            "{}:{}",
-            ipv4_to_string(u32::from(backend.as_ipv4().unwrap())),
-            backend.port
-        );
+        let backend_label = format!("{}:{}", ipv4_to_string(backend.ipv4_as_u32()), backend.port);
         let worker_label = worker_id.to_string();
         POOL_MAX_CONCURRENT_STREAMS
             .with_label_values(&[&backend_label, &worker_label])
@@ -696,11 +695,7 @@ mod tests {
         let pool = pools.get_or_create_pool(backend);
 
         // Initialize gauge to 0
-        let backend_label = format!(
-            "{}:{}",
-            ipv4_to_string(u32::from(backend.as_ipv4().unwrap())),
-            backend.port
-        );
+        let backend_label = format!("{}:{}", ipv4_to_string(backend.ipv4_as_u32()), backend.port);
         let worker_label = pool.worker_id.to_string();
         POOL_CONNECTIONS_ACTIVE
             .with_label_values(&[&backend_label, &worker_label])
