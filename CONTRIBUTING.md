@@ -1,6 +1,6 @@
 # Contributing to RAUTA
 
-Thanks for your interest in contributing! RAUTA is a learning project focused on production-grade eBPF/XDP networking.
+Thanks for your interest in contributing! RAUTA is a learning project focused on building a production-grade Kubernetes Gateway API controller in Rust.
 
 ## Quick Start
 
@@ -86,9 +86,9 @@ Format: `<type>: <description>`
 
 **Examples:**
 ```
-feat: Add HTTP/2 support to XDP parser
-fix: Correct checksum calculation for fragmented packets
-perf: Use SIMD for batch packet processing
+feat: Add HTTP/2 support to proxy server
+fix: Correct Maglev distribution for IPv6 backends
+perf: Optimize connection pool reuse
 docs: Update DEVELOPMENT.md with Linux setup
 ```
 
@@ -124,12 +124,11 @@ How did you test this? (unit tests, integration tests, manual)
 
 ```
 rauta/
-├── common/       # Shared types (Pod-compatible for BPF)
-├── bpf/          # XDP program (kernel space)
-├── control/      # Control plane (userspace)
-├── cli/          # CLI tool (future)
+├── common/       # Shared types (Maglev, HTTP parsing, metrics)
+├── control/      # HTTP proxy + Kubernetes Gateway API controller
 ├── tests/        # Integration tests
-└── docker/       # Docker environment
+├── docker/       # Docker environment
+└── deploy/       # Kubernetes deployment manifests
 ```
 
 ### Where to Contribute
@@ -141,10 +140,10 @@ rauta/
 - Documentation improvements
 
 **Advanced:**
-- Maglev consistent hashing implementation
-- Connection tracking for graceful draining
-- TC-BPF Tier 2 implementation
-- Prometheus metrics exporter
+- HTTP/2 support
+- TLS termination with rustls
+- EndpointSlice dynamic backend resolution
+- WASM plugin system (future)
 
 ## Questions?
 
