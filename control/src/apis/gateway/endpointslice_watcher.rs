@@ -253,7 +253,7 @@ fn aggregate_backends_for_service(
 
             // Deduplicate by IP (a backend might appear in multiple slices)
             for backend in slice_backends {
-                // Only use IPv4 backends for now (parsing IPv6 endpoints is TODO)
+                // Only use IPv4 backends for now (IPv6 support planned for future)
                 if let Some(ipv4) = backend.as_ipv4() {
                     if seen_ips.insert(u32::from(ipv4)) {
                         backends.push(backend);

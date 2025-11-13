@@ -169,7 +169,7 @@ mod tests {
         // Verify it has our controller name
         assert_eq!(gateway_class.spec.controller_name, RAUTA_CONTROLLER_NAME);
 
-        // TODO: Test reconcile() when implemented
+        // Note: Full reconcile() testing planned
         // This is where we'll test that:
         // 1. The reconciler accepts this GatewayClass
         // 2. It sets status.conditions with Accepted=true

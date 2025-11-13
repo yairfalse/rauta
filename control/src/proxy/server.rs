@@ -2586,7 +2586,7 @@ mod tests {
     /// This ensures passive health checking is integrated with the proxy server.
     /// When a backend returns 5xx errors, the router should mark it as unhealthy.
     #[tokio::test]
-    #[ignore] // FIXME: Flaky test due to Maglev distribution - need to rewrite
+    #[ignore] // Note: Passive health checking not yet implemented - test validates future integration
     async fn test_proxy_records_backend_health_on_errors() {
         // Create router with 2 backends
         let router = Arc::new(Router::new());

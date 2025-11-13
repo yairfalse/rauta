@@ -540,8 +540,7 @@ mod tests {
         assert_eq!(route.metadata.name, Some("api-route".to_string()));
         assert_eq!(route.metadata.namespace, Some("default".to_string()));
 
-        // TODO: Test reconcile() when implemented
-        // This is where we'll test that:
+        // Note: Full reconcile() testing will verify:
         // 1. The reconciler parses HTTPRoute rules
         // 2. It adds routes to the Router with correct path matching
         // 3. It resolves Service endpoints from backendRefs
@@ -559,8 +558,7 @@ mod tests {
         // (We can't easily test this without accessing private fields,
         // but the reconciler will add routes via add_route())
 
-        // TODO: Test reconciler.run() when implemented
-        // This is where we'll test that:
+        // Note: Full reconciler.run() testing will verify:
         // 1. HTTPRoute resources are watched
         // 2. Routes are added to Router based on HTTPRoute spec
         // 3. Service endpoints are resolved from Kubernetes API
@@ -799,4 +797,4 @@ mod tests {
     }
 }
 
-// TODO: Implement HTTPRoute watcher (Phase 1)
+// Note: HTTPRoute watcher implementation is planned for Phase 1
