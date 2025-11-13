@@ -5,11 +5,11 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum RautaError {
     #[error("Route configuration error: {0}")]
-    RouteConfigError(String),
+    RouteConfig(String),
 
     #[error("Kubernetes error: {0}")]
-    KubernetesError(String),
+    Kubernetes(String),
 
     #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
+    Io(#[from] std::io::Error),
 }
