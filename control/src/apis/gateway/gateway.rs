@@ -241,7 +241,7 @@ mod tests {
         assert_eq!(listener.port, 80);
         assert_eq!(listener.protocol, "HTTP");
 
-        // Note: Full reconcile() testing will verify:
+        // Note: Full reconcile() testing will verify the following:
         // 1. The reconciler accepts this Gateway
         // 2. It configures the HTTP listener on port 80
         // 3. It sets status.conditions with Accepted=true, Programmed=true
