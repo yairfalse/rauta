@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::time::interval;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// Health check configuration
@@ -104,6 +105,8 @@ pub struct HealthChecker {
     config: HealthCheckConfig,
     /// Backend health state (Backend -> HealthState)
     states: Arc<RwLock<HashMap<Backend, BackendHealthState>>>,
+    /// Cancellation token for graceful shutdown
+    cancel_token: CancellationToken,
 
     // Prometheus metrics (injected, not global)
     backend_health_status: IntGaugeVec,
@@ -183,12 +186,20 @@ impl HealthChecker {
         Self {
             config,
             states: Arc::new(RwLock::new(HashMap::new())),
+            cancel_token: CancellationToken::new(),
             backend_health_status,
             health_check_probes_total,
             health_check_duration,
             health_check_consecutive_failures,
             health_state_transitions_total,
         }
+    }
+
+    /// Stop all health checking tasks gracefully
+    #[allow(dead_code)] // TODO: Remove when health checking is enabled in router
+    pub fn shutdown(&self) {
+        info!("Shutting down health checker");
+        self.cancel_token.cancel();
     }
 
     /// Check if a backend is healthy
@@ -215,6 +226,7 @@ impl HealthChecker {
     pub fn start_checking(&self, backends: Vec<Backend>, route_name: String) {
         let states = self.states.clone();
         let config = self.config.clone();
+        let cancel_token = self.cancel_token.clone();
 
         // Clone metrics for background tasks
         let backend_health_status = self.backend_health_status.clone();
@@ -239,6 +251,7 @@ impl HealthChecker {
             let states_clone = states.clone();
             let config_clone = config.clone();
             let route_name_clone = route_name.clone();
+            let cancel_token_clone = cancel_token.clone();
 
             // Clone metrics for this task
             let backend_health_status_clone = backend_health_status.clone();
@@ -255,6 +268,7 @@ impl HealthChecker {
                         states_clone,
                         config_clone,
                         route_name_clone,
+                        cancel_token_clone,
                         backend_health_status_clone,
                         health_check_probes_total_clone,
                         health_check_duration_clone,
@@ -275,6 +289,7 @@ impl HealthChecker {
         states: Arc<RwLock<HashMap<Backend, BackendHealthState>>>,
         config: HealthCheckConfig,
         route_name: String,
+        cancel_token: CancellationToken,
         backend_health_status: IntGaugeVec,
         health_check_probes_total: CounterVec,
         health_check_duration: HistogramVec,
@@ -291,7 +306,19 @@ impl HealthChecker {
         );
 
         loop {
-            interval_timer.tick().await;
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    info!(
+                        backend = %backend_label,
+                        route = %route_name,
+                        "Health check task cancelled, shutting down"
+                    );
+                    break;
+                }
+                _ = interval_timer.tick() => {
+                    // Continue with health check
+                }
+            }
 
             // Probe backend
             let start = Instant::now();
@@ -494,5 +521,19 @@ mod tests {
         assert_eq!(config.timeout, Duration::from_secs(2));
         assert_eq!(config.unhealthy_threshold, 3);
         assert_eq!(config.healthy_threshold, 2);
+    }
+
+    #[tokio::test]
+    async fn test_health_checker_graceful_shutdown() {
+        // Test that health checker shuts down gracefully when shutdown() is called
+        let registry = Registry::new();
+        let config = HealthCheckConfig::default();
+        let checker = HealthChecker::new(config, &registry);
+
+        // Shutdown should complete without hanging or panicking
+        checker.shutdown();
+
+        // Verify cancellation token is cancelled
+        assert!(checker.cancel_token.is_cancelled());
     }
 }
