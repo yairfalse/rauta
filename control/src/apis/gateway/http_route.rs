@@ -353,13 +353,9 @@ impl HTTPRouteReconciler {
         namespace: &str,
         name: &str,
         accepted: bool,
+        generation: i64,
     ) -> Result<(), kube::Error> {
         let api: Api<HTTPRoute> = Api::namespaced(self.client.clone(), namespace);
-
-        // Get the current HTTPRoute to read its generation
-        let route = api.get(name).await?;
-        let generation = route.metadata.generation.unwrap_or(0);
-
         let status = if accepted {
             json!({
                 "status": {
