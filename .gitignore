@@ -83,3 +83,5 @@ rauta-bpf/.output/
 
 # Documentation (research notes - not for commit)
 docs/
+# But allow ADRs (architectural decision records)
+!docs/adr/

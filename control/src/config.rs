@@ -18,6 +18,10 @@ pub struct ControllerConfig {
     /// Timeout configuration
     #[serde(default)]
     pub timeouts: TimeoutConfig,
+
+    /// Health checking configuration
+    #[serde(default)]
+    pub health_check: HealthCheckConfig,
 }
 
 /// Timeout configuration for reliability
@@ -58,6 +62,62 @@ impl Default for TimeoutConfig {
     }
 }
 
+/// Health check configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HealthCheckConfig {
+    /// Enable active health checking (default: false for safety)
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+
+    /// Probe interval in seconds (default: 5s)
+    #[serde(default = "default_health_check_interval")]
+    pub interval_secs: u64,
+
+    /// Probe timeout in seconds (default: 2s)
+    #[serde(default = "default_health_check_timeout")]
+    pub timeout_secs: u64,
+
+    /// Consecutive failures before marking unhealthy (default: 3)
+    #[serde(default = "default_unhealthy_threshold")]
+    pub unhealthy_threshold: u32,
+
+    /// Consecutive successes before marking healthy (default: 2)
+    #[serde(default = "default_healthy_threshold")]
+    pub healthy_threshold: u32,
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_health_check_interval() -> u64 {
+    5
+}
+
+fn default_health_check_timeout() -> u64 {
+    2
+}
+
+fn default_unhealthy_threshold() -> u32 {
+    3
+}
+
+fn default_healthy_threshold() -> u32 {
+    2
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_false(), // Disabled by default for safety
+            interval_secs: default_health_check_interval(),
+            timeout_secs: default_health_check_timeout(),
+            unhealthy_threshold: default_unhealthy_threshold(),
+            healthy_threshold: default_healthy_threshold(),
+        }
+    }
+}
+
 fn default_controller_name() -> String {
     "rauta.io/gateway-controller".to_string()
 }
@@ -68,6 +128,7 @@ impl Default for ControllerConfig {
             controller_name: default_controller_name(),
             gateway_class_name: Some("rauta".to_string()),
             timeouts: TimeoutConfig::default(),
+            health_check: HealthCheckConfig::default(),
         }
     }
 }
@@ -118,6 +179,33 @@ mod tests {
         assert_eq!(
             config.timeouts.idle_timeout_secs, 90,
             "Idle timeout should be 90s (keep connections alive but not forever)"
+        );
+    }
+
+    #[test]
+    fn test_health_check_defaults() {
+        let config = ControllerConfig::default();
+
+        // Health checking disabled by default for safety
+        assert!(
+            !config.health_check.enabled,
+            "Health checking should be disabled by default"
+        );
+        assert_eq!(
+            config.health_check.interval_secs, 5,
+            "Health check interval should be 5s"
+        );
+        assert_eq!(
+            config.health_check.timeout_secs, 2,
+            "Health check timeout should be 2s"
+        );
+        assert_eq!(
+            config.health_check.unhealthy_threshold, 3,
+            "Unhealthy threshold should be 3"
+        );
+        assert_eq!(
+            config.health_check.healthy_threshold, 2,
+            "Healthy threshold should be 2"
         );
     }
 }

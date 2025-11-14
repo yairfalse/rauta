@@ -259,6 +259,26 @@ impl Backend {
         u32::from(self.as_ipv4().expect("Backend must be IPv4"))
     }
 
+    /// Convert Backend to SocketAddr (for TCP connections)
+    ///
+    /// Returns a proper SocketAddr for both IPv4 and IPv6 backends.
+    /// Use this for TcpStream::connect() calls.
+    pub fn to_socket_addr(&self) -> core::net::SocketAddr {
+        if self.is_ipv6 {
+            core::net::SocketAddr::V6(core::net::SocketAddrV6::new(
+                core::net::Ipv6Addr::from(self.ip),
+                self.port,
+                0, // flowinfo
+                0, // scope_id
+            ))
+        } else {
+            core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
+                self.as_ipv4().unwrap(),
+                self.port,
+            ))
+        }
+    }
+
     /// Convert IPv4 backend to IPv4-mapped IPv6 address (::ffff:x.x.x.x)
     pub fn to_ipv4_mapped(&self) -> core::net::Ipv6Addr {
         if self.is_ipv6 {
@@ -868,5 +888,39 @@ mod tests {
         let display = format!("{}", backend);
 
         assert_eq!(display, "[2001:db8::1]:8080");
+    }
+
+    #[test]
+    fn test_backend_to_socket_addr_ipv4() {
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        // Test converting IPv4 Backend to SocketAddr
+        let backend = Backend::from_ipv4(Ipv4Addr::new(192, 168, 1, 100), 8080, 100);
+        let socket_addr = backend.to_socket_addr();
+
+        match socket_addr {
+            SocketAddr::V4(addr) => {
+                assert_eq!(*addr.ip(), Ipv4Addr::new(192, 168, 1, 100));
+                assert_eq!(addr.port(), 8080);
+            }
+            SocketAddr::V6(_) => panic!("Expected IPv4 SocketAddr"),
+        }
+    }
+
+    #[test]
+    fn test_backend_to_socket_addr_ipv6() {
+        use std::net::{Ipv6Addr, SocketAddr};
+
+        // Test converting IPv6 Backend to SocketAddr
+        let backend = Backend::from_ipv6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 8080, 100);
+        let socket_addr = backend.to_socket_addr();
+
+        match socket_addr {
+            SocketAddr::V6(addr) => {
+                assert_eq!(*addr.ip(), Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+                assert_eq!(addr.port(), 8080);
+            }
+            SocketAddr::V4(_) => panic!("Expected IPv6 SocketAddr"),
+        }
     }
 }
