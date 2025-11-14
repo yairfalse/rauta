@@ -8,6 +8,7 @@
 [![Gateway API](https://img.shields.io/badge/Gateway%20API-v1.2.0-purple.svg)](https://gateway-api.sigs.k8s.io/)
 [![Tests](https://img.shields.io/badge/tests-90%20passing-brightgreen.svg)]()
 [![Performance](https://img.shields.io/badge/throughput-129K%20req%2Fs-orange.svg)]()
+<sub>Note: Badge shows average throughput on 12-core machine; ADR claims are peak per-core/node throughput under ideal conditions.</sub>
 
 **Tech Stack:**
 [![Tokio](https://img.shields.io/badge/async-tokio-blue.svg?logo=rust)](https://tokio.rs)
