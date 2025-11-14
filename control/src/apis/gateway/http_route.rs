@@ -804,7 +804,7 @@ mod tests {
 
     #[test]
     fn test_endpointslice_ipv6_parsing() {
-        // GREEN: Test that IPv6 addresses are parsed correctly in HTTPRoute
+        // Test that IPv6 addresses are parsed correctly in HTTPRoute
         use k8s_openapi::api::discovery::v1::{Endpoint, EndpointPort, EndpointSlice};
 
         // Create EndpointSlice with both IPv4 and IPv6 addresses
