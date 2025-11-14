@@ -2,7 +2,7 @@
 
 **Status**: Accepted
 **Date**: 2025-11-13
-**Authors**: Claude Code
+**Authors**: Jane Doe
 **Related**: [ADR 001](001-hostnetwork-daemonset-architecture.md)
 
 ## Context
