@@ -35,12 +35,21 @@ cd "$GATEWAY_API_DIR/conformance"
 if [ -n "$SPECIFIC_TEST" ]; then
     echo "🎯 Running specific test: $SPECIFIC_TEST"
     go test -v -run "$SPECIFIC_TEST" \
-        -gateway-class="$GATEWAY_CLASS"
+        -gateway-class="$GATEWAY_CLASS" \
+        -organization="RAUTA" \
+        -project="rauta" \
+        -url="https://github.com/yairfalse/rauta" \
+        -version="v0.1.0"
 else
     echo "🎯 Running full conformance suite..."
     go test -v \
         -gateway-class="$GATEWAY_CLASS" \
         -supported-features=Gateway,HTTPRoute \
+        -organization="RAUTA" \
+        -project="rauta" \
+        -url="https://github.com/yairfalse/rauta" \
+        -version="v0.1.0" \
+        -allow-crds-mismatch \
         -report-output="$REPORT_OUTPUT" \
         -timeout=30m
 fi
