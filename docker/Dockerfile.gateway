@@ -6,7 +6,7 @@
 # ============================================
 # Build stage - Compile control plane only
 # ============================================
-FROM rust:latest AS builder
+FROM rust:1.83-bookworm AS builder
 
 # Install minimal build dependencies
 RUN apt-get update && apt-get install -y \
