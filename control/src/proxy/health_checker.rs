@@ -408,13 +408,13 @@ impl HealthChecker {
                 });
 
             health_check_probes_total
-                .with_label_values(&[&backend_label, &probe_result.to_string()])
+                .with_label_values(&[&backend_label, probe_result])
                 .inc();
 
             // Record latency as histogram (ALL probes, not just success)
             let latency_seconds = latency_ms as f64 / 1000.0;
             health_check_duration
-                .with_label_values(&[&backend_label, &probe_result.to_string()])
+                .with_label_values(&[&backend_label, probe_result])
                 .observe(latency_seconds);
 
             let consecutive_failures = {
