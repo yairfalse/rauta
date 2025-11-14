@@ -378,12 +378,12 @@ impl HealthChecker {
             // Record state transition if status changed
             if old_status != new_status {
                 let old_status_str = match old_status {
-                    HealthStatus::Healthy => "healthy".to_string(),
-                    HealthStatus::Unhealthy => "unhealthy".to_string(),
+                    HealthStatus::Healthy => "healthy",
+                    HealthStatus::Unhealthy => "unhealthy",
                 };
                 let new_status_str = match new_status {
-                    HealthStatus::Healthy => "healthy".to_string(),
-                    HealthStatus::Unhealthy => "unhealthy".to_string(),
+                    HealthStatus::Healthy => "healthy",
+                    HealthStatus::Unhealthy => "unhealthy",
                 };
 
                 health_state_transitions_total
