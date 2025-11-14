@@ -130,13 +130,9 @@ impl GatewayReconciler {
         name: &str,
         accepted: bool,
         gateway: &Gateway,
+        generation: i64,
     ) -> Result<(), kube::Error> {
         let api: Api<Gateway> = Api::namespaced(self.client.clone(), namespace);
-
-        // Get the current Gateway to read its generation
-        let gateway_current = api.get(name).await?;
-        let generation = gateway_current.metadata.generation.unwrap_or(0);
-
         // Get node addresses for Gateway status
         let addresses = self.get_node_addresses().await;
 
