@@ -209,7 +209,7 @@ TcpStream::connect(backend).timeout(2s).await
 
 **Future**: HTTP GET (application-aware)
 ```rust
-http_client.get(f"http://{backend}/health").timeout(2s).await
+http_client.get(format!("http://{backend}/health")).timeout(2s).await
 ```
 
 ## Operational Guide
