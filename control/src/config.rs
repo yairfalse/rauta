@@ -118,18 +118,6 @@ impl Default for HealthCheckConfig {
     }
 }
 
-/// API feature flags
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ApiConfig {
-    /// Enable Gateway API support
-    #[serde(default = "default_true")]
-    pub gateway: bool,
-
-    /// Enable Ingress API support
-    #[serde(default = "default_true")]
-    pub ingress: bool,
-}
-
 fn default_controller_name() -> String {
     "rauta.io/gateway-controller".to_string()
 }

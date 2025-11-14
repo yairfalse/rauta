@@ -378,12 +378,12 @@ impl HealthChecker {
             // Record state transition if status changed
             if old_status != new_status {
                 let old_status_str = match old_status {
-                    HealthStatus::Healthy => "healthy",
-                    HealthStatus::Unhealthy => "unhealthy",
+                    HealthStatus::Healthy => "healthy".to_string(),
+                    HealthStatus::Unhealthy => "unhealthy".to_string(),
                 };
                 let new_status_str = match new_status {
-                    HealthStatus::Healthy => "healthy",
-                    HealthStatus::Unhealthy => "unhealthy",
+                    HealthStatus::Healthy => "healthy".to_string(),
+                    HealthStatus::Unhealthy => "unhealthy".to_string(),
                 };
 
                 health_state_transitions_total
@@ -408,13 +408,13 @@ impl HealthChecker {
                 });
 
             health_check_probes_total
-                .with_label_values(&[&backend_label, probe_result])
+                .with_label_values(&[&backend_label, &probe_result.to_string()])
                 .inc();
 
             // Record latency as histogram (ALL probes, not just success)
             let latency_seconds = latency_ms as f64 / 1000.0;
             health_check_duration
-                .with_label_values(&[&backend_label, probe_result])
+                .with_label_values(&[&backend_label, &probe_result.to_string()])
                 .observe(latency_seconds);
 
             let consecutive_failures = {

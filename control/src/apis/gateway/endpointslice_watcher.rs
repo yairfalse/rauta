@@ -714,10 +714,10 @@ mod tests {
         );
     }
 
-    /// Test that IPv6 addresses are parsed correctly
+    /// RED: Test that IPv6 addresses are parsed correctly
     ///
     /// Per Gateway API spec, EndpointSlices can contain IPv6 addresses.
-    /// This test validates that both IPv4 and IPv6 addresses are parsed and included as backends.
+    /// We must parse both IPv4 and IPv6 addresses.
     #[test]
     fn test_ipv6_addresses_parsed() {
         // Test that IPv6 addresses are parsed, not skipped
