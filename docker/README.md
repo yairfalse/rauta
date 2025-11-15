@@ -5,7 +5,7 @@ Quick setup for building and testing RAUTA on any platform (macOS, Windows, Linu
 ## Quick Start
 
 ```bash
-# Build RAUTA (includes BPF compilation)
+# Build RAUTA Gateway (pure Rust userspace proxy)
 ./docker/build.sh
 
 # Run integration tests
@@ -27,7 +27,7 @@ Quick setup for building and testing RAUTA on any platform (macOS, Windows, Linu
 │  │  ┌──────────────┐  ┌──────────────┐  │ │
 │  │  │  Backend     │  │  RAUTA       │  │ │
 │  │  │  10.0.1.10   │  │  10.0.1.5    │  │ │
-│  │  │  :8080       │◄─┤  (XDP LB)    │  │ │
+│  │  │  :8080       │◄─┤  (Gateway)   │  │ │
 │  │  └──────────────┘  └──────────────┘  │ │
 │  │                     ▲                 │ │
 │  │                     │                 │ │
@@ -52,8 +52,7 @@ Quick setup for building and testing RAUTA on any platform (macOS, Windows, Linu
 ### RAUTA (rauta-control)
 - **Image**: rauta:latest (custom build)
 - **IP**: 10.0.1.5
-- **Capabilities**: privileged (for XDP)
-- **Purpose**: XDP load balancer
+- **Purpose**: Gateway API controller (pure Rust userspace proxy)
 
 ### Client (rauta-client)
 - **Image**: williamyeh/wrk
@@ -98,9 +97,8 @@ docker-compose exec client wrk -t12 -c400 -d30s --latency http://10.0.1.10:8080/
 # RAUTA container
 docker-compose exec rauta /bin/bash
 
-# Check BPF maps (if bpftool available)
-docker-compose exec rauta bpftool map show
-docker-compose exec rauta bpftool prog show
+# Check proxy metrics
+docker-compose exec rauta curl http://localhost:9090/metrics
 
 # Client container
 docker-compose exec client /bin/sh
@@ -127,19 +125,16 @@ docker-compose down -v
 
 The Docker build is multi-stage:
 
-### Stage 1: Builder (rust:1.75-bookworm)
-- Installs BPF development tools (clang, llvm, libelf-dev)
-- Installs bpf-linker for eBPF compilation
-- Adds bpfel-unknown-none Rust target
-- Compiles BPF program: `bpf/src/main.rs` → `rauta`
-- Compiles control plane: `control/src/main.rs` → `rauta-control`
-- Compiles CLI: `cli/src/main.rs` → `rautactl`
+### Stage 1: Builder (rust:1.83-bookworm)
+- Installs Rust dependencies (pkg-config, libssl-dev)
+- Compiles control plane: `control/src/main.rs` → `control`
+- Uses cargo dependency caching for faster builds
 
-### Stage 2: Runtime (ubuntu:22.04)
-- Minimal image with runtime dependencies
-- Includes debugging tools: tcpdump, bpftool, wrk
-- Copies built artifacts from builder stage
-- Total size: ~500MB (vs ~3GB for builder)
+### Stage 2: Runtime (ubuntu:24.04)
+- Minimal image with runtime dependencies (ca-certificates, curl)
+- Copies built control plane binary from builder
+- Runs as non-root user (rauta)
+- Total size: ~100MB (vs ~2GB for builder)
 
 ## Troubleshooting
 
@@ -153,17 +148,6 @@ docker system df
 
 # Clean up
 docker system prune -a
-```
-
-### XDP Not Working
-```bash
-# XDP in Docker uses SKB mode (slower than native)
-# This is expected - native mode requires bare metal Linux
-
-# Check XDP mode
-docker-compose exec rauta cat /proc/sys/net/core/xdp_mode
-
-# Expected: 0 (SKB mode)
 ```
 
 ### Cannot Connect to Backend

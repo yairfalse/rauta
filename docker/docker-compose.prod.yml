@@ -15,20 +15,13 @@ services:
       timeout: 3s
       retries: 3
 
-  # RAUTA control plane (XDP load balancer)
+  # RAUTA control plane (Gateway API proxy)
   rauta:
     build:
       context: ..
       dockerfile: docker/Dockerfile.gateway
     container_name: rauta-control
-    privileged: true  # Required for XDP
-    cap_add:
-      - NET_ADMIN
-      - SYS_ADMIN
-      - BPF
     environment:
-      - RAUTA_INTERFACE=eth0
-      - RAUTA_XDP_MODE=skb  # Generic XDP mode for containers
       - RUST_LOG=info
     networks:
       rauta-net:
