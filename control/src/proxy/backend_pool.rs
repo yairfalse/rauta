@@ -763,7 +763,7 @@ mod tests {
 
     /// RED: Test that pool size is increased to 8 connections for higher concurrency
     /// Phase 3: Connection pool size optimization (4 → 8 connections per backend)
-    /// Expected impact: +15-20% throughput by reducing queueing under high load
+    /// Measured impact: +6% throughput (25,543 → 27,076 rps) by reducing queueing under high load
     #[tokio::test]
     async fn test_pool_size_increased_to_8_connections() {
         let backend = Backend::new(u32::from(Ipv4Addr::new(127, 0, 0, 1)), 9001, 100);
