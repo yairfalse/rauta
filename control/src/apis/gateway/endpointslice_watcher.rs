@@ -243,6 +243,7 @@ fn aggregate_backends_for_service(
     target_port: u16,
 ) -> Vec<Backend> {
     let mut backends = Vec::new();
+    // Use Backend's full IP bytes for deduplication (supports both IPv4 and IPv6)
     let mut seen_ips = std::collections::HashSet::new();
 
     // Get all slices for this service
@@ -252,8 +253,9 @@ fn aggregate_backends_for_service(
             let slice_backends = parse_endpointslice_to_backends(endpointslice, target_port);
 
             // Deduplicate by IP (a backend might appear in multiple slices)
+            // Use the full 16-byte IP address for deduplication
             for backend in slice_backends {
-                if seen_ips.insert(backend.ipv4) {
+                if seen_ips.insert(*backend.ip_bytes()) {
                     backends.push(backend);
                 }
             }
@@ -264,6 +266,10 @@ fn aggregate_backends_for_service(
 }
 
 /// Parse EndpointSlice to Backend list
+///
+/// Supports both IPv4 and IPv6 addresses. Backends are created using
+/// `Backend::from_ipv4()` or `Backend::from_ipv6()` depending on the address type.
+///
 /// (Reuse from http_route.rs)
 fn parse_endpointslice_to_backends(
     endpoint_slice: &EndpointSlice,
@@ -295,20 +301,22 @@ fn parse_endpointslice_to_backends(
             continue; // Skip non-ready endpoints
         }
 
-        // Parse IP addresses
+        // Parse IP addresses (both IPv4 and IPv6)
         for address in &endpoint.addresses {
-            match address.parse::<std::net::Ipv4Addr>() {
-                Ok(ipv4) => {
-                    backends.push(Backend {
-                        ipv4: u32::from(ipv4),
-                        port,
-                        weight: 100, // Default weight
-                    });
-                }
-                Err(e) => {
-                    warn!("Failed to parse IP address {}: {}", address, e);
-                }
+            // Try IPv4 first
+            if let Ok(ipv4) = address.parse::<std::net::Ipv4Addr>() {
+                backends.push(Backend::from_ipv4(ipv4, port, 100));
+                continue;
             }
+
+            // Try IPv6
+            if let Ok(ipv6) = address.parse::<std::net::Ipv6Addr>() {
+                backends.push(Backend::from_ipv6(ipv6, port, 100));
+                continue;
+            }
+
+            // Neither IPv4 nor IPv6
+            warn!("Failed to parse IP address {}: invalid format", address);
         }
     }
 
@@ -330,8 +338,8 @@ mod tests {
         // Create Router with initial route
         let router = Arc::new(Router::new());
 
-        let initial_backends = vec![Backend::new(
-            u32::from(std::net::Ipv4Addr::new(10, 0, 1, 1)),
+        let initial_backends = vec![Backend::from_ipv4(
+            std::net::Ipv4Addr::new(10, 0, 1, 1),
             8080,
             100,
         )];
@@ -346,7 +354,7 @@ mod tests {
             .expect("Should find initial backend");
 
         assert_eq!(
-            std::net::Ipv4Addr::from(route_match.backend.ipv4),
+            route_match.backend.as_ipv4().unwrap(),
             std::net::Ipv4Addr::new(10, 0, 1, 1),
             "Initial backend should be 10.0.1.1"
         );
@@ -438,7 +446,7 @@ mod tests {
                 )
                 .expect("Should find backend");
 
-            backend_ips.insert(std::net::Ipv4Addr::from(route_match.backend.ipv4));
+            backend_ips.insert(route_match.backend.as_ipv4().unwrap());
         }
 
         // Should see BOTH new backends (10.0.1.2 and 10.0.1.3), NOT the old one (10.0.1.1)
@@ -470,8 +478,8 @@ mod tests {
         // Create Router with initial route
         let router = Arc::new(Router::new());
 
-        let initial_backends = vec![Backend::new(
-            u32::from(std::net::Ipv4Addr::new(10, 0, 1, 1)),
+        let initial_backends = vec![Backend::from_ipv4(
+            std::net::Ipv4Addr::new(10, 0, 1, 1),
             8080,
             100,
         )];
@@ -675,7 +683,7 @@ mod tests {
                 )
                 .expect("Should find backend");
 
-            backend_ips.insert(std::net::Ipv4Addr::from(route_match.backend.ipv4));
+            backend_ips.insert(route_match.backend.as_ipv4().unwrap());
         }
 
         // Must see ALL 5 backends (aggregated from 3 slices)
@@ -704,5 +712,116 @@ mod tests {
             backend_ips.contains(&std::net::Ipv4Addr::new(10, 0, 1, 6)),
             "Should have backend from slice 3"
         );
+    }
+
+    /// RED: Test that IPv6 addresses are parsed correctly
+    ///
+    /// Per Gateway API spec, EndpointSlices can contain IPv6 addresses.
+    /// We must parse both IPv4 and IPv6 addresses.
+    #[test]
+    fn test_ipv6_addresses_parsed() {
+        // Test that IPv6 addresses are parsed, not skipped
+        use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions};
+
+        let endpoint_slice = EndpointSlice {
+            address_type: "IPv6".to_string(), // Mixed address type
+            endpoints: vec![
+                Endpoint {
+                    addresses: vec!["2001:db8::1".to_string()], // IPv6 address
+                    conditions: Some(EndpointConditions {
+                        ready: Some(true),
+                        serving: None,
+                        terminating: None,
+                    }),
+                    deprecated_topology: None,
+                    hints: None,
+                    hostname: None,
+                    node_name: None,
+                    target_ref: None,
+                    zone: None,
+                },
+                Endpoint {
+                    addresses: vec!["10.0.1.1".to_string()], // IPv4 address (valid)
+                    conditions: Some(EndpointConditions {
+                        ready: Some(true),
+                        serving: None,
+                        terminating: None,
+                    }),
+                    deprecated_topology: None,
+                    hints: None,
+                    hostname: None,
+                    node_name: None,
+                    target_ref: None,
+                    zone: None,
+                },
+                Endpoint {
+                    addresses: vec!["::1".to_string()], // IPv6 localhost
+                    conditions: Some(EndpointConditions {
+                        ready: Some(true),
+                        serving: None,
+                        terminating: None,
+                    }),
+                    deprecated_topology: None,
+                    hints: None,
+                    hostname: None,
+                    node_name: None,
+                    target_ref: None,
+                    zone: None,
+                },
+            ],
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some("test-slice".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            ports: Some(vec![k8s_openapi::api::discovery::v1::EndpointPort {
+                app_protocol: None,
+                name: Some("http".to_string()),
+                port: Some(8080),
+                protocol: Some("TCP".to_string()),
+            }]),
+        };
+
+        // Parse backends - should get ALL addresses (IPv4 AND IPv6)
+        let backends = parse_endpointslice_to_backends(&endpoint_slice, 8080);
+
+        // Should have exactly 3 backends: 2 IPv6 + 1 IPv4
+        assert_eq!(
+            backends.len(),
+            3,
+            "Should have all backends (IPv4 and IPv6)"
+        );
+
+        // Find backends by address type
+        let ipv4_backends: Vec<&Backend> = backends.iter().filter(|b| !b.is_ipv6()).collect();
+        let ipv6_backends: Vec<&Backend> = backends.iter().filter(|b| b.is_ipv6()).collect();
+
+        // Should have 1 IPv4 backend
+        assert_eq!(ipv4_backends.len(), 1, "Should have 1 IPv4 backend");
+        assert_eq!(
+            ipv4_backends[0].as_ipv4().unwrap(),
+            std::net::Ipv4Addr::new(10, 0, 1, 1),
+            "Should have IPv4 backend 10.0.1.1"
+        );
+
+        // Should have 2 IPv6 backends
+        assert_eq!(ipv6_backends.len(), 2, "Should have 2 IPv6 backends");
+
+        let ipv6_addrs: Vec<std::net::Ipv6Addr> =
+            ipv6_backends.iter().map(|b| b.as_ipv6().unwrap()).collect();
+
+        assert!(
+            ipv6_addrs.contains(&"2001:db8::1".parse().unwrap()),
+            "Should have IPv6 backend 2001:db8::1"
+        );
+        assert!(
+            ipv6_addrs.contains(&"::1".parse().unwrap()),
+            "Should have IPv6 backend ::1"
+        );
+
+        // All backends should have correct port
+        for backend in &backends {
+            assert_eq!(backend.port, 8080, "All backends should have port 8080");
+        }
     }
 }

@@ -1,27 +1,29 @@
 # Building RAUTA
 
-RAUTA requires Linux to build because eBPF is Linux-only. This guide covers building on **macOS** (using Docker) and **Linux** (native).
+RAUTA is a pure Rust userspace HTTP proxy. This guide covers building on **macOS**, **Linux**, and **Windows**.
 
 ## 🚨 Important: Platform Requirements
 
-- **eBPF/XDP**: Linux kernel only (no macOS/Windows support)
-- **Aya library**: Uses Linux-specific syscalls (`SYS_bpf`, netlink)
-- **Development**: Write code on any OS, build in Linux (Docker/CI)
+- **Pure Rust**: Works on Linux, macOS, and Windows
+- **Development**: Write and build on any OS
+- **Runtime**: Deploy on Linux (Kubernetes target platform)
 
-## Quick Start (macOS with Docker) ⚡
+## Quick Start ⚡
 
-### Option 1: Quick Build Test (Fastest)
+### Option 1: Direct Build (All Platforms)
 ```bash
-# Build everything in Docker (5-10 minutes first time)
-cd docker
-./build-quick.sh
+# Build everything (common + control)
+cargo build --release
+
+# Run tests
+cargo test
 ```
 
-### Option 2: Full Docker Image
+### Option 2: Docker Build
 ```bash
-# Build production Docker image with all components
+# Build in Docker (ensures Linux target)
 cd docker
-./build.sh
+./build-quick.sh
 ```
 
 ### Option 3: GitHub Actions (Zero Setup)
@@ -35,10 +37,10 @@ git push
 
 ## Build Components
 
-RAUTA has 3 build targets:
+RAUTA has 2 build targets:
 
 ### 1. Common Library (Rust, no_std)
-Shared types between eBPF and userspace.
+Shared types and utilities (Maglev, HTTP parsing, etc).
 
 ```bash
 cd common
@@ -48,54 +50,35 @@ cargo test
 
 **Platforms**: ✅ Linux, ✅ macOS, ✅ Windows
 
-### 2. BPF Program (Rust → eBPF bytecode)
-XDP program that runs in the Linux kernel.
-
-```bash
-cd bpf
-cargo +nightly build \
-  --release \
-  --target=bpfel-unknown-none \
-  -Z build-std=core
-```
-
-**Requirements**:
-- Rust nightly
-- `bpf-linker` (`cargo install bpf-linker`)
-- LLVM/Clang
-- Linux (or Docker on macOS)
-
-**Platforms**: ✅ Linux, 🐳 macOS (Docker only)
-
-### 3. Control Plane (Rust, userspace)
-Loads BPF program and manages routes.
+### 2. Control Plane (Rust, userspace)
+HTTP proxy and Kubernetes Gateway API controller.
 
 ```bash
 cd control
 cargo build --release
+cargo test
 ```
 
 **Requirements**:
-- Aya 0.13 (stable)
-- Linux headers
+- Rust stable (1.75+)
+- tokio, hyper, kube-rs
 
-**Platforms**: ✅ Linux, ❌ macOS (Aya uses Linux syscalls)
+**Platforms**: ✅ Linux, ✅ macOS, ✅ Windows
 
 ## Development Workflow
 
-### On macOS (Recommended)
+### On Any Platform (Recommended)
 
 ```bash
 # 1. Write code in your editor
 vim common/src/lib.rs
-vim bpf/src/main.rs
 vim control/src/main.rs
 
-# 2. Run tests locally (common library only)
-cd common && cargo test
+# 2. Run tests locally
+cargo test
 
-# 3. Build in Docker when ready
-cd docker && ./build-quick.sh
+# 3. Build release binary
+cargo build --release
 
 # 4. Or just push and let CI build
 git add -A
@@ -103,23 +86,18 @@ git commit -m "feat: Add new feature"
 git push  # CI builds automatically
 ```
 
-### On Linux (Native)
+### On Linux (Native Kubernetes Development)
 
 ```bash
-# Install dependencies
-sudo apt-get install -y \
-  clang llvm libelf-dev \
-  linux-headers-$(uname -r) \
-  pkg-config build-essential
-
-# Install bpf-linker
-cargo install bpf-linker
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Build everything
-cargo build --release                           # Common
-cd bpf && cargo +nightly build --release \
-  --target=bpfel-unknown-none -Z build-std=core # BPF
-cd ../control && cargo build --release          # Control
+cargo build --release
+
+# Run in kind cluster
+kind create cluster --name rauta-dev
+kubectl apply -f deploy/
 ```
 
 ## Continuous Integration (GitHub Actions)
@@ -131,12 +109,9 @@ Every push to `main`, `dev`, or `feat/*` branches triggers:
 - `cargo clippy` (lints)
 - `cargo test` (unit tests)
 
-### ✅ Build BPF (5 minutes)
-- Compiles BPF program for kernel
-- Uploads artifact for testing
-
-### ✅ Build Control Plane (3 minutes)
-- Compiles userspace control plane
+### ✅ Build Release (3 minutes)
+- Compiles optimized release binary
+- Runs integration tests
 - Uploads binary artifact
 
 ### ✅ Security Audit
@@ -149,56 +124,64 @@ Every push to `main`, `dev`, or `feat/*` branches triggers:
 ### Development Image (Full Toolchain)
 ```dockerfile
 FROM rust:1.75-bookworm
-# Includes: Rust, bpf-linker, LLVM, kernel headers
+# Includes: Rust stable, build tools
 ```
 
 **Use case**: Building and testing RAUTA
 
 ### Runtime Image (Minimal)
 ```dockerfile
-FROM ubuntu:22.04
-# Includes: Only runtime dependencies (iproute2, bpftool)
+FROM debian:bookworm-slim
+# Includes: Only runtime dependencies
 ```
 
 **Use case**: Deploying RAUTA in Kubernetes
 
 ## Troubleshooting
 
-### "cannot find `SYS_bpf` in crate `libc`" (macOS)
+### "failed to compile OpenSSL"
 
-**Cause**: Aya uses Linux-specific syscalls
+**Cause**: Missing OpenSSL development libraries (needed for kube-rs TLS)
 
-**Fix**: Use Docker
+**Fix**: Install OpenSSL dev package
 ```bash
-cd docker && ./build-quick.sh
+# Ubuntu/Debian
+sudo apt-get install -y pkg-config libssl-dev
+
+# macOS
+brew install openssl pkg-config
+
+# Set PKG_CONFIG_PATH if needed
+export PKG_CONFIG_PATH="/opt/homebrew/opt/openssl/lib/pkgconfig"
 ```
 
-### "unable to find LLVM shared lib" (macOS)
+### "linker `cc` not found"
 
-**Cause**: bpf-linker can't find LLVM on macOS
+**Cause**: Missing C compiler (needed for some dependencies)
 
-**Fix**: Set LLVM path or use Docker
+**Fix**: Install build tools
 ```bash
-# Option 1: Set LLVM path
-export LLVM_SYS_PREFIX="/opt/homebrew/opt/llvm"
+# Ubuntu/Debian
+sudo apt-get install -y build-essential
 
-# Option 2: Use Docker (easier)
-cd docker && ./build-quick.sh
+# macOS
+xcode-select --install
+
+# Windows
+# Install Visual Studio Build Tools
 ```
 
-### "could not read `target/bpfel-unknown-none/release/rauta`"
+### Tests fail with "address already in use"
 
-**Cause**: BPF binary not built yet
+**Cause**: Another test or process is using test ports
 
-**Fix**: Build BPF first, then control plane
+**Fix**: Run tests serially or kill conflicting processes
 ```bash
-# In Docker
-cd docker && ./build-quick.sh
+# Run tests one at a time
+cargo test -- --test-threads=1
 
-# Or manually
-cd bpf && cargo +nightly build --release \
-  --target=bpfel-unknown-none -Z build-std=core
-cd ../control && cargo build --release
+# Or kill processes on test ports
+lsof -ti:8080,9090 | xargs kill -9
 ```
 
 ## Build Artifacts
@@ -207,23 +190,39 @@ After successful build:
 
 ```
 target/
-├── bpfel-unknown-none/release/
-│   └── rauta                      # eBPF binary (kernel)
 ├── release/
-│   └── control                    # Control plane (userspace)
+│   ├── control                    # RAUTA binary (HTTP proxy + K8s controller)
+│   └── libcommon-*.rlib          # Common library
 └── debug/
-    └── common-*.rlib              # Common library
+    └── ...                        # Debug builds
 ```
+
+## Performance Builds
+
+For maximum performance:
+
+```bash
+# Release with LTO and optimizations
+cargo build --release
+
+# Profile-guided optimization (advanced)
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+The workspace `Cargo.toml` already includes:
+- `lto = true` (Link-Time Optimization)
+- `opt-level = 3` (Maximum optimization)
+- `codegen-units = 1` (Better optimization, slower compile)
 
 ## Next Steps
 
-- **Run Tests**: `./docker/test.sh`
-- **Deploy**: See [DEPLOYMENT.md](DEPLOYMENT.md)
+- **Run Tests**: `cargo test`
+- **Deploy**: See `deploy/README.md`
 - **Develop**: See [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ---
 
 **TL;DR**:
-- **macOS**: Use `docker/build-quick.sh` or push to GitHub (CI builds)
-- **Linux**: `cargo build --release` (after installing deps)
-- **Testing**: Let CI handle it automatically
+- **Any OS**: `cargo build --release && cargo test`
+- **Docker**: `docker/build-quick.sh`
+- **CI**: Push to GitHub, builds automatically

@@ -4,6 +4,7 @@ Multi-source load tester for canary routing validation.
 Simulates requests from different IPs to test Maglev distribution.
 """
 
+import json
 import subprocess
 import sys
 from collections import Counter
@@ -36,22 +37,32 @@ def test_from_different_pods(num_requests=100):
     for i in range(num_requests):
         pod_name = pod_names[i % len(pod_names)]
 
-        result = subprocess.run(
-            ["kubectl", "exec", "-n", "demo", pod_name, "--",
-             "curl", "-s", "http://rauta.rauta-system.svc.cluster.local/api/test"],
-            capture_output=True,
-            text=True,
-            check=False
-        )
+        try:
+            result = subprocess.run(
+                ["kubectl", "exec", "-n", "demo", pod_name, "--",
+                 "curl", "-s", "http://rauta.rauta-system.svc.cluster.local/api/test"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10  # Prevent hanging
+            )
+        except subprocess.TimeoutExpired:
+            print(f"  Request {i+1} timed out (pod: {pod_name})")
+            continue
+        except subprocess.SubprocessError as e:
+            print(f"  Request {i+1} failed with error: {e} (pod: {pod_name})")
+            continue
 
         if result.returncode == 0:
             output = result.stdout
-            if '"version"' in output:
-                # Extract version from JSON response
-                if '"v1-stable"' in output:
-                    versions.append("v1-stable")
-                elif '"v2-canary"' in output:
-                    versions.append("v2-canary")
+            # Use proper JSON parsing
+            try:
+                data = json.loads(output)
+                version = data.get("version")
+                if version:
+                    versions.append(version)
+            except json.JSONDecodeError:
+                pass  # Silently skip malformed responses
 
         # Progress indicator
         if (i + 1) % 10 == 0:
@@ -89,5 +100,13 @@ def test_from_different_pods(num_requests=100):
         print("\n❌ FAIL: Distribution differs significantly from 90/10 split")
 
 if __name__ == "__main__":
-    num_requests = int(sys.argv[1]) if len(sys.argv) > 1 else 100
+    try:
+        num_requests = int(sys.argv[1]) if len(sys.argv) > 1 else 100
+        if num_requests <= 0:
+            print("ERROR: Number of requests must be positive")
+            sys.exit(1)
+    except ValueError:
+        print("ERROR: Invalid number of requests")
+        sys.exit(1)
+
     test_from_different_pods(num_requests)

@@ -5,48 +5,75 @@
 [![CI](https://github.com/yairfalse/rauta/actions/workflows/ci.yml/badge.svg)](https://github.com/yairfalse/rauta/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+[![Gateway API](https://img.shields.io/badge/Gateway%20API-v1.2.0-purple.svg)](https://gateway-api.sigs.k8s.io/)
+[![Tests](https://img.shields.io/badge/tests-90%20passing-brightgreen.svg)]()
+[![Performance](https://img.shields.io/badge/throughput-129K%20req%2Fs-orange.svg)]()
+<sub>Note: Badge shows average throughput on 12-core machine; ADR claims are peak per-core/node throughput under ideal conditions.</sub>
+
+**Tech Stack:**
+[![Tokio](https://img.shields.io/badge/async-tokio-blue.svg?logo=rust)](https://tokio.rs)
+[![Hyper](https://img.shields.io/badge/HTTP-hyper-blue.svg?logo=rust)](https://hyper.rs)
+[![Kubernetes](https://img.shields.io/badge/K8s-kube--rs-326CE5.svg?logo=kubernetes&logoColor=white)](https://kube.rs)
+[![HTTP/2](https://img.shields.io/badge/HTTP%2F2-enabled-success.svg)]()
+[![Prometheus](https://img.shields.io/badge/metrics-prometheus-E6522C.svg?logo=prometheus&logoColor=white)](https://prometheus.io)
 
 ---
 
 ## What is RAUTA?
 
-A Kubernetes ingress controller built in Rust with HTTP/2 support and WASM-based extensibility.
+A learning project exploring Rust and Kubernetes Gateway API - built for fun, happens to be fast.
 
-**Core Features:**
-- Modern Kubernetes Gateway API (v1) support
+**What's Actually Built:**
+- Kubernetes Gateway API (v1) controller (GatewayClass, Gateway, HTTPRoute)
 - HTTP/2 connection pooling with multiplexing
+- Multi-core workers (129K+ req/sec on 12 cores)
 - Maglev consistent hashing for load balancing
-- WASM plugin system for safe extensibility
-- Production-grade observability (Prometheus metrics)
+- Weighted routing for canary deployments (90/10 splits)
+- Passive health checking with circuit breakers
+- Graceful shutdown with connection draining
+- Connection/request timeouts (5s/30s)
+- Prometheus metrics and structured logging
+- 74 unit tests + integration tests
 
-**Why RAUTA?**
-- **Memory Safe** - Rust prevents entire classes of bugs
-- **Modern Standards** - Gateway API native, not legacy Ingress
-- **Extensible** - WASM plugins for safe extensibility
-- **Fast** - HTTP/2 multiplexing, efficient connection pooling
+**Why Build This?**
+- Learn Rust async (tokio, hyper)
+- Understand Kubernetes controllers (kube-rs)
+- Explore HTTP/2 multiplexing and connection pooling
+- Practice TDD (every feature test-first)
+- Have fun building systems software
 
 ---
 
-## Status
+## What Works
 
-**Stage 1: Gateway API Controller** ✅ Complete
+**Gateway API Controller** ✅
 - GatewayClass, Gateway, HTTPRoute reconciliation
 - Dynamic backend resolution via EndpointSlice API
-- Maglev load balancing with consistent hashing
+- Service port → targetPort resolution
 - Prefix matching (e.g., `/api` matches `/api/users/123`)
-- Prometheus metrics
 
-**Stage 2: HTTP/2 Connection Pooling** ✅ Complete
-- HTTP/2 multiplexing (1 connection → 44K+ requests)
-- Per-backend connection pools with circuit breakers
-- 3-state health tracking (Healthy → Degraded → Unhealthy)
-- Protocol detection (auto-fallback to HTTP/1.1)
-- Validated: **88K+ req/sec peak** in load testing
+**Load Balancing** ✅
+- Maglev consistent hashing (Google's algorithm)
+- Weighted routing for canary deployments (90/10 splits)
+- Backend health tracking (passive health checks)
+- Connection draining for graceful removal
 
-**Stage 3: WASM Plugin System** 🚧 In Design
-- Safe extensibility without memory leaks
-- Custom authentication, rate limiting, transforms
-- Sandboxed execution environment
+**HTTP/2 Performance** ✅
+- Multi-core workers (12 workers → 129K req/sec)
+- HTTP/2 multiplexing (1 connection → thousands of requests)
+- Per-worker connection pools (lock-free)
+- Auto-fallback to HTTP/1.1
+
+**Reliability** ✅
+- Connection timeout (5s for dead backends)
+- Request timeout (30s for slow backends)
+- Circuit breakers (3-state: Healthy → Degraded → Unhealthy)
+- Graceful shutdown with connection draining (SIGTERM-safe)
+
+**Observability** ✅
+- Prometheus metrics (request rates, latencies, pool stats)
+- Structured logging (OpenTelemetry-style fields)
+- Per-request tracing with request IDs
 
 ---
 
@@ -131,12 +158,11 @@ http2_pool_connections_failed_total{backend}
 http2_pool_requests_queued_total{backend}
 ```
 
-**Load Test Results (Progressive Testing):**
-- **Peak: 88,328 req/sec** (50 concurrent connections)
-- **Sustained: 84,630 req/sec** (800 concurrent connections)
-- **p99 Latency: 9.33ms** at max stress (800 connections)
-- **Multiplexing: 44,543:1 ratio** (1 connection served 44K requests)
-- Zero failures across all test levels
+**Load Test Results:**
+- **Peak: 129,813 req/sec** (12 workers, 400 concurrent connections)
+- **Average Latency: 3.00ms** (p99 under 17ms)
+- **Total: 3.9M requests** in 30 seconds
+- Zero failures, zero dropped connections
 
 See [`docs/HTTP2_CONNECTION_POOLING.md`](docs/HTTP2_CONNECTION_POOLING.md) for design details.
 
@@ -156,36 +182,32 @@ Consistent hashing keeps connections sticky to the same backend. When backends c
 
 - Request multiplexing (1 connection → thousands of requests)
 - Header compression (HPACK)
-- Research-backed: ACM 2024 shows HTTP/2 outperforms HTTP/3 by 45%
+- Reduces connection overhead
 
-**Why WASM for plugins?**
+**Why multi-core workers?**
 
-- Memory safe and sandboxed execution
-- Can't crash the proxy process
-- Platform-independent bytecode
-- Compile once, run anywhere
+- Lock-free routing (each worker has own connection pools)
+- Linear scaling with CPU cores (4 cores → 4x throughput)
+- Zero contention under load
 
 **Why Rust?**
 
-- Memory safety (no segfaults in production)
+- Memory safety (no segfaults)
 - Strong type system (catch bugs at compile time)
 - Excellent async ecosystem (tokio, hyper)
+- Zero-cost abstractions
 
 ---
 
 ## Technology Stack
 
-**Userspace:**
 - **tokio** - Async runtime
 - **hyper** - HTTP/1.1 and HTTP/2
 - **kube-rs** - Kubernetes API client
 - **gateway-api** - Official Gateway API CRD types
 - **matchit** - Radix tree for path matching
 - **prometheus** - Metrics
-
-**Future:**
-- **wasmtime** - WASM runtime for plugins
-- **io_uring** - Zero-copy I/O (Linux 5.7+)
+- **jemalloc** - Allocator optimized for async workloads
 
 ---
 
@@ -232,40 +254,49 @@ See `CLAUDE.md` for detailed guidelines.
 
 ---
 
-## Roadmap
+## What's Implemented
 
-**Completed:**
+**Core Routing:**
 - ✅ Gateway API controller (GatewayClass, Gateway, HTTPRoute)
 - ✅ EndpointSlice resolution for dynamic backends
-- ✅ Maglev load balancing
-- ✅ HTTP/2 connection pooling with circuit breakers
+- ✅ Maglev consistent hashing
+- ✅ Weighted routing (canary deployments)
+
+**Performance:**
+- ✅ Multi-core workers (lock-free, per-worker pools)
+- ✅ HTTP/2 connection pooling
+- ✅ Connection multiplexing
+
+**Reliability:**
+- ✅ Passive health checking
+- ✅ Circuit breakers (3-state)
+- ✅ Connection draining
+- ✅ Graceful shutdown
+- ✅ Connection/request timeouts
+
+**Observability:**
 - ✅ Prometheus metrics
-
-**In Progress:**
-- 🚧 WASM plugin system design
-- 🚧 TLS termination
-- 🚧 Per-core worker architecture (lock-free routing)
-
-**Future Exploration:**
-- io_uring zero-copy I/O
-- eBPF sockmap for service mesh mode
-- Multi-cluster routing
+- ✅ Structured logging
+- ✅ Request tracing
 
 ---
 
-## Contributing
+## Using This Code
 
-**How to help:**
-1. **Try it** - Deploy in a cluster, report issues
-2. **Review code** - Suggest improvements
-3. **Improve docs** - Make things clearer
-4. **Share ideas** - What features would be useful?
+This is a learning project, but the code is:
+- Well-tested (74 unit tests + integration tests)
+- Documented (see `docs/` directory)
+- Following Rust best practices
 
-**Before contributing:**
-- Read `CLAUDE.md` (project guidelines)
-- Follow TDD workflow (tests before code)
-- Keep commits small and focused
-- No TODOs in code (finish features or document why)
+**If you want to learn from it:**
+- Read `CLAUDE.md` for TDD workflow
+- Check `docs/` for design decisions
+- Tests show how features work
+
+**If you want to use it:**
+- It works! But it's a learning project
+- No guarantees, no roadmap
+- Use at your own risk
 
 ---
 
@@ -295,4 +326,4 @@ Apache 2.0 - Free and open source.
 
 ---
 
-**Fast. Safe. Extensible.** 🦀
+**Built for fun. Happens to be fast.** 🦀

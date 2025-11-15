@@ -31,6 +31,11 @@ fi
 
 if ! kind get clusters | grep -q "^${CLUSTER_NAME}$"; then
     kind create cluster --config deploy/kind-config.yaml --name ${CLUSTER_NAME}
+    # Verify cluster creation succeeded
+    if ! kind get clusters | grep -q "^${CLUSTER_NAME}$"; then
+        echo "❌ Cluster creation failed"
+        exit 1
+    fi
 fi
 
 # Set kubectl context
@@ -54,7 +59,8 @@ echo ""
 
 # Step 3: Build RAUTA Docker image
 echo "🔨 Step 3: Building RAUTA Docker image..."
-cd $(git rev-parse --show-toplevel)
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "❌ Not in a git repository"; exit 1; }
+cd "$REPO_ROOT"
 docker build -t rauta:latest -f docker/Dockerfile.prod .
 echo "✅ Image built"
 echo ""
@@ -95,9 +101,9 @@ kubectl apply -f deploy/gateway-api.yaml
 echo "✅ Gateway API resources created"
 echo ""
 
-# Give RAUTA time to reconcile
-echo "⏳ Waiting for reconciliation..."
-sleep 5
+# Wait for Gateway to be ready
+echo "⏳ Waiting for Gateway to be ready..."
+kubectl wait --for=condition=Programmed gateway/rauta-gateway -n demo --timeout=60s || echo "⚠️  Gateway not ready yet (check manually)"
 echo ""
 
 # Step 8: Show status

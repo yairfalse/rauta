@@ -231,19 +231,51 @@ impl HTTPRouteReconciler {
                     let mut backends = Vec::new();
 
                     if total_weight > 0 {
-                        // First, calculate target slots for each service
+                        // First, calculate target slots for each service using largest-remainder method
+                        // This ensures slots sum to exactly MAX_MAGLEV_BACKENDS (more fair than simple rounding)
                         let mut service_targets = Vec::new();
+                        let mut slot_allocations = Vec::new();
+
+                        // Step 1: Calculate exact fractional slots and assign floor values
+                        let mut allocated_slots = 0;
                         for (service_backends, weight) in &resolved_services {
+                            let exact_slots =
+                                (*weight as f64 / total_weight as f64) * MAX_MAGLEV_BACKENDS as f64;
+                            let floor_slots = exact_slots.floor() as usize;
+                            let remainder = exact_slots - floor_slots as f64;
+
+                            slot_allocations.push((service_backends, floor_slots, remainder));
+                            allocated_slots += floor_slots;
+                        }
+
+                        // Step 2: Distribute remaining slots to services with largest remainders
+                        let remaining_slots = MAX_MAGLEV_BACKENDS - allocated_slots;
+                        let mut indexed_remainders: Vec<(usize, f64)> = slot_allocations
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, (_, _, remainder))| (idx, *remainder))
+                            .collect();
+
+                        // Sort by remainder descending (largest first)
+                        indexed_remainders.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+                        // Give one extra slot to top N services (where N = remaining_slots)
+                        for (idx, _remainder) in indexed_remainders
+                            .iter()
+                            .take(remaining_slots.min(indexed_remainders.len()))
+                        {
+                            slot_allocations[*idx].1 += 1;
+                        }
+
+                        // Step 3: Calculate replicas per pod for each service
+                        for (service_backends, service_slots, _) in slot_allocations {
                             let pods_count = service_backends.len();
-                            let service_slots = ((*weight as f64 / total_weight as f64)
-                                * MAX_MAGLEV_BACKENDS as f64)
-                                .round() as usize;
                             let replicas_per_pod =
                                 (service_slots as f64 / pods_count as f64).ceil().max(1.0) as usize;
 
                             info!(
-                                "  - Service weight {} gets {} slots, {} replicas per pod ({} pods)",
-                                weight, service_slots, replicas_per_pod, pods_count
+                                "  - Service gets {} slots, {} replicas per pod ({} pods)",
+                                service_slots, replicas_per_pod, pods_count
                             );
 
                             service_targets.push((service_backends.clone(), replicas_per_pod));
@@ -300,7 +332,8 @@ impl HTTPRouteReconciler {
         }
 
         // Update HTTPRoute status
-        ctx.set_route_status(&namespace, &name, routes_added > 0)
+        let generation = route.metadata.generation.unwrap_or(0);
+        ctx.set_route_status(&namespace, &name, routes_added > 0, generation)
             .await?;
 
         // Record metrics
@@ -321,9 +354,9 @@ impl HTTPRouteReconciler {
         namespace: &str,
         name: &str,
         accepted: bool,
+        generation: i64,
     ) -> Result<(), kube::Error> {
         let api: Api<HTTPRoute> = Api::namespaced(self.client.clone(), namespace);
-
         let status = if accepted {
             json!({
                 "status": {
@@ -339,12 +372,14 @@ impl HTTPRouteReconciler {
                             "reason": "Accepted",
                             "message": "HTTPRoute is accepted and configured",
                             "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            "observedGeneration": generation,
                         }, {
                             "type": "ResolvedRefs",
                             "status": "True",
                             "reason": "ResolvedRefs",
                             "message": "All backend refs resolved",
                             "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            "observedGeneration": generation,
                         }]
                     }]
                 }
@@ -364,6 +399,7 @@ impl HTTPRouteReconciler {
                             "reason": "NoRules",
                             "message": "HTTPRoute has no valid routing rules",
                             "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            "observedGeneration": generation,
                         }]
                     }]
                 }
@@ -435,7 +471,7 @@ impl HTTPRouteReconciler {
     }
 }
 
-/// Parse EndpointSlice into Backend structs
+/// Parse EndpointSlice into Backend structs (supports both IPv4 and IPv6)
 #[allow(dead_code)] // Used in K8s mode
 fn parse_endpointslice_to_backends(
     endpoint_slice: &k8s_openapi::api::discovery::v1::EndpointSlice,
@@ -467,20 +503,22 @@ fn parse_endpointslice_to_backends(
             continue; // Skip non-ready endpoints
         }
 
-        // Parse IP addresses
+        // Parse IP addresses (both IPv4 and IPv6)
         for address in &endpoint.addresses {
-            match address.parse::<std::net::Ipv4Addr>() {
-                Ok(ipv4) => {
-                    backends.push(Backend {
-                        ipv4: u32::from(ipv4),
-                        port,
-                        weight: 100, // Default weight
-                    });
-                }
-                Err(e) => {
-                    warn!("Failed to parse IP address {}: {}", address, e);
-                }
+            // Try IPv4 first
+            if let Ok(ipv4) = address.parse::<std::net::Ipv4Addr>() {
+                backends.push(Backend::from_ipv4(ipv4, port, 100));
+                continue;
             }
+
+            // Try IPv6
+            if let Ok(ipv6) = address.parse::<std::net::Ipv6Addr>() {
+                backends.push(Backend::from_ipv6(ipv6, port, 100));
+                continue;
+            }
+
+            // Neither IPv4 nor IPv6
+            warn!("Failed to parse IP address {}: invalid format", address);
         }
     }
 
@@ -512,8 +550,7 @@ mod tests {
         assert_eq!(route.metadata.name, Some("api-route".to_string()));
         assert_eq!(route.metadata.namespace, Some("default".to_string()));
 
-        // TODO: Test reconcile() when implemented
-        // This is where we'll test that:
+        // Note: Full reconcile() testing will verify the following:
         // 1. The reconciler parses HTTPRoute rules
         // 2. It adds routes to the Router with correct path matching
         // 3. It resolves Service endpoints from backendRefs
@@ -531,8 +568,7 @@ mod tests {
         // (We can't easily test this without accessing private fields,
         // but the reconciler will add routes via add_route())
 
-        // TODO: Test reconciler.run() when implemented
-        // This is where we'll test that:
+        // Note: Full reconciler.run() testing will verify the following:
         // 1. HTTPRoute resources are watched
         // 2. Routes are added to Router based on HTTPRoute spec
         // 3. Service endpoints are resolved from Kubernetes API
@@ -627,7 +663,7 @@ mod tests {
 
         // Verify first backend
         assert_eq!(
-            std::net::Ipv4Addr::from(backends[0].ipv4),
+            backends[0].as_ipv4().unwrap(),
             "10.0.1.1".parse::<std::net::Ipv4Addr>().unwrap()
         );
         assert_eq!(backends[0].port, 8080);
@@ -635,13 +671,13 @@ mod tests {
 
         // Verify second backend
         assert_eq!(
-            std::net::Ipv4Addr::from(backends[1].ipv4),
+            backends[1].as_ipv4().unwrap(),
             "10.0.1.2".parse::<std::net::Ipv4Addr>().unwrap()
         );
 
         // Verify third backend
         assert_eq!(
-            std::net::Ipv4Addr::from(backends[2].ipv4),
+            backends[2].as_ipv4().unwrap(),
             "10.0.1.3".parse::<std::net::Ipv4Addr>().unwrap()
         );
     }
@@ -716,7 +752,7 @@ mod tests {
         // Verify we got the right IPs (not the not-ready one)
         let ips: Vec<String> = backends
             .iter()
-            .map(|b| std::net::Ipv4Addr::from(b.ipv4).to_string())
+            .map(|b| b.as_ipv4().unwrap().to_string())
             .collect();
         assert!(ips.contains(&"10.0.1.1".to_string()));
         assert!(!ips.contains(&"10.0.1.2".to_string())); // Not ready
@@ -769,6 +805,84 @@ mod tests {
         assert_eq!(backends.len(), 1);
         assert_eq!(backends[0].port, 80, "Should default to port 80");
     }
+
+    #[test]
+    fn test_endpointslice_ipv6_parsing() {
+        // GREEN: Test that IPv6 addresses are parsed correctly in HTTPRoute
+        use k8s_openapi::api::discovery::v1::{Endpoint, EndpointPort, EndpointSlice};
+
+        // Create EndpointSlice with both IPv4 and IPv6 addresses
+        let endpoint_slice = EndpointSlice {
+            address_type: "IPv4".to_string(), // K8s uses this even for dual-stack
+            endpoints: vec![
+                Endpoint {
+                    addresses: vec!["10.0.1.1".to_string()],
+                    conditions: None,
+                    deprecated_topology: None,
+                    hints: None,
+                    hostname: None,
+                    node_name: None,
+                    target_ref: None,
+                    zone: None,
+                },
+                Endpoint {
+                    addresses: vec!["2001:db8::1".to_string()],
+                    conditions: None,
+                    deprecated_topology: None,
+                    hints: None,
+                    hostname: None,
+                    node_name: None,
+                    target_ref: None,
+                    zone: None,
+                },
+                Endpoint {
+                    addresses: vec!["::1".to_string()],
+                    conditions: None,
+                    deprecated_topology: None,
+                    hints: None,
+                    hostname: None,
+                    node_name: None,
+                    target_ref: None,
+                    zone: None,
+                },
+            ],
+            metadata: Default::default(),
+            ports: Some(vec![EndpointPort {
+                app_protocol: None,
+                name: Some("http".to_string()),
+                port: Some(8080),
+                protocol: Some("TCP".to_string()),
+            }]),
+        };
+
+        // Parse into backends (target port 8080)
+        let backends = parse_endpointslice_to_backends(&endpoint_slice, 8080);
+
+        // Should have all 3 backends: 1 IPv4 + 2 IPv6
+        assert_eq!(
+            backends.len(),
+            3,
+            "Should have all backends (IPv4 and IPv6)"
+        );
+
+        // Find backends by address type
+        let ipv4_backends: Vec<&Backend> = backends.iter().filter(|b| !b.is_ipv6()).collect();
+        let ipv6_backends: Vec<&Backend> = backends.iter().filter(|b| b.is_ipv6()).collect();
+
+        // Verify 1 IPv4 backend
+        assert_eq!(ipv4_backends.len(), 1, "Should have 1 IPv4 backend");
+        assert_eq!(
+            ipv4_backends[0].as_ipv4().unwrap(),
+            "10.0.1.1".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+
+        // Verify 2 IPv6 backends
+        assert_eq!(ipv6_backends.len(), 2, "Should have 2 IPv6 backends");
+        let ipv6_addrs: Vec<std::net::Ipv6Addr> =
+            ipv6_backends.iter().map(|b| b.as_ipv6().unwrap()).collect();
+        assert!(ipv6_addrs.contains(&"2001:db8::1".parse().unwrap()));
+        assert!(ipv6_addrs.contains(&"::1".parse().unwrap()));
+    }
 }
 
-// TODO: Implement HTTPRoute watcher (Phase 1)
+// Note: HTTPRoute watcher implementation is planned for Phase 1

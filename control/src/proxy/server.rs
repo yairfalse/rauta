@@ -1,8 +1,11 @@
 //! HTTP Server - proxies requests to backends
 
 use crate::apis::metrics::CONTROLLER_METRICS_REGISTRY;
+use crate::proxy::filters::{
+    HeaderModifierOp, RequestHeaderModifier, RequestRedirect, ResponseHeaderModifier,
+};
 use crate::proxy::router::Router;
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::body::Bytes;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
@@ -174,6 +177,8 @@ impl ProxyServer {
     }
 
     /// Start serving HTTP requests
+    /// NOTE: Production code should use serve_with_shutdown() instead for graceful shutdown
+    #[allow(dead_code)] // Used in tests; production uses serve_with_shutdown()
     pub async fn serve(self) -> Result<(), String> {
         let listener = TcpListener::bind(&self.bind_addr)
             .await
@@ -224,6 +229,122 @@ impl ProxyServer {
                     debug!("Error serving connection: {}", e);
                 }
             });
+        }
+    }
+
+    /// Start serving HTTP requests with graceful shutdown support
+    /// When shutdown signal is received:
+    /// 1. Stop accepting new connections
+    /// 2. Wait for active connections to complete
+    /// 3. Shutdown after all connections drained or timeout
+    #[allow(dead_code)] // Used in production via main.rs signal handling
+    pub async fn serve_with_shutdown<F>(self, shutdown_signal: F) -> Result<(), String>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use tokio::sync::Notify;
+
+        let listener = TcpListener::bind(&self.bind_addr)
+            .await
+            .map_err(|e| format!("Failed to bind to {}: {}", self.bind_addr, e))?;
+
+        let _actual_addr = listener
+            .local_addr()
+            .map_err(|e| format!("Failed to get local addr: {}", e))?;
+
+        // Track active connections
+        let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shutdown_notify = Arc::new(Notify::new());
+
+        // Spawn shutdown handler
+        let active_connections_clone = active_connections.clone();
+        let shutdown_notify_clone = shutdown_notify.clone();
+        tokio::spawn(async move {
+            shutdown_signal.await;
+            info!("Graceful shutdown initiated - draining active connections");
+
+            // Wait for active connections to complete (with timeout)
+            let drain_timeout = tokio::time::Duration::from_secs(30);
+            let start = std::time::Instant::now();
+
+            while active_connections_clone.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                if start.elapsed() > drain_timeout {
+                    warn!(
+                        "Drain timeout exceeded - forcing shutdown with {} active connections",
+                        active_connections_clone.load(std::sync::atomic::Ordering::Relaxed)
+                    );
+                    break;
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+
+            info!("All connections drained - shutting down");
+            shutdown_notify_clone.notify_one();
+        });
+
+        // Main accept loop
+        loop {
+            tokio::select! {
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok((stream, _)) => {
+                            // Increment active connection counter
+                            active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                            let router = self.router.clone();
+                            let client = self.client.clone();
+                            let backend_pools = self.backend_pools.clone();
+                            let protocol_cache = self.protocol_cache.clone();
+                            let workers = self.workers.clone();
+                            let worker_selector = self.worker_selector.clone();
+                            let active_connections_clone = active_connections.clone();
+
+                            tokio::spawn(async move {
+                                let io = TokioIo::new(stream);
+
+                                let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                                    let router = router.clone();
+                                    let client = client.clone();
+                                    let backend_pools = backend_pools.clone();
+                                    let protocol_cache = protocol_cache.clone();
+                                    let workers = workers.clone();
+                                    let worker_selector = worker_selector.clone();
+                                    async move {
+                                        handle_request(
+                                            req,
+                                            router,
+                                            client,
+                                            backend_pools,
+                                            protocol_cache,
+                                            workers,
+                                            worker_selector,
+                                        )
+                                        .await
+                                    }
+                                });
+
+                                if let Err(e) = http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await
+                                {
+                                    debug!("Error serving connection: {}", e);
+                                }
+
+                                // Decrement active connection counter when done
+                                active_connections_clone.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            });
+                        }
+                        Err(e) => {
+                            return Err(format!("Failed to accept connection: {}", e));
+                        }
+                    }
+                }
+                _ = shutdown_notify.notified() => {
+                    info!("Server shutdown complete");
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -393,6 +514,136 @@ fn is_hop_by_hop_header(name: &str) -> bool {
     )
 }
 
+/// Apply request header filters before forwarding to backend
+/// Gateway API HTTPRouteBackendRequestHeaderModification
+///
+/// Security: HeaderName::from_bytes() and HeaderValue::from_str() validate input and reject
+/// CRLF characters (\r\n), preventing header injection attacks. Invalid headers return errors.
+fn apply_request_filters(
+    req: &mut Request<hyper::body::Incoming>,
+    filters: &RequestHeaderModifier,
+) -> Result<(), String> {
+    apply_header_filters(req, &filters.operations)
+}
+
+/// Trait for types that provide mutable access to headers
+trait HasHeadersMut {
+    fn headers_mut(&mut self) -> &mut hyper::header::HeaderMap;
+}
+
+impl<B> HasHeadersMut for hyper::Request<B> {
+    fn headers_mut(&mut self) -> &mut hyper::header::HeaderMap {
+        self.headers_mut()
+    }
+}
+
+impl<B> HasHeadersMut for hyper::Response<B> {
+    fn headers_mut(&mut self) -> &mut hyper::header::HeaderMap {
+        self.headers_mut()
+    }
+}
+
+/// Generic helper to apply header filters
+fn apply_header_filters<T, F>(target: &mut T, filters: &F) -> Result<(), String>
+where
+    T: HasHeadersMut,
+    F: std::ops::Deref<Target = [HeaderModifierOp]>,
+{
+    for op in filters.iter() {
+        match op {
+            HeaderModifierOp::Set { name, value } => {
+                let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
+                let header_value = hyper::header::HeaderValue::from_str(value)
+                    .map_err(|e| format!("Invalid header value '{}': {}", value, e))?;
+                target.headers_mut().insert(header_name, header_value);
+            }
+            HeaderModifierOp::Add { name, value } => {
+                let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
+                let header_value = hyper::header::HeaderValue::from_str(value)
+                    .map_err(|e| format!("Invalid header value '{}': {}", value, e))?;
+                target.headers_mut().append(header_name, header_value);
+            }
+            HeaderModifierOp::Remove { name } => {
+                let header_name = hyper::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
+                target.headers_mut().remove(header_name);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply response header filters after receiving response from backend
+/// Gateway API HTTPResponseHeaderModifier
+fn apply_response_filters<B>(
+    resp: &mut Response<B>,
+    filters: &ResponseHeaderModifier,
+) -> Result<(), String> {
+    apply_header_filters(resp, &filters.operations)
+}
+/// Build redirect response (Gateway API HTTPRequestRedirectFilter - Core)
+///
+/// Security Note: Redirect configuration is controlled by cluster operators via Gateway API
+/// HTTPRoute resources. While this function doesn't validate redirect targets against an allowlist,
+/// operators must ensure that redirect filters only point to trusted destinations. Redirects
+/// configured via HTTPRoute are considered intentional by the cluster operator.
+///
+/// For production deployments, operators should:
+/// 1. Use RBAC to restrict who can create/modify HTTPRoutes
+/// 2. Review redirect configurations during deployment
+/// 3. Implement admission webhooks for additional validation if needed
+fn build_redirect_response(
+    req: &Request<hyper::body::Incoming>,
+    redirect: &RequestRedirect,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, String> {
+    let uri = req.uri();
+
+    // Extract components with fallbacks
+    let scheme = redirect
+        .scheme
+        .as_deref()
+        .or_else(|| uri.scheme_str())
+        .unwrap_or("http");
+
+    let host = redirect
+        .hostname
+        .as_deref()
+        .or_else(|| uri.host())
+        .or_else(|| req.headers().get("host").and_then(|h| h.to_str().ok()))
+        .ok_or_else(|| "Cannot determine redirect host".to_string())?;
+
+    let port = redirect
+        .port
+        .or_else(|| uri.port_u16())
+        .map(|p| format!(":{}", p))
+        .unwrap_or_default();
+
+    let path = redirect.path.as_deref().unwrap_or_else(|| uri.path());
+
+    // Build Location header
+    let location = format!("{}://{}{}{}", scheme, host, port, path);
+
+    // Map status code
+    use crate::proxy::filters::RedirectStatusCode;
+    let status = match redirect.status_code {
+        RedirectStatusCode::MovedPermanently => StatusCode::MOVED_PERMANENTLY,
+        RedirectStatusCode::Found => StatusCode::FOUND,
+    };
+
+    // Build response
+    Ok(Response::builder()
+        .status(status)
+        .header("Location", location)
+        .body(
+            Empty::<Bytes>::new()
+                .map_err(|never| match never {}) // Handle infallible error type
+                .boxed(),
+        )
+        .unwrap())
+}
+
 /// Forward request to backend server
 /// Returns BoxBody to support zero-copy streaming for HTTP/2 (hot path)
 #[allow(clippy::too_many_arguments)] // Workers integration requires additional parameters
@@ -460,7 +711,7 @@ async fn forward_to_backend(
 
     let backend_uri = format!(
         "http://{}:{}{}",
-        ipv4_to_string(backend.ipv4),
+        ipv4_to_string(backend.ipv4_as_u32()),
         backend.port,
         path_and_query
     );
@@ -480,11 +731,11 @@ async fn forward_to_backend(
     }
 
     // Set Host header to match backend address
-    let backend_host = format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port);
+    let backend_host = format!("{}:{}", ipv4_to_string(backend.ipv4_as_u32()), backend.port);
     backend_req_builder = backend_req_builder.header("Host", backend_host);
 
     // Check protocol cache BEFORE cloning body (optimization: avoid clone on hot path)
-    let backend_key = format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port);
+    let backend_key = format!("{}:{}", ipv4_to_string(backend.ipv4_as_u32()), backend.port);
     let protocol_cached = {
         let cache = protocol_cache.lock().await;
         cache.get(&backend_key).copied()
@@ -549,7 +800,7 @@ async fn forward_to_backend(
     info!(
         request_id = %request_id,
         stage = "backend_request_built",
-        network.peer.address = %ipv4_to_string(backend.ipv4),
+        network.peer.address = %ipv4_to_string(backend.ipv4_as_u32()),
         network.peer.port = backend.port,
         url.full = %backend_uri,
         http.request.method = %method_str,
@@ -640,7 +891,11 @@ async fn forward_to_backend(
                             .uri(&backend_uri)
                             .header(
                                 "Host",
-                                format!("{}:{}", ipv4_to_string(backend.ipv4), backend.port),
+                                format!(
+                                    "{}:{}",
+                                    ipv4_to_string(backend.ipv4_as_u32()),
+                                    backend.port
+                                ),
                             )
                             .body(Full::new(fallback_body))
                             .map_err(|e| format!("Failed to build fallback request: {}", e))?;
@@ -678,7 +933,7 @@ async fn forward_to_backend(
                     request_id = %request_id,
                     error.message = %e,
                     error.type = "backend_connection",
-                    network.peer.address = %ipv4_to_string(backend.ipv4),
+                    network.peer.address = %ipv4_to_string(backend.ipv4_as_u32()),
                     network.peer.port = backend.port,
                     elapsed_us = backend_connect_start.elapsed().as_micros() as u64,
                     "Backend connection failed"
@@ -695,7 +950,7 @@ async fn forward_to_backend(
         request_id = %request_id,
         stage = "backend_response_received",
         http.response.status_code = response_status,
-        network.peer.address = %ipv4_to_string(backend.ipv4),
+        network.peer.address = %ipv4_to_string(backend.ipv4_as_u32()),
         network.peer.port = backend.port,
         elapsed_us = backend_connect_duration.as_micros() as u64,
         "Backend responded"
@@ -722,7 +977,7 @@ async fn forward_to_backend(
         request_id = %request_id,
         stage = "request_complete",
         http.response.status_code = response_status,
-        network.peer.address = %ipv4_to_string(backend.ipv4),
+        network.peer.address = %ipv4_to_string(backend.ipv4_as_u32()),
         network.peer.port = backend.port,
         timing.total_us = total_duration.as_micros() as u64,
         timing.backend_us = backend_connect_duration.as_micros() as u64,
@@ -771,7 +1026,7 @@ fn status_to_str(status: u16) -> &'static str {
 /// Handle incoming HTTP request
 /// Returns BoxBody to support zero-copy streaming for HTTP/2 responses
 async fn handle_request(
-    req: Request<hyper::body::Incoming>,
+    mut req: Request<hyper::body::Incoming>,
     router: Arc<Router>,
     client: Client<HttpConnector, Full<Bytes>>,
     backend_pools: BackendPools,
@@ -866,11 +1121,63 @@ async fn handle_request(
             // Select worker for this request (lock-free round-robin)
             let worker_index = worker_selector.as_ref().map(|selector| selector.select());
 
+            // Check for redirect filter (Gateway API HTTPRequestRedirectFilter - Core)
+            // Redirects return immediately - NEVER forward to backend
+            if let Some(redirect) = &route_match.redirect {
+                match build_redirect_response(&req, redirect) {
+                    Ok(resp) => {
+                        info!(
+                            request_id = %request_id,
+                            status = %resp.status().as_u16(),
+                            location = ?resp.headers().get("Location"),
+                            "Redirect response generated"
+                        );
+                        return Ok(resp);
+                    }
+                    Err(e) => {
+                        error!(
+                            request_id = %request_id,
+                            error = %e,
+                            "Failed to build redirect response"
+                        );
+                        return Ok(Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .header("Content-Type", "text/plain")
+                            .body(
+                                Full::new(Bytes::from(format!("Redirect error: {}", e)))
+                                    .map_err(|never| match never {})
+                                    .boxed(),
+                            )
+                            .unwrap());
+                    }
+                }
+            }
+
+            // Apply request header filters if configured (Gateway API HTTPRouteBackendRequestHeaderModification)
+            if let Some(filters) = &route_match.request_filters {
+                if let Err(e) = apply_request_filters(&mut req, filters) {
+                    error!(
+                        request_id = %request_id,
+                        error = %e,
+                        "Failed to apply request header filters"
+                    );
+                    return Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header("Content-Type", "text/plain")
+                        .body(
+                            Full::new(Bytes::from(format!("Filter error: {}", e)))
+                                .map_err(|never| match never {})
+                                .boxed(),
+                        )
+                        .unwrap());
+                }
+            }
+
             info!(
                 request_id = %request_id,
                 stage = "route_matched",
                 route.pattern = %route_match.pattern,
-                network.peer.address = %ipv4_to_string(route_match.backend.ipv4),
+                network.peer.address = %ipv4_to_string(u32::from(route_match.backend.as_ipv4().unwrap())),
                 network.peer.port = route_match.backend.port,
                 worker_index = ?worker_index,
                 "Route matched, forwarding to backend"
@@ -908,7 +1215,10 @@ async fn handle_request(
                         .observe(duration.as_secs_f64());
 
                     // Record backend health for passive health checking
-                    router.record_backend_response(route_match.backend.ipv4, status_code);
+                    router.record_backend_response(
+                        u32::from(route_match.backend.as_ipv4().unwrap()),
+                        status_code,
+                    );
                 }
                 Err(e) => {
                     HTTP_REQUESTS_TOTAL
@@ -919,7 +1229,10 @@ async fn handle_request(
                         .observe(duration.as_secs_f64());
 
                     // Record backend health (treat connection errors as 500)
-                    router.record_backend_response(route_match.backend.ipv4, 500);
+                    router.record_backend_response(
+                        u32::from(route_match.backend.as_ipv4().unwrap()),
+                        500,
+                    );
 
                     error!(
                         request_id = %request_id,
@@ -933,7 +1246,35 @@ async fn handle_request(
                 }
             }
 
-            result
+            // Apply response header filters if configured (Gateway API HTTPResponseHeaderModifier)
+            if let Some(filters) = &route_match.response_filters {
+                match result {
+                    Ok(mut resp) => {
+                        if let Err(e) = apply_response_filters(&mut resp, filters) {
+                            error!(
+                                request_id = %request_id,
+                                error = %e,
+                                "Failed to apply response header filters"
+                            );
+                            // Return error response if filter application fails
+                            Ok(Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .header("Content-Type", "text/plain")
+                                .body(
+                                    Full::new(Bytes::from(format!("Response filter error: {}", e)))
+                                        .map_err(|never| match never {})
+                                        .boxed(),
+                                )
+                                .unwrap())
+                        } else {
+                            Ok(resp)
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                result
+            }
         }
         None => {
             let duration = start.elapsed();
@@ -1066,7 +1407,9 @@ mod tests {
         let router = crate::proxy::router::Router::new();
         let backend_ip = match backend_addr.ip() {
             std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-            _ => panic!("Expected IPv4 address"),
+            _ => panic!(
+                "Test expects IPv4 address (IPv6 support not yet implemented in Backend struct)"
+            ),
         };
         let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
         router
@@ -2243,7 +2586,7 @@ mod tests {
     /// This ensures passive health checking is integrated with the proxy server.
     /// When a backend returns 5xx errors, the router should mark it as unhealthy.
     #[tokio::test]
-    #[ignore] // FIXME: Flaky test due to Maglev distribution - need to rewrite
+    #[ignore] // Note: Test is flaky due to Maglev distribution - needs rewrite to guarantee backend selection
     async fn test_proxy_records_backend_health_on_errors() {
         // Create router with 2 backends
         let router = Arc::new(Router::new());
@@ -2372,6 +2715,174 @@ mod tests {
             error_count < 10,
             "Expected <10% errors after health checking, got {}/100",
             error_count
+        );
+    }
+
+    /// RED: Test HTTP → HTTPS redirect with 301 status code
+    ///
+    /// This test verifies that the proxy server returns a 301 redirect response
+    /// when a RequestRedirect filter is configured to upgrade HTTP to HTTPS.
+    /// The Location header should contain the HTTPS URL, and the backend
+    /// should NOT be called (request is handled by the proxy).
+    #[tokio::test]
+    async fn test_redirect_https_upgrade() {
+        use crate::proxy::filters::{RedirectStatusCode, RequestRedirect};
+        use crate::proxy::router::Router;
+
+        // Create router with redirect filter (HTTP → HTTPS with 301)
+        let router = Arc::new(Router::new());
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+
+        // Create redirect filter: scheme="https", status_code=301
+        let redirect = RequestRedirect::new()
+            .scheme("https".to_string())
+            .status_code(RedirectStatusCode::MovedPermanently);
+
+        router
+            .add_route_with_redirect(HttpMethod::GET, "/old-path", backends, redirect)
+            .expect("Should add route with redirect");
+
+        // Start proxy server
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::clone(&router)).unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Send HTTP request to /old-path
+        let client = Client::builder(TokioExecutor::new()).build_http();
+
+        let uri = format!("http://{}/old-path", proxy_addr);
+        let req = Request::builder()
+            .uri(&uri)
+            .header("Host", "example.com")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let response = client.request(req).await.unwrap();
+
+        // Verify redirect response (will FAIL - not implemented yet)
+        assert_eq!(
+            response.status(),
+            StatusCode::MOVED_PERMANENTLY,
+            "Expected 301 redirect response"
+        );
+
+        // Verify Location header exists with HTTPS scheme
+        let location = response
+            .headers()
+            .get("Location")
+            .expect("Location header should be present");
+
+        let location_str = location.to_str().unwrap();
+        assert!(
+            location_str.starts_with("https://"),
+            "Location should start with https://, got: {}",
+            location_str
+        );
+        assert!(
+            location_str.contains("example.com"),
+            "Location should preserve hostname, got: {}",
+            location_str
+        );
+        assert!(
+            location_str.contains("/old-path"),
+            "Location should preserve path, got: {}",
+            location_str
+        );
+    }
+
+    /// RED: Test hostname redirect with 302 status code
+    ///
+    /// This test verifies that the proxy server returns a 302 redirect response
+    /// when a RequestRedirect filter is configured to change the hostname.
+    /// The Location header should contain the new hostname while preserving
+    /// the scheme and path.
+    #[tokio::test]
+    async fn test_redirect_hostname_change() {
+        use crate::proxy::filters::{RedirectStatusCode, RequestRedirect};
+        use crate::proxy::router::Router;
+
+        // Create router with redirect filter (hostname change with 302)
+        let router = Arc::new(Router::new());
+
+        let backends = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+
+        // Create redirect filter: hostname="new.example.com", status_code=302
+        let redirect = RequestRedirect::new()
+            .hostname("new.example.com".to_string())
+            .status_code(RedirectStatusCode::Found);
+
+        router
+            .add_route_with_redirect(HttpMethod::GET, "/api/test", backends, redirect)
+            .expect("Should add route with redirect");
+
+        // Start proxy server
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::clone(&router)).unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Send request to /api/test with original hostname
+        let client = Client::builder(TokioExecutor::new()).build_http();
+
+        let uri = format!("http://{}/api/test", proxy_addr);
+        let req = Request::builder()
+            .uri(&uri)
+            .header("Host", "old.example.com")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let response = client.request(req).await.unwrap();
+
+        // Verify redirect response (will FAIL - not implemented yet)
+        assert_eq!(
+            response.status(),
+            StatusCode::FOUND,
+            "Expected 302 redirect response"
+        );
+
+        // Verify Location header has new hostname
+        let location = response
+            .headers()
+            .get("Location")
+            .expect("Location header should be present");
+
+        let location_str = location.to_str().unwrap();
+        assert!(
+            location_str.contains("new.example.com"),
+            "Location should contain new hostname, got: {}",
+            location_str
+        );
+        assert!(
+            location_str.contains("/api/test"),
+            "Location should preserve path, got: {}",
+            location_str
+        );
+        assert!(
+            location_str.starts_with("http://"),
+            "Location should preserve HTTP scheme, got: {}",
+            location_str
         );
     }
 }

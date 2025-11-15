@@ -329,8 +329,10 @@ fn test_embedded_compact_maglev_multi_route() {
     let backend2 = &route2_backends[idx2 as usize];
 
     // Route 1 backends are in 10.0.1.0/24, Route 2 in 10.0.2.0/24
-    assert!((backend1.ipv4 & 0xFFFFFF00) == 0x0a000100);
-    assert!((backend2.ipv4 & 0xFFFFFF00) == 0x0a000200);
+    let backend1_ip = u32::from(backend1.as_ipv4().unwrap());
+    let backend2_ip = u32::from(backend2.as_ipv4().unwrap());
+    assert!((backend1_ip & 0xFFFFFF00) == 0x0a000100);
+    assert!((backend2_ip & 0xFFFFFF00) == 0x0a000200);
 }
 
 #[test]

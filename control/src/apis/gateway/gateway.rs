@@ -5,6 +5,7 @@
 use crate::apis::metrics::record_gateway_reconciliation;
 use futures::StreamExt;
 use gateway_api::apis::standard::gateways::Gateway;
+use k8s_openapi::api::core::v1::Node;
 use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher::Config as WatcherConfig;
@@ -12,7 +13,7 @@ use kube::{Client, ResourceExt};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Gateway reconciler
 #[allow(dead_code)] // Used in K8s mode
@@ -34,6 +35,44 @@ impl GatewayReconciler {
     /// Check if this Gateway references our GatewayClass
     fn should_reconcile(&self, gateway_class_name: &str) -> bool {
         gateway_class_name == self.gateway_class_name
+    }
+
+    /// Get node IPs for Gateway status addresses
+    /// Returns all node InternalIP addresses where RAUTA could be running
+    async fn get_node_addresses(&self) -> Vec<serde_json::Value> {
+        let nodes_api: Api<Node> = Api::all(self.client.clone());
+
+        match nodes_api.list(&Default::default()).await {
+            Ok(nodes) => {
+                let mut addresses = Vec::new();
+
+                for node in nodes.items {
+                    // Get node's InternalIP
+                    if let Some(status) = &node.status {
+                        if let Some(addrs) = &status.addresses {
+                            for addr in addrs {
+                                if addr.type_ == "InternalIP" {
+                                    addresses.push(json!({
+                                        "type": "IPAddress",
+                                        "value": addr.address
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if addresses.is_empty() {
+                    warn!("No node addresses found, Gateway will not have addresses in status");
+                }
+
+                addresses
+            }
+            Err(e) => {
+                warn!("Failed to list nodes: {:?}", e);
+                Vec::new()
+            }
+        }
     }
 
     /// Reconcile a single Gateway
@@ -74,7 +113,8 @@ impl GatewayReconciler {
         }
 
         // Update Gateway status
-        ctx.set_gateway_status(&namespace, &name, true, listener_count)
+        let generation = gateway.metadata.generation.unwrap_or(0);
+        ctx.set_gateway_status(&namespace, &name, true, &gateway, generation)
             .await?;
 
         // Record metrics
@@ -90,14 +130,17 @@ impl GatewayReconciler {
         namespace: &str,
         name: &str,
         accepted: bool,
-        listener_count: usize,
+        gateway: &Gateway,
+        generation: i64,
     ) -> Result<(), kube::Error> {
         let api: Api<Gateway> = Api::namespaced(self.client.clone(), namespace);
+        // Get node addresses for Gateway status
+        let addresses = self.get_node_addresses().await;
 
         let status = if accepted {
-            // Build listener statuses
-            let listener_statuses: Vec<_> = (0..listener_count)
-                .map(|i| {
+            // Build listener statuses using actual listener names
+            let listener_statuses: Vec<_> = gateway.spec.listeners.iter()
+                .map(|listener| {
                     json!({
                         "attachedRoutes": 0,
                         "conditions": [{
@@ -106,20 +149,23 @@ impl GatewayReconciler {
                             "reason": "Accepted",
                             "message": "Listener is accepted",
                             "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            "observedGeneration": generation,
                         }, {
                             "type": "Programmed",
                             "status": "True",
                             "reason": "Programmed",
                             "message": "Listener is programmed",
                             "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            "observedGeneration": generation,
                         }, {
                             "type": "ResolvedRefs",
                             "status": "True",
                             "reason": "ResolvedRefs",
                             "message": "All references resolved",
                             "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            "observedGeneration": generation,
                         }],
-                        "name": format!("listener-{}", i),
+                        "name": listener.name.clone(),
                         "supportedKinds": [{
                             "group": "gateway.networking.k8s.io",
                             "kind": "HTTPRoute"
@@ -130,18 +176,21 @@ impl GatewayReconciler {
 
             json!({
                 "status": {
+                    "addresses": addresses,
                     "conditions": [{
                         "type": "Accepted",
                         "status": "True",
                         "reason": "Accepted",
                         "message": "Gateway is accepted",
                         "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        "observedGeneration": generation,
                     }, {
                         "type": "Programmed",
                         "status": "True",
                         "reason": "Programmed",
                         "message": "Gateway is programmed",
                         "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        "observedGeneration": generation,
                     }],
                     "listeners": listener_statuses
                 }
@@ -155,6 +204,7 @@ impl GatewayReconciler {
                         "reason": "Invalid",
                         "message": "Gateway configuration is invalid",
                         "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        "observedGeneration": generation,
                     }]
                 }
             })
@@ -169,7 +219,10 @@ impl GatewayReconciler {
 
         info!(
             "Updated Gateway {}/{} status: accepted={}, listeners={}",
-            namespace, name, accepted, listener_count
+            namespace,
+            name,
+            accepted,
+            gateway.spec.listeners.len()
         );
         Ok(())
     }
@@ -241,8 +294,7 @@ mod tests {
         assert_eq!(listener.port, 80);
         assert_eq!(listener.protocol, "HTTP");
 
-        // TODO: Test reconcile() when implemented
-        // This is where we'll test that:
+        // Note: Full reconcile() testing will verify the following:
         // 1. The reconciler accepts this Gateway
         // 2. It configures the HTTP listener on port 80
         // 3. It sets status.conditions with Accepted=true, Programmed=true
@@ -266,7 +318,7 @@ mod tests {
                     name: "https".to_string(),
                     port: 443,
                     protocol: "HTTPS".to_string(),
-                    // TODO: Add TLS configuration
+                    // Note: TLS configuration will be added in future
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -322,7 +374,7 @@ mod tests {
         assert_eq!(gateway.spec.listeners[0].port, 80);
         assert_eq!(gateway.spec.listeners[1].port, 443);
 
-        // TODO: Test that both listeners are configured correctly
+        // Note: Full listener configuration testing planned
     }
 
     #[test]

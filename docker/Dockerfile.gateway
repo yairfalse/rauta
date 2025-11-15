@@ -30,8 +30,8 @@ RUN mkdir -p common/src control/src && \
 # Build dependencies (this layer will be cached)
 RUN cd control && cargo build --release || true
 
-# Remove dummy files
-RUN rm -rf common/src control/src
+# Remove dummy files AND clean build artifacts
+RUN rm -rf common/src control/src target/release/deps/libcommon* target/release/deps/common* target/release/.fingerprint/common*
 
 # Copy actual source code
 COPY common/ common/
@@ -43,7 +43,7 @@ RUN cd control && cargo build --release --bin control
 # ============================================
 # Runtime stage - Minimal image
 # ============================================
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \

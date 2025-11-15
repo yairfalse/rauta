@@ -53,7 +53,7 @@ $ cargo build --release -p control -v 2>&1 | grep lto
 ```
 
 ### ✅ Memory Allocator
-- **jemalloc** (via tikv-jemallocator crate) - optimized for async workloads
+- **jemalloc** (tikv-jemallocator) - optimized for async workloads
 - Better than system allocator for high-concurrency scenarios
 
 ### ✅ HTTP/2 Optimizations
