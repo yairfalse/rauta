@@ -3,6 +3,7 @@
 //! Watches Gateway resources and configures listeners (HTTP, HTTPS, TCP).
 
 use crate::apis::metrics::record_gateway_reconciliation;
+use crate::proxy::listener_manager::{ListenerConfig, ListenerManager, Protocol};
 use futures::StreamExt;
 use gateway_api::apis::standard::gateways::Gateway;
 use k8s_openapi::api::core::v1::Node;
@@ -21,14 +22,21 @@ pub struct GatewayReconciler {
     client: Client,
     /// GatewayClass name to watch for
     gateway_class_name: String,
+    /// Listener manager for dynamic listener lifecycle
+    listener_manager: Arc<ListenerManager>,
 }
 
 #[allow(dead_code)] // Used in K8s mode
 impl GatewayReconciler {
-    pub fn new(client: Client, gateway_class_name: String) -> Self {
+    pub fn new(
+        client: Client,
+        gateway_class_name: String,
+        listener_manager: Arc<ListenerManager>,
+    ) -> Self {
         Self {
             client,
             gateway_class_name,
+            listener_manager,
         }
     }
 
@@ -110,6 +118,48 @@ impl GatewayReconciler {
                 "  - Listener '{}': {}:{}",
                 listener.name, listener.protocol, listener.port
             );
+        }
+
+        // Configure listeners in ListenerManager
+        for listener in &gateway.spec.listeners {
+            // Convert protocol string to Protocol enum
+            let protocol = match listener.protocol.as_str() {
+                "HTTP" => Protocol::HTTP,
+                "HTTPS" => Protocol::HTTPS,
+                _ => {
+                    warn!(
+                        "Unsupported protocol '{}' for listener '{}' in Gateway {}/{}",
+                        listener.protocol, listener.name, namespace, name
+                    );
+                    continue; // Skip unsupported protocols
+                }
+            };
+
+            let config = ListenerConfig {
+                name: listener.name.clone(),
+                protocol,
+                port: listener.port as u16,
+                hostname: listener.hostname.clone(),
+                gateway_namespace: namespace.clone(),
+                gateway_name: name.clone(),
+            };
+
+            match ctx.listener_manager.upsert_listener(config).await {
+                Ok(listener_id) => {
+                    info!(
+                        "Configured listener {} for Gateway {}/{}",
+                        listener_id, namespace, name
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to configure listener '{}' for Gateway {}/{}: {}",
+                        listener.name, namespace, name, e
+                    );
+                    // Continue with other listeners even if one fails
+                    // TODO: Update listener status to reflect failure
+                }
+            }
         }
 
         // Update Gateway status

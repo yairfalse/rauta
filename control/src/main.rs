@@ -20,6 +20,7 @@ use apis::gateway::endpointslice_watcher::watch_endpointslices;
 use apis::gateway::gateway::GatewayReconciler;
 use apis::gateway::gateway_class::GatewayClassReconciler;
 use apis::gateway::http_route::HTTPRouteReconciler;
+use proxy::listener_manager::ListenerManager;
 
 /// RAUTA Control Plane - Stage 1
 ///
@@ -43,6 +44,9 @@ async fn main() -> Result<()> {
 
     // Create shared router (Arc for sharing with controllers)
     let router = Arc::new(Router::new());
+
+    // Create listener manager for Gateway API dynamic listeners
+    let listener_manager = Arc::new(ListenerManager::new(router.clone()));
 
     // Kubernetes Gateway API controllers (optional)
     let mut controller_handles = vec![];
@@ -72,7 +76,8 @@ async fn main() -> Result<()> {
                 // Spawn Gateway controller
                 let gw_client = client.clone();
                 let gw_name = gateway_class_name.clone();
-                let gw_reconciler = GatewayReconciler::new(gw_client, gw_name);
+                let gw_listener_manager = listener_manager.clone();
+                let gw_reconciler = GatewayReconciler::new(gw_client, gw_name, gw_listener_manager);
                 controller_handles.push(tokio::spawn(async move {
                     if let Err(e) = gw_reconciler.run().await {
                         tracing::error!("Gateway controller error: {}", e);

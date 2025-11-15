@@ -25,7 +25,7 @@ trap cleanup EXIT
 
 # Step 1: Start backend (Python slow backend)
 echo -e "${YELLOW}[1/6] Starting slow backend server on port 9090 (3s delay)...${NC}"
-python3 slow_backend.py 9090 > /tmp/backend.log 2>&1 &
+python3 scripts/slow_backend.py 9090 > /tmp/backend.log 2>&1 &
 BACKEND_PID=$!
 echo $BACKEND_PID > /tmp/backend.pid
 sleep 2

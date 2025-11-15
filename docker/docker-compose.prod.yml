@@ -18,8 +18,8 @@ services:
   # RAUTA control plane (XDP load balancer)
   rauta:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: docker/Dockerfile.gateway
     container_name: rauta-control
     privileged: true  # Required for XDP
     cap_add:
