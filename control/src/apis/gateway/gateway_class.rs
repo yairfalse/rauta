@@ -49,7 +49,8 @@ impl GatewayClassReconciler {
         // Check if this GatewayClass is for our controller
         if ctx.should_accept(controller_name) {
             info!("GatewayClass {} has our controllerName, accepting", name);
-            ctx.set_accepted_status(&name, true).await?;
+            let generation = gateway_class.metadata.generation.unwrap_or(0);
+            ctx.set_accepted_status(&name, true, generation).await?;
 
             // Record metrics for accepted GatewayClass
             record_gatewayclass_reconciliation(&name, start.elapsed().as_secs_f64(), "success");
@@ -66,7 +67,12 @@ impl GatewayClassReconciler {
     }
 
     /// Update GatewayClass status with Accepted condition
-    async fn set_accepted_status(&self, name: &str, accepted: bool) -> Result<(), kube::Error> {
+    async fn set_accepted_status(
+        &self,
+        name: &str,
+        accepted: bool,
+        generation: i64,
+    ) -> Result<(), kube::Error> {
         let api: Api<GatewayClass> = Api::all(self.client.clone());
 
         let status = if accepted {
@@ -78,6 +84,7 @@ impl GatewayClassReconciler {
                         "reason": "Accepted",
                         "message": format!("GatewayClass is accepted by controller {}", RAUTA_CONTROLLER_NAME),
                         "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        "observedGeneration": generation,
                     }]
                 }
             })
@@ -90,6 +97,7 @@ impl GatewayClassReconciler {
                         "reason": "InvalidParameters",
                         "message": "GatewayClass configuration is invalid",
                         "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        "observedGeneration": generation,
                     }]
                 }
             })

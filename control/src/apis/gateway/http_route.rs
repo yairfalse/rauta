@@ -332,7 +332,8 @@ impl HTTPRouteReconciler {
         }
 
         // Update HTTPRoute status
-        ctx.set_route_status(&namespace, &name, routes_added > 0)
+        let generation = route.metadata.generation.unwrap_or(0);
+        ctx.set_route_status(&namespace, &name, routes_added > 0, generation)
             .await?;
 
         // Record metrics
@@ -353,9 +354,9 @@ impl HTTPRouteReconciler {
         namespace: &str,
         name: &str,
         accepted: bool,
+        generation: i64,
     ) -> Result<(), kube::Error> {
         let api: Api<HTTPRoute> = Api::namespaced(self.client.clone(), namespace);
-
         let status = if accepted {
             json!({
                 "status": {
@@ -371,12 +372,14 @@ impl HTTPRouteReconciler {
                             "reason": "Accepted",
                             "message": "HTTPRoute is accepted and configured",
                             "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            "observedGeneration": generation,
                         }, {
                             "type": "ResolvedRefs",
                             "status": "True",
                             "reason": "ResolvedRefs",
                             "message": "All backend refs resolved",
                             "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            "observedGeneration": generation,
                         }]
                     }]
                 }
@@ -396,6 +399,7 @@ impl HTTPRouteReconciler {
                             "reason": "NoRules",
                             "message": "HTTPRoute has no valid routing rules",
                             "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            "observedGeneration": generation,
                         }]
                     }]
                 }
