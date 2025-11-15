@@ -113,7 +113,8 @@ impl GatewayReconciler {
         }
 
         // Update Gateway status
-        ctx.set_gateway_status(&namespace, &name, true, &gateway)
+        let generation = gateway.metadata.generation.unwrap_or(0);
+        ctx.set_gateway_status(&namespace, &name, true, &gateway, generation)
             .await?;
 
         // Record metrics
@@ -218,7 +219,10 @@ impl GatewayReconciler {
 
         info!(
             "Updated Gateway {}/{} status: accepted={}, listeners={}",
-            namespace, name, accepted, gateway.spec.listeners.len()
+            namespace,
+            name,
+            accepted,
+            gateway.spec.listeners.len()
         );
         Ok(())
     }

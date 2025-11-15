@@ -1,0 +1,61 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rauta-controller
+  namespace: rauta-system
+  labels:
+    app.kubernetes.io/name: rauta
+    app.kubernetes.io/component: controller
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rauta-controller
+  labels:
+    app.kubernetes.io/name: rauta
+    app.kubernetes.io/component: controller
+rules:
+  # Gateway API resources
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses", "gateways", "httproutes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses/status", "gateways/status", "httproutes/status"]
+    verbs: ["get", "update", "patch"]
+
+  # Core resources for backend resolution
+  - apiGroups: [""]
+    resources: ["services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+
+  # Secrets for TLS certificates
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+
+  # Events for debugging
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rauta-controller
+  labels:
+    app.kubernetes.io/name: rauta
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rauta-controller
+subjects:
+  - kind: ServiceAccount
+    name: rauta-controller
+    namespace: rauta-system

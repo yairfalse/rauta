@@ -1,0 +1,17 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: rauta
+  labels:
+    app.kubernetes.io/name: rauta
+    app.kubernetes.io/component: gatewayclass
+spec:
+  controllerName: rauta.io/gateway-controller
+  description: |
+    RAUTA is a high-performance Rust-based Gateway API implementation.
+    Features:
+    - IPv4 and IPv6 support
+    - Maglev consistent hashing
+    - HTTP/2 connection pooling
+    - Active and passive health checking
+    - 129K+ req/s throughput

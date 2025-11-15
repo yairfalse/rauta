@@ -332,7 +332,8 @@ impl HTTPRouteReconciler {
         }
 
         // Update HTTPRoute status
-        ctx.set_route_status(&namespace, &name, routes_added > 0)
+        let generation = route.metadata.generation.unwrap_or(0);
+        ctx.set_route_status(&namespace, &name, routes_added > 0, generation)
             .await?;
 
         // Record metrics
