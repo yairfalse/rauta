@@ -154,7 +154,7 @@ fn test_path_extraction_simulation() {
     let method = HttpMethod::from_bytes(request).unwrap();
     assert_eq!(method, HttpMethod::GET);
 
-    // Extract path (would be done in BPF)
+    // Extract path (would be done by parser)
     let path_start = method.len() as usize + 1; // Skip "GET "
     let path_end = request[path_start..]
         .iter()
@@ -183,7 +183,7 @@ fn test_path_extraction_simulation() {
 // 3. Protocol Errors - HTTP/2, binary data, truncated
 // 4. Edge Cases - Empty, whitespace, Unicode
 //
-// Expected: All should return None (XDP_PASS to kernel)
+// Expected: All should return None (parse failure)
 // ============================================================================
 
 // Category 1: Malformed Methods
@@ -337,10 +337,10 @@ fn test_negative_path_too_long() {
     // Method should still parse
     assert_eq!(HttpMethod::from_bytes(&long_request), Some(HttpMethod::GET));
 
-    // But path handling would fail in BPF (>256 bytes)
+    // But path handling would fail in parser (>256 bytes)
     let long_path = vec![b'a'; 300];
     let hash = fnv1a_hash(&long_path);
-    // Should complete but would be rejected by BPF verifier
+    // Should complete but would be rejected by parser
     assert_ne!(hash, 0);
 }
 
@@ -406,5 +406,5 @@ fn test_negative_random_bytes_batch() {
 // - Protocol Errors: 4 tests
 // - Edge Cases: 7 tests
 //
-// All negative tests expect None (XDP_PASS to kernel)
+// All negative tests expect None (parse failure)
 // ============================================================================

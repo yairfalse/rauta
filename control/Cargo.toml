@@ -12,10 +12,6 @@ anyhow = "1.0"
 thiserror = "1.0"
 num_cpus = "1.16"
 
-# eBPF (Aya framework) - Stage 2 only (disabled for Stage 1 pure Rust)
-# aya = "0.13"
-# aya-log = "0.2"
-
 # Kubernetes
 kube = { version = ">=1.0, <2.0", features = ["runtime", "derive"] }  # Updated to match k8s-openapi 0.25
 k8s-openapi = { version = "0.25", features = ["v1_31"] }  # Updated to match gateway-api
@@ -67,5 +63,3 @@ tokio-rustls = "0.26"
 rustls-pemfile = "2.1"
 
 [build-dependencies]
-# Note: aya-build is the correct package for build scripts, not aya-gen
-# We don't need this currently as we're not generating bindings

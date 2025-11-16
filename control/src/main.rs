@@ -22,9 +22,9 @@ use apis::gateway::gateway_class::GatewayClassReconciler;
 use apis::gateway::http_route::HTTPRouteReconciler;
 use proxy::listener_manager::ListenerManager;
 
-/// RAUTA Control Plane - Stage 1
+/// RAUTA Control Plane
 ///
-/// Pure Rust userspace HTTP proxy (no eBPF yet)
+/// Pure Rust userspace HTTP proxy with Gateway API support
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize rustls crypto provider (needed for Kubernetes TLS client)

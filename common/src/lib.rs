@@ -2,19 +2,8 @@
 
 //! RAUTA Common Types
 //!
-//! Shared data structures between eBPF and userspace components.
-//! All types are Pod-compatible (Plain Old Data) for BPF map usage.
-
-// Stage 1: Define local Pod trait (no eBPF yet)
-// Stage 4+: Will use aya::Pod when we add eBPF observability
-///
-/// # Safety
-///
-/// Types implementing Pod must be plain-old-data (POD):
-/// - No padding bytes (all bits initialized)
-/// - Safe to transmit via memcpy
-/// - Can be safely cast to/from byte slices
-pub unsafe trait Pod: Copy + 'static {}
+//! Core data structures for HTTP routing, load balancing, and backend management.
+//! All types are no_std compatible and memory-efficient for high-performance routing.
 
 /// Maximum path length for HTTP routing (99%+ coverage)
 pub const MAX_PATH_LEN: usize = 256;
@@ -115,7 +104,7 @@ impl HttpMethod {
     }
 }
 
-/// Key for route lookup in BPF map
+/// Key for route lookup
 /// Uses path hash instead of full path for fast lookup
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -127,9 +116,6 @@ pub struct RouteKey {
     /// Hash of request path (xxHash or FNV-1a)
     pub path_hash: u64,
 }
-
-// Safety: RouteKey is a POD type with no padding or pointers
-unsafe impl Pod for RouteKey {}
 
 impl RouteKey {
     /// Create new route key with FNV-1a hash of path
@@ -174,9 +160,6 @@ pub struct Backend {
     /// Padding for 8-byte alignment
     _pad: [u8; 3],
 }
-
-// Safety: Backend is a POD type with no padding or pointers
-unsafe impl Pod for Backend {}
 
 impl Backend {
     /// Create Backend from IPv4 address
@@ -315,15 +298,15 @@ impl core::fmt::Display for Backend {
 }
 
 /// List of backend servers for a route
-/// Fixed-size array to work with BPF maps
+/// Fixed-size array for backend storage
 ///
 /// Memory layout:
 /// - backends: 32 × 8 bytes = 256 bytes
 /// - count: 4 bytes
-/// - Total: 260 bytes ✅ Fits in BPF stack (512B limit)
+/// - Total: 260 bytes ✅ Memory efficient at 260 bytes
 ///
 /// Note: Maglev tables stored separately in MAGLEV_TABLES map
-/// to avoid BPF stack overflow (table is 4KB)
+/// keeping the table separate (4KB)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BackendList {
@@ -334,9 +317,6 @@ pub struct BackendList {
     /// Padding for alignment
     pub _pad: u32,
 }
-
-// Safety: BackendList is a POD type with no padding or pointers
-unsafe impl Pod for BackendList {}
 
 impl BackendList {
     pub const fn empty() -> Self {
@@ -355,7 +335,7 @@ impl BackendList {
     }
 }
 
-/// Compact Maglev lookup table (stored separately to avoid BPF stack overflow)
+/// Compact Maglev lookup table (stored separately for memory efficiency)
 /// 4KB per route - stored in MAGLEV_TABLES map indexed by path_hash
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -363,9 +343,6 @@ pub struct CompactMaglevTable {
     /// Backend indices (0..MAX_BACKENDS)
     pub table: [u8; COMPACT_MAGLEV_SIZE],
 }
-
-// Safety: CompactMaglevTable is a POD type
-unsafe impl Pod for CompactMaglevTable {}
 
 impl CompactMaglevTable {
     pub const fn empty() -> Self {
@@ -376,15 +353,15 @@ impl CompactMaglevTable {
 }
 
 /// Performance metrics counters
-/// Updated by eBPF, read by userspace
+/// Routing performance metrics
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Metrics {
     /// Total packets processed
     pub packets_total: u64,
-    /// Packets routed in Tier 1 (XDP exact match)
+    /// Packets routed via direct lookup
     pub packets_tier1: u64,
-    /// Packets fallen back to Tier 2 (TC-BPF)
+    /// Packets using fallback path
     pub packets_tier2: u64,
     /// Packets fallen back to Tier 3 (userspace)
     pub packets_tier3: u64,
@@ -395,9 +372,6 @@ pub struct Metrics {
     /// Timestamp of last update (nanoseconds)
     pub last_updated_ns: u64,
 }
-
-// Safety: Metrics is a POD type with no padding or pointers
-unsafe impl Pod for Metrics {}
 
 impl Metrics {
     pub const fn new() -> Self {
@@ -436,7 +410,7 @@ impl Default for Metrics {
 }
 
 /// FNV-1a hash for path strings
-/// Used in both eBPF and userspace for consistent hashing
+/// FNV-1a hash function for consistent hashing
 pub const fn fnv1a_hash(bytes: &[u8]) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
@@ -456,11 +430,8 @@ pub const fn fnv1a_hash(bytes: &[u8]) -> u64 {
 /// Based on Google's Maglev paper: https://research.google/pubs/pub44824/
 ///
 /// Maglev provides O(1) lookup with minimal disruption (~1/N) when backends change.
-#[cfg(not(target_arch = "bpf"))]
 extern crate alloc;
-#[cfg(not(target_arch = "bpf"))]
 use alloc::vec;
-#[cfg(not(target_arch = "bpf"))]
 use alloc::vec::Vec;
 
 /// Build Maglev lookup table for a set of backends
@@ -470,7 +441,6 @@ use alloc::vec::Vec;
 /// - Even distribution across backends
 /// - Minimal disruption when backends change (~1/N)
 /// - Deterministic results for same backend set
-#[cfg(not(target_arch = "bpf"))]
 pub fn maglev_build_table(backends: &[Backend]) -> Vec<Option<u32>> {
     if backends.is_empty() {
         return vec![None; MAGLEV_TABLE_SIZE];
@@ -511,7 +481,6 @@ pub fn maglev_build_table(backends: &[Backend]) -> Vec<Option<u32>> {
 }
 
 /// Generate permutation for a backend using Maglev's double hashing
-#[cfg(not(target_arch = "bpf"))]
 fn generate_permutation(backend: &Backend, backend_idx: u32) -> Vec<usize> {
     // Generate two hash values for offset and skip
     // Hash full 16-byte IP + port for both IPv4 and IPv6 support
@@ -536,7 +505,6 @@ fn generate_permutation(backend: &Backend, backend_idx: u32) -> Vec<usize> {
 }
 
 /// Hash function for Maglev permutation generation
-#[cfg(not(target_arch = "bpf"))]
 fn hash_backend(key: u64, seed: u64) -> u64 {
     // FNV-1a hash with seed
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
@@ -556,7 +524,7 @@ fn hash_backend(key: u64, seed: u64) -> u64 {
 
 /// Lookup backend index for a given flow key using Maglev table
 ///
-/// This is the fast-path function used in XDP.
+/// Fast lookup function using Maglev consistent hashing.
 /// Takes O(1) time.
 #[inline(always)]
 pub fn maglev_lookup(flow_key: u64, table: &[Option<u32>]) -> Option<u32> {
@@ -579,7 +547,6 @@ pub fn maglev_lookup(flow_key: u64, table: &[Option<u32>]) -> Option<u32> {
 ///
 /// # Returns
 /// Vec of u8 backend indices (each < MAX_BACKENDS)
-#[cfg(not(target_arch = "bpf"))]
 pub fn maglev_build_compact_table(backends: &[Backend]) -> Vec<u8> {
     if backends.is_empty() {
         return vec![0u8; COMPACT_MAGLEV_SIZE];
@@ -641,7 +608,6 @@ pub fn maglev_build_compact_table(backends: &[Backend]) -> Vec<u8> {
 }
 
 /// Generate permutation for compact table using Maglev's double hashing
-#[cfg(not(target_arch = "bpf"))]
 fn generate_permutation_compact(backend: &Backend, backend_idx: u32) -> Vec<usize> {
     // Generate two hash values for offset and skip
     // Hash full 16-byte IP + port for both IPv4 and IPv6 support
@@ -667,7 +633,7 @@ fn generate_permutation_compact(backend: &Backend, backend_idx: u32) -> Vec<usiz
 
 /// Lookup backend index in compact Maglev table
 ///
-/// This is the fast-path function for embedded tables in XDP.
+/// Fast lookup function for per-route Maglev tables.
 /// Takes O(1) time.
 #[inline(always)]
 pub fn maglev_lookup_compact(flow_key: u64, table: &[u8]) -> u8 {

@@ -1,23 +1,23 @@
-// TDD RED Phase: Parser Contract Tests
+// Parser Contract Tests
 //
-// Goal: Document the contract that BPF must follow
-// BPF parse_http_method() should use common::HttpMethod::from_bytes()
-// and return (method, method.len())
+// Goal: Validate HTTP method parsing behavior
+// HttpMethod::from_bytes() should correctly parse HTTP methods
+// and return the method length for path extraction
 //
 // Why this matters:
-// - BPF and common had duplicate logic (drift risk!)
-// - Tests only validated common parser
-// - BPF parser could behave differently
+// - Consistent parsing across all components
+// - Tests validate parser behavior
+// - Contract ensures correct path offset calculation
 //
 // TDD Cycle:
-// 1. RED: This test documents expected behavior
-// 2. GREEN: Refactor BPF to use common::HttpMethod::from_bytes()
-// 3. REFACTOR: Remove duplicate code
+// 1. RED: Write test documenting expected behavior
+// 2. GREEN: Implement parser to pass test
+// 3. REFACTOR: Optimize implementation
 
 use common::HttpMethod;
 
 /// Contract: Parser returns method with correct length
-/// This is what BPF parse_http_method() must implement
+/// This validates HttpMethod::from_bytes() behavior
 #[test]
 fn test_parser_contract_method_with_length() {
     // Test all methods return correct (method, length) tuple
@@ -94,7 +94,7 @@ fn test_parser_contract_edge_cases() {
 }
 
 /// Contract: Method length must be accurate for path parsing
-/// BPF uses this to skip "GET " and find "/api/users"
+/// Parser uses this to skip "GET " and find "/api/users"
 #[test]
 fn test_parser_contract_length_for_path_extraction() {
     let request = b"GET /api/users HTTP/1.1";
@@ -122,7 +122,7 @@ fn test_parser_contract_length_for_path_extraction() {
 }
 
 /// Contract: Parser is const-evaluable (no runtime deps)
-/// This allows BPF verifier to optimize it
+/// This allows compiler to optimize it at compile time
 #[test]
 fn test_parser_contract_const_eval() {
     // from_bytes is const fn - can be evaluated at compile time
@@ -134,18 +134,11 @@ fn test_parser_contract_const_eval() {
 }
 
 // ============================================================================
-// RED Phase Complete
+// Contract Tests Complete
 // ============================================================================
 //
-// These tests document the contract. Now:
-//
-// GREEN Phase: Refactor bpf/src/main.rs::parse_http_method() to:
-//
-//   fn parse_http_method(data: &[u8]) -> Option<(HttpMethod, usize)> {
-//       let method = common::HttpMethod::from_bytes(data)?;
-//       let method_len = method.len() as usize;
-//       Some((method, method_len))
-//   }
-//
+// These tests validate the parser contract for HTTP method parsing.
+// The parser must correctly identify methods and return accurate lengths
+// for subsequent path extraction.
 // REFACTOR Phase: Run all tests, verify integration tests pass
 // ============================================================================

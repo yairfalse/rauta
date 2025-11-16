@@ -2,14 +2,28 @@
 
 **Research Date**: 2025-11-02
 **Status**: Feasibility Analysis Complete ✅
+**Scope**: FUTURE research - RAUTA is currently 100% Rust userspace (no eBPF)
+
+---
+
+## Important Context
+
+**RAUTA's Current Architecture** (as of Stage 1):
+- 100% Rust userspace HTTP proxy
+- NO eBPF for L7 routing (XDP cannot parse HTTP/2, TLS - see CLAUDE.md)
+- eBPF observability is a FUTURE possibility (not current implementation)
+
+**This Document**: Research for potential future observability features using eBPF sockops (NOT for routing)
 
 ---
 
 ## Executive Summary
 
-**Finding**: RAUTA can implement **predictive circuit breaking** and **cookie-less session affinity** using eBPF sockops programs - capabilities that Cilium cannot provide because they delegate L7 routing to Envoy.
+**Finding**: RAUTA could potentially implement **predictive circuit breaking** and **cookie-less session affinity** using eBPF sockops programs - capabilities that Cilium cannot provide because they delegate L7 routing to Envoy.
 
-**Key Insight**: By owning both the eBPF observation layer (sockops) and L7 routing decision (Rust workers), RAUTA can act on kernel TCP metrics **before** HTTP requests fail.
+**Key Insight**: By owning both the eBPF observation layer (sockops) and L7 routing decision (Rust workers), RAUTA could act on kernel TCP metrics **before** HTTP requests fail.
+
+**Status**: This is RESEARCH ONLY - not part of current implementation.
 
 ---
 
