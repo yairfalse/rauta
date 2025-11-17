@@ -157,6 +157,7 @@ impl HTTPRouteReconciler {
 /// - Must not be empty
 /// - Must not have trailing slash (except root "/")
 /// - Must not have double slashes
+#[allow(dead_code)]
 fn validate_path(path: &str) -> Result<(), String> {
     if path.is_empty() {
         return Err("Path cannot be empty".to_string());
@@ -185,6 +186,7 @@ fn validate_path(path: &str) -> Result<(), String> {
 /// - Must not have double dots
 /// - Can start with wildcard "*."
 /// - Max length 253 characters
+#[allow(dead_code)]
 fn validate_hostname(hostname: &str) -> Result<(), String> {
     if hostname.is_empty() {
         return Err("Hostname cannot be empty".to_string());
@@ -195,8 +197,8 @@ fn validate_hostname(hostname: &str) -> Result<(), String> {
     }
 
     // Handle wildcard prefix
-    let hostname_to_check = if hostname.starts_with("*.") {
-        &hostname[2..]
+    let hostname_to_check = if let Some(stripped) = hostname.strip_prefix("*.") {
+        stripped
     } else {
         hostname
     };
@@ -246,6 +248,7 @@ fn validate_hostname(hostname: &str) -> Result<(), String> {
 /// - Cannot contain ":" (no HTTP/2 pseudo-headers)
 /// - Cannot contain whitespace or control characters
 /// - Must be ASCII printable (excluding special chars)
+#[allow(dead_code)]
 fn validate_header_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("Header name cannot be empty".to_string());
@@ -276,6 +279,7 @@ fn validate_header_name(name: &str) -> Result<(), String> {
 
 impl HTTPRouteReconciler {
     /// Reconcile a single HTTPRoute
+    #[allow(dead_code)]
     async fn reconcile(route: Arc<HTTPRoute>, ctx: Arc<Self>) -> Result<Action, kube::Error> {
         let start = Instant::now();
         let namespace = route.namespace().unwrap_or_else(|| "default".to_string());
@@ -501,6 +505,7 @@ impl HTTPRouteReconciler {
     }
 
     /// Update HTTPRoute status with Accepted condition
+    #[allow(dead_code)]
     async fn set_route_status(
         &self,
         namespace: &str,
@@ -573,6 +578,7 @@ impl HTTPRouteReconciler {
     }
 
     /// Update HTTPRoute status with validation error (Accepted: False)
+    #[allow(dead_code)]
     async fn set_route_status_invalid(
         &self,
         namespace: &str,
@@ -616,6 +622,7 @@ impl HTTPRouteReconciler {
     }
 
     /// Error handler for controller
+    #[allow(dead_code)]
     fn error_policy(_obj: Arc<HTTPRoute>, error: &kube::Error, _ctx: Arc<Self>) -> Action {
         error!("HTTPRoute reconciliation error: {:?}", error);
         // Retry after 1 minute on errors
@@ -623,6 +630,7 @@ impl HTTPRouteReconciler {
     }
 
     /// Start the HTTPRoute controller
+    #[allow(dead_code)]
     pub async fn run(self) -> Result<(), kube::Error> {
         let api: Api<HTTPRoute> = Api::all(self.client.clone());
         let ctx = Arc::new(self);
@@ -1084,7 +1092,10 @@ mod tests {
         // RED: Test path validation accepts valid paths
         assert!(validate_path("/").is_ok(), "Root path should be valid");
         assert!(validate_path("/api").is_ok(), "Simple path should be valid");
-        assert!(validate_path("/api/v1").is_ok(), "Nested path should be valid");
+        assert!(
+            validate_path("/api/v1").is_ok(),
+            "Nested path should be valid"
+        );
         assert!(
             validate_path("/api/users/123").is_ok(),
             "Path with numbers should be valid"
@@ -1094,10 +1105,7 @@ mod tests {
     #[test]
     fn test_validate_path_invalid() {
         // RED: Test path validation rejects invalid paths
-        assert!(
-            validate_path("").is_err(),
-            "Empty path should be rejected"
-        );
+        assert!(validate_path("").is_err(), "Empty path should be rejected");
         assert!(
             validate_path("api").is_err(),
             "Path without leading slash should be rejected"

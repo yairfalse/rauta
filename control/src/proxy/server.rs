@@ -487,6 +487,7 @@ impl ProxyServer {
 }
 
 /// Convert IPv4 u32 to string format (e.g., "192.168.1.1")
+#[allow(dead_code)]
 fn ipv4_to_string(ipv4: u32) -> String {
     format!(
         "{}.{}.{}.{}",
@@ -1205,10 +1206,7 @@ async fn handle_request(
                         .observe(duration.as_secs_f64());
 
                     // Record backend health for passive health checking (supports IPv4 and IPv6)
-                    router.record_backend_response(
-                        route_match.backend,
-                        status_code,
-                    );
+                    router.record_backend_response(route_match.backend, status_code);
                 }
                 Err(e) => {
                     HTTP_REQUESTS_TOTAL
@@ -1219,10 +1217,7 @@ async fn handle_request(
                         .observe(duration.as_secs_f64());
 
                     // Record backend health (treat connection errors as 500, supports IPv4 and IPv6)
-                    router.record_backend_response(
-                        route_match.backend,
-                        500,
-                    );
+                    router.record_backend_response(route_match.backend, 500);
 
                     error!(
                         request_id = %request_id,

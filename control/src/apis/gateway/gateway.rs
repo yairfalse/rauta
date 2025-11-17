@@ -225,47 +225,39 @@ impl GatewayReconciler {
                 .collect();
 
             json!({
-                "status": {
-                    "addresses": addresses,
-                    "conditions": [{
-                        "type": "Accepted",
-                        "status": "True",
-                        "reason": "Accepted",
-                        "message": "Gateway is accepted",
-                        "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                        "observedGeneration": generation,
-                    }, {
-                        "type": "Programmed",
-                        "status": "True",
-                        "reason": "Programmed",
-                        "message": "Gateway is programmed",
-                        "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                        "observedGeneration": generation,
-                    }],
-                    "listeners": listener_statuses
-                }
+                "addresses": addresses,
+                "conditions": [{
+                    "type": "Accepted",
+                    "status": "True",
+                    "reason": "Accepted",
+                    "message": "Gateway is accepted",
+                    "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    "observedGeneration": generation,
+                }, {
+                    "type": "Programmed",
+                    "status": "True",
+                    "reason": "Programmed",
+                    "message": "Gateway is programmed",
+                    "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    "observedGeneration": generation,
+                }],
+                "listeners": listener_statuses
             })
         } else {
             json!({
-                "status": {
-                    "conditions": [{
-                        "type": "Accepted",
-                        "status": "False",
-                        "reason": "Invalid",
-                        "message": "Gateway configuration is invalid",
-                        "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                        "observedGeneration": generation,
-                    }]
-                }
+                "conditions": [{
+                    "type": "Accepted",
+                    "status": "False",
+                    "reason": "Invalid",
+                    "message": "Gateway configuration is invalid",
+                    "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    "observedGeneration": generation,
+                }]
             })
         };
 
-        api.patch_status(
-            name,
-            &PatchParams::apply("rauta-controller"),
-            &Patch::Merge(&status),
-        )
-        .await?;
+        api.patch_status(name, &PatchParams::default(), &Patch::Merge(&status))
+            .await?;
 
         info!(
             "Updated Gateway {}/{} status: accepted={}, listeners={}",

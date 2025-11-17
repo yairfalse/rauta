@@ -12,7 +12,7 @@ use common::{fnv1a_hash, maglev_build_compact_table, maglev_lookup_compact, Back
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -512,10 +512,7 @@ impl Router {
             let backend = route.backends.get(backend_idx as usize).copied()?;
 
             // Check if backend is healthy (passive health checking)
-            let is_healthy_passive = health
-                .get(&backend)
-                .map(|h| h.is_healthy())
-                .unwrap_or(true); // Default to healthy if no health data
+            let is_healthy_passive = health.get(&backend).map(|h| h.is_healthy()).unwrap_or(true); // Default to healthy if no health data
 
             // Check if backend is healthy (active health checking via TCP probes)
             let is_healthy_active = self.health_checker.is_healthy(&backend);
@@ -550,7 +547,12 @@ impl Router {
     ///
     /// Combines path hash with connection info (if available) to distribute
     /// requests across backends. Falls back to path-only if no connection info.
-    fn compute_flow_hash(&self, path_hash: u64, src_ip: Option<std::net::IpAddr>, src_port: Option<u16>) -> u64 {
+    fn compute_flow_hash(
+        &self,
+        path_hash: u64,
+        src_ip: Option<std::net::IpAddr>,
+        src_port: Option<u16>,
+    ) -> u64 {
         match (src_ip, src_port) {
             (Some(ip), Some(port)) => {
                 // Convert IP to u64 for hashing
@@ -563,12 +565,12 @@ impl Router {
                         // IPv6: XOR upper and lower 64 bits to compress 128-bit address
                         let bytes = v6.octets();
                         let upper = u64::from_be_bytes([
-                            bytes[0], bytes[1], bytes[2], bytes[3],
-                            bytes[4], bytes[5], bytes[6], bytes[7],
+                            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                            bytes[7],
                         ]);
                         let lower = u64::from_be_bytes([
-                            bytes[8], bytes[9], bytes[10], bytes[11],
-                            bytes[12], bytes[13], bytes[14], bytes[15],
+                            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13],
+                            bytes[14], bytes[15],
                         ]);
                         upper ^ lower
                     }
@@ -1112,10 +1114,7 @@ impl Router {
 
             let backend = route.backends.get(backend_idx as usize).copied()?;
 
-            let is_healthy = health
-                .get(&backend)
-                .map(|h| h.is_healthy())
-                .unwrap_or(true);
+            let is_healthy = health.get(&backend).map(|h| h.is_healthy()).unwrap_or(true);
 
             let is_draining = draining.contains_key(&backend);
 
@@ -1196,10 +1195,7 @@ impl Router {
 
             let backend = route.backends.get(backend_idx as usize).copied()?;
 
-            let is_healthy = health
-                .get(&backend)
-                .map(|h| h.is_healthy())
-                .unwrap_or(true);
+            let is_healthy = health.get(&backend).map(|h| h.is_healthy()).unwrap_or(true);
 
             let is_draining = draining.contains_key(&backend);
 
@@ -1592,14 +1588,12 @@ mod tests {
                 .expect("Should find backend");
 
             assert_ne!(
-                route_match.backend,
-                backend_1,
+                route_match.backend, backend_1,
                 "New connections should NOT go to draining backend (attempt {})",
                 i
             );
             assert_eq!(
-                route_match.backend,
-                backend_2,
+                route_match.backend, backend_2,
                 "Should route to healthy backend only"
             );
         }
@@ -2727,10 +2721,6 @@ mod tests {
             "IPv6 backends should be selected (got {})",
             ipv6_count
         );
-        assert_eq!(
-            ipv4_count + ipv6_count,
-            100,
-            "Total should be 100 requests"
-        );
+        assert_eq!(ipv4_count + ipv6_count, 100, "Total should be 100 requests");
     }
 }
