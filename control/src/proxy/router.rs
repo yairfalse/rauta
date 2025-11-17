@@ -12,8 +12,63 @@ use common::{fnv1a_hash, maglev_build_compact_table, maglev_lookup_compact, Back
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, MutexGuard};
 use std::time::{Duration, Instant};
+use tracing::warn;
+
+// ============================================================================
+// CRITICAL FIX: Safe lock access with poison recovery
+// ============================================================================
+//
+// RwLock poisoning occurs when a thread panics while holding the lock.
+// Using .unwrap() on poisoned locks causes cascading panics across all threads.
+//
+// Solution: Recover from poisoned locks by extracting the inner data.
+// The data itself is still valid - poisoning only indicates a thread panicked
+// while holding the lock, NOT that the data is corrupt.
+//
+// Performance: Poison check is ~1ns (single atomic load), negligible overhead.
+
+/// Safe RwLock read access with automatic poison recovery
+///
+/// # Why this is safe
+///
+/// RwLock poisoning means a panic occurred while holding the lock, but:
+/// - The lock still protects the data (no race conditions)
+/// - The data itself is NOT corrupt (panic doesn't corrupt memory in Rust)
+/// - Subsequent readers can safely access the data
+///
+/// We use .into_inner() to extract the guard, logging the poisoning event
+/// for observability but continuing operation.
+#[inline]
+fn safe_read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| {
+        warn!("RwLock poisoned during read, recovering (data is still valid)");
+        poisoned.into_inner()
+    })
+}
+
+/// Safe RwLock write access with automatic poison recovery
+#[inline]
+fn safe_write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|poisoned| {
+        warn!("RwLock poisoned during write, recovering (data is still valid)");
+        poisoned.into_inner()
+    })
+}
+
+/// Safe Mutex access with automatic poison recovery
+#[inline]
+fn safe_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        warn!("Mutex poisoned, recovering (data is still valid)");
+        poisoned.into_inner()
+    })
+}
+
+// ============================================================================
+// End of safe lock helpers
+// ============================================================================
 
 /// Backend draining state (for graceful removal)
 #[derive(Debug, Clone)]
@@ -96,7 +151,7 @@ const MAX_REGEX_CACHE_SIZE: usize = 256;
 /// Returns Arc<Regex> for zero-cost cloning on hot path.
 /// Invalid patterns return None (treated as no match per Gateway API spec).
 fn get_cached_regex(pattern: &str) -> Option<Arc<Regex>> {
-    let mut cache = REGEX_CACHE.lock().unwrap();
+    let mut cache = safe_lock(&REGEX_CACHE);
 
     // Fast path: pattern already cached
     if let Some(regex) = cache.get(pattern) {
@@ -261,7 +316,7 @@ impl Router {
 
         // Check if route already exists with same backends (idempotent fast path)
         {
-            let routes = self.routes.read().unwrap();
+            let routes = safe_read(&self.routes);
             if let Some(existing) = routes.get(&key) {
                 // Compare backends by content (O(n) Vec comparison; can be expensive for large backend lists)
                 if existing.backends.len() == backends.len() && existing.backends == backends {
@@ -295,7 +350,7 @@ impl Router {
 
         // Update routes HashMap (minimize write lock duration)
         {
-            let mut routes = self.routes.write().unwrap();
+            let mut routes = safe_write(&self.routes);
             routes.insert(key, route);
         } // Drop write lock immediately - allows concurrent lookups during rebuild
 
@@ -304,7 +359,7 @@ impl Router {
         // This is O(n) but acceptable for typical K8s Ingress scale (<1000 routes)
         let mut new_prefix_router = matchit::Router::new();
         {
-            let routes = self.routes.read().unwrap();
+            let routes = safe_read(&self.routes);
             for (route_key, route) in routes.iter() {
                 let path_str = route.pattern.as_ref();
 
@@ -328,7 +383,7 @@ impl Router {
 
         // Swap in new prefix router atomically (brief write lock)
         {
-            let mut prefix_router = self.prefix_router.write().unwrap();
+            let mut prefix_router = safe_write(&self.prefix_router);
             *prefix_router = new_prefix_router;
         }
 
@@ -405,18 +460,18 @@ impl Router {
 
         // Try exact match first, then prefix match
         let route_key = {
-            let routes = self.routes.read().unwrap();
+            let routes = safe_read(&self.routes);
             if routes.contains_key(&key) {
                 Some(key)
             } else {
                 // Prefix match via matchit
-                let prefix_router = self.prefix_router.read().unwrap();
+                let prefix_router = safe_read(&self.prefix_router);
                 prefix_router.at(path).ok().map(|m| *m.value)
             }
         }?;
 
         // Look up route
-        let routes = self.routes.read().unwrap();
+        let routes = safe_read(&self.routes);
         let route = routes.get(&route_key)?;
 
         // GREEN phase: Check method constraints (Gateway API)
@@ -432,8 +487,8 @@ impl Router {
         let flow_hash = self.compute_flow_hash(path_hash, src_ip, src_port);
 
         // Try up to all backends to find one that is BOTH healthy AND not draining
-        let health = self.backend_health.read().unwrap();
-        let draining = self.draining_backends.read().unwrap();
+        let health = safe_read(&self.backend_health);
+        let draining = safe_read(&self.draining_backends);
 
         // Track which backend indices we've tried to avoid infinite loops
         let mut tried_indices = HashSet::new();
