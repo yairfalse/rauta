@@ -458,7 +458,7 @@ impl Router {
         &self,
         method: HttpMethod,
         path: &str,
-        src_ip: Option<u32>,
+        src_ip: Option<std::net::IpAddr>,
         src_port: Option<u16>,
     ) -> Option<RouteMatch> {
         let path_hash = fnv1a_hash(path.as_bytes());
@@ -550,12 +550,33 @@ impl Router {
     ///
     /// Combines path hash with connection info (if available) to distribute
     /// requests across backends. Falls back to path-only if no connection info.
-    fn compute_flow_hash(&self, path_hash: u64, src_ip: Option<u32>, src_port: Option<u16>) -> u64 {
+    fn compute_flow_hash(&self, path_hash: u64, src_ip: Option<std::net::IpAddr>, src_port: Option<u16>) -> u64 {
         match (src_ip, src_port) {
             (Some(ip), Some(port)) => {
-                // Hash = path_hash XOR (ip << 16 | port)
+                // Convert IP to u64 for hashing
+                let ip_hash = match ip {
+                    std::net::IpAddr::V4(v4) => {
+                        // IPv4: use the 32-bit address directly
+                        u32::from(v4) as u64
+                    }
+                    std::net::IpAddr::V6(v6) => {
+                        // IPv6: XOR upper and lower 64 bits to compress 128-bit address
+                        let bytes = v6.octets();
+                        let upper = u64::from_be_bytes([
+                            bytes[0], bytes[1], bytes[2], bytes[3],
+                            bytes[4], bytes[5], bytes[6], bytes[7],
+                        ]);
+                        let lower = u64::from_be_bytes([
+                            bytes[8], bytes[9], bytes[10], bytes[11],
+                            bytes[12], bytes[13], bytes[14], bytes[15],
+                        ]);
+                        upper ^ lower
+                    }
+                };
+
+                // Hash = path_hash XOR (ip_hash << 16 | port)
                 // This mixes path and connection info for good distribution
-                path_hash ^ ((ip as u64) << 16 | port as u64)
+                path_hash ^ (ip_hash << 16 | port as u64)
             }
             _ => {
                 // No connection info - fall back to path-only
@@ -1044,7 +1065,7 @@ impl Router {
         method: HttpMethod,
         path: &str,
         request_headers: Vec<(&str, &str)>,
-        src_ip: Option<u32>,
+        src_ip: Option<std::net::IpAddr>,
         src_port: Option<u16>,
     ) -> Option<RouteMatch> {
         // GREEN phase: Full header matching implementation
@@ -1128,7 +1149,7 @@ impl Router {
         method: HttpMethod,
         path: &str,
         query_params: Vec<(&str, &str)>,
-        src_ip: Option<u32>,
+        src_ip: Option<std::net::IpAddr>,
         src_port: Option<u16>,
     ) -> Option<RouteMatch> {
         // GREEN phase: Full query parameter matching implementation
@@ -1404,7 +1425,7 @@ mod tests {
             let path = format!("/api/users/{}", i);
 
             // Simulate different source IPs/ports for load distribution
-            let src_ip = 0x0a000001 + (i as u32); // 10.0.0.1 + i
+            let src_ip = std::net::IpAddr::V4(Ipv4Addr::from(0x0a000001 + (i as u32))); // 10.0.0.1 + i
             let src_port = 50000 + (i as u16);
 
             let route_match = router
@@ -1516,7 +1537,7 @@ mod tests {
                 .select_backend(
                     HttpMethod::GET,
                     "/api/test",
-                    Some(0x0100007f + i), // Vary source IP
+                    Some(std::net::IpAddr::V4(Ipv4Addr::from(0x0100007f + i))), // Vary source IP
                     Some((i % 65535) as u16),
                 )
                 .expect("Should find backend");
@@ -1563,7 +1584,7 @@ mod tests {
         // NEW connections should NOT go to draining backend
         // Try 100 times to ensure we don't get the draining backend
         for i in 0..100 {
-            let src_ip = Some(0x0a000001 + i); // Vary IP to test distribution
+            let src_ip = Some(std::net::IpAddr::V4(Ipv4Addr::from(0x0a000001 + i))); // Vary IP to test distribution
             let src_port = Some((50000 + i) as u16);
 
             let route_match = router
@@ -1612,7 +1633,7 @@ mod tests {
         // Test distribution over 1000 requests
         let mut distribution = std::collections::HashMap::new();
         for i in 0..1000 {
-            let src_ip = Some(0x0a000001 + i);
+            let src_ip = Some(std::net::IpAddr::V4(Ipv4Addr::from(0x0a000001 + i)));
             let src_port = Some((50000 + (i % 60000)) as u16);
 
             let route_match = router
@@ -2581,6 +2602,135 @@ mod tests {
             timeout_config.backend_request,
             Some(Duration::from_secs(10)),
             "Backend request timeout should be 10s"
+        );
+    }
+
+    #[test]
+    fn test_router_select_backend_ipv6() {
+        // Test IPv6 backend selection (dual-stack support)
+        let router = Router::new();
+
+        // Add route with IPv6 backends: GET /api/v6 -> [2001:db8::1:8080, 2001:db8::2:8080]
+        let backends = vec![
+            Backend::from_ipv6("2001:db8::1".parse().unwrap(), 8080, 100),
+            Backend::from_ipv6("2001:db8::2".parse().unwrap(), 8080, 100),
+        ];
+
+        router
+            .add_route(HttpMethod::GET, "/api/v6", backends)
+            .expect("Should add IPv6 route");
+
+        // Select backend for IPv6 route
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/api/v6", None, None)
+            .expect("Should find IPv6 backend");
+
+        // Verify it's an IPv6 backend
+        assert!(route_match.backend.is_ipv6(), "Backend should be IPv6");
+        let backend_ip = route_match.backend.as_ipv6().unwrap();
+        assert!(
+            backend_ip == "2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap()
+                || backend_ip == "2001:db8::2".parse::<std::net::Ipv6Addr>().unwrap(),
+            "Should select one of the IPv6 backends"
+        );
+        assert_eq!(route_match.backend.port, 8080);
+        assert_eq!(route_match.pattern.as_ref(), "/api/v6");
+    }
+
+    #[test]
+    fn test_router_maglev_distribution_ipv6() {
+        // Test Maglev consistent hashing works with IPv6 backends
+        let router = Router::new();
+
+        let backends = vec![
+            Backend::from_ipv6("2001:db8::1".parse().unwrap(), 8080, 100),
+            Backend::from_ipv6("2001:db8::2".parse().unwrap(), 8080, 100),
+            Backend::from_ipv6("2001:db8::3".parse().unwrap(), 8080, 100),
+        ];
+
+        router
+            .add_route(HttpMethod::GET, "/api/v6/users", backends)
+            .expect("Should add IPv6 route");
+
+        // Simulate 10K requests with varying source IPs
+        let mut distribution = std::collections::HashMap::new();
+        for i in 0..10_000 {
+            // Create IPv6 address 2001:db8::i
+            let ipv6_int = (0x20010db8u128 << 96) | (i as u128);
+            let src_ip = Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(ipv6_int)));
+            let src_port = Some((i % 65535) as u16);
+
+            let route_match = router
+                .select_backend(HttpMethod::GET, "/api/v6/users", src_ip, src_port)
+                .expect("Should find backend");
+
+            // Count by Backend (not IP) since Backend implements Hash
+            *distribution.entry(route_match.backend).or_insert(0) += 1;
+        }
+
+        // Each backend should get ~33% (within 5% variance)
+        assert_eq!(distribution.len(), 3, "Should use all 3 backends");
+        for (backend, count) in distribution.iter() {
+            let percentage = (*count as f64) / 10_000.0;
+            assert!(
+                (percentage - 0.33).abs() < 0.05,
+                "Backend {:?} got {}% (expected ~33%)",
+                backend,
+                percentage * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn test_router_mixed_ipv4_ipv6_backends() {
+        // Test dual-stack: route with BOTH IPv4 and IPv6 backends
+        let router = Router::new();
+
+        let backends = vec![
+            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100),
+            Backend::from_ipv6("2001:db8::1".parse().unwrap(), 8080, 100),
+            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100),
+            Backend::from_ipv6("2001:db8::2".parse().unwrap(), 8080, 100),
+        ];
+
+        router
+            .add_route(HttpMethod::GET, "/api/dual", backends)
+            .expect("Should add dual-stack route");
+
+        // Select backend 100 times to ensure both IPv4 and IPv6 are used
+        let mut ipv4_count = 0;
+        let mut ipv6_count = 0;
+
+        for i in 0..100 {
+            let src_ip = Some(std::net::IpAddr::V4(Ipv4Addr::from(0x0a000000 + i))); // Vary source IP
+            let src_port = Some((i % 65535) as u16);
+
+            let route_match = router
+                .select_backend(HttpMethod::GET, "/api/dual", src_ip, src_port)
+                .expect("Should find backend");
+
+            if route_match.backend.is_ipv6() {
+                ipv6_count += 1;
+            } else {
+                ipv4_count += 1;
+            }
+        }
+
+        // Both IPv4 and IPv6 should be selected
+        assert!(
+            ipv4_count > 0,
+            "IPv4 backends should be selected (got {})",
+            ipv4_count
+        );
+        assert!(
+            ipv6_count > 0,
+            "IPv6 backends should be selected (got {})",
+            ipv6_count
+        );
+        assert_eq!(
+            ipv4_count + ipv6_count,
+            100,
+            "Total should be 100 requests"
         );
     }
 }
