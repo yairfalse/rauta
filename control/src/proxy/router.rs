@@ -270,9 +270,9 @@ pub struct Router {
     routes: Arc<RwLock<HashMap<RouteKey, Route>>>,
     prefix_router: Arc<RwLock<matchit::Router<RouteKey>>>,
     /// Backends marked for draining (graceful removal)
-    draining_backends: Arc<RwLock<HashMap<u32, BackendDraining>>>,
-    /// Backend health tracking (key = backend IPv4 address)
-    backend_health: Arc<RwLock<HashMap<u32, BackendHealth>>>,
+    draining_backends: Arc<RwLock<HashMap<Backend, BackendDraining>>>,
+    /// Backend health tracking (supports both IPv4 and IPv6)
+    backend_health: Arc<RwLock<HashMap<Backend, BackendHealth>>>,
     /// Active health checker (TCP probes)
     health_checker: Arc<HealthChecker>,
 }
@@ -413,17 +413,21 @@ impl Router {
     /// This implements Google's Maglev pattern: "rolling restart of machines
     /// to upgrade Maglevs in a cluster, draining traffic from each one a few
     /// moments beforehand"
+    ///
+    /// **Supports both IPv4 and IPv6** backends.
     #[allow(dead_code)] // Used in tests and future EndpointSlice integration
-    pub fn drain_backend(&self, backend_ip: u32, drain_timeout: Duration) {
+    pub fn drain_backend(&self, backend: Backend, drain_timeout: Duration) {
         let mut draining = self.draining_backends.write().unwrap();
-        draining.insert(backend_ip, BackendDraining::new(drain_timeout));
+        draining.insert(backend, BackendDraining::new(drain_timeout));
     }
 
     /// Check if backend is marked for draining
+    ///
+    /// **Supports both IPv4 and IPv6** backends.
     #[allow(dead_code)] // Used in tests
-    pub fn is_backend_draining(&self, backend_ip: u32) -> bool {
+    pub fn is_backend_draining(&self, backend: Backend) -> bool {
         let draining = self.draining_backends.read().unwrap();
-        draining.contains_key(&backend_ip)
+        draining.contains_key(&backend)
     }
 
     /// Clean up expired draining backends
@@ -437,9 +441,11 @@ impl Router {
     ///
     /// Tracks success (2xx-4xx) and error (5xx) responses per backend.
     /// Used to calculate error rate and exclude unhealthy backends.
-    pub fn record_backend_response(&self, backend_ip: u32, status_code: u16) {
-        let mut health = self.backend_health.write().unwrap();
-        let backend_health = health.entry(backend_ip).or_insert_with(BackendHealth::new);
+    ///
+    /// **Supports both IPv4 and IPv6** backends.
+    pub fn record_backend_response(&self, backend: Backend, status_code: u16) {
+        let mut health = safe_write(&self.backend_health);
+        let backend_health = health.entry(backend).or_insert_with(BackendHealth::new);
         backend_health.record_response(status_code);
     }
 
@@ -506,9 +512,8 @@ impl Router {
             let backend = route.backends.get(backend_idx as usize).copied()?;
 
             // Check if backend is healthy (passive health checking)
-            let backend_ipv4 = backend.ipv4_as_u32();
             let is_healthy_passive = health
-                .get(&backend_ipv4)
+                .get(&backend)
                 .map(|h| h.is_healthy())
                 .unwrap_or(true); // Default to healthy if no health data
 
@@ -516,7 +521,7 @@ impl Router {
             let is_healthy_active = self.health_checker.is_healthy(&backend);
 
             // Check if backend is draining (connection draining)
-            let is_draining = draining.contains_key(&backend_ipv4);
+            let is_draining = draining.contains_key(&backend);
 
             // Skip if unhealthy (passive OR active) OR draining
             if !is_healthy_passive || !is_healthy_active || is_draining {
@@ -1086,13 +1091,12 @@ impl Router {
 
             let backend = route.backends.get(backend_idx as usize).copied()?;
 
-            let backend_ipv4 = backend.ipv4_as_u32();
             let is_healthy = health
-                .get(&backend_ipv4)
+                .get(&backend)
                 .map(|h| h.is_healthy())
                 .unwrap_or(true);
 
-            let is_draining = draining.contains_key(&backend_ipv4);
+            let is_draining = draining.contains_key(&backend);
 
             if !is_healthy || is_draining {
                 if tried_indices.len() == route.backends.len() {
@@ -1171,13 +1175,12 @@ impl Router {
 
             let backend = route.backends.get(backend_idx as usize).copied()?;
 
-            let backend_ipv4 = backend.ipv4_as_u32();
             let is_healthy = health
-                .get(&backend_ipv4)
+                .get(&backend)
                 .map(|h| h.is_healthy())
                 .unwrap_or(true);
 
-            let is_draining = draining.contains_key(&backend_ipv4);
+            let is_draining = draining.contains_key(&backend);
 
             if !is_healthy || is_draining {
                 if tried_indices.len() == route.backends.len() {
@@ -1487,25 +1490,22 @@ mod tests {
         let router = Router::new();
 
         // Add route with 2 backends
-        let backends = vec![
-            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100), // Backend 1
-            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100), // Backend 2
-        ];
+        let backend1 = Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100); // Backend 1
+        let backend2 = Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100); // Backend 2
+        let backends = vec![backend1, backend2];
 
         router
             .add_route(HttpMethod::GET, "/api/test", backends)
             .expect("Should add route");
 
         // Simulate 10 requests to backend 10.0.1.1 - all return 500 (unhealthy)
-        let backend1_ip = u32::from(Ipv4Addr::new(10, 0, 1, 1));
         for _ in 0..10 {
-            router.record_backend_response(backend1_ip, 500);
+            router.record_backend_response(backend1, 500);
         }
 
         // Simulate 10 requests to backend 10.0.1.2 - all return 200 (healthy)
-        let backend2_ip = u32::from(Ipv4Addr::new(10, 0, 1, 2));
         for _ in 0..10 {
-            router.record_backend_response(backend2_ip, 200);
+            router.record_backend_response(backend2, 200);
         }
 
         // Now when we select a backend, it should ONLY return the healthy one (10.0.1.2)
@@ -1521,22 +1521,22 @@ mod tests {
                 )
                 .expect("Should find backend");
 
-            selected_backends.insert(route_match.backend.as_ipv4().unwrap());
+            selected_backends.insert(route_match.backend);
         }
 
-        // Should ONLY see the healthy backend (10.0.1.2)
+        // Should ONLY see the healthy backend (backend2)
         assert_eq!(
             selected_backends.len(),
             1,
             "Should only use 1 healthy backend"
         );
         assert!(
-            selected_backends.contains(&Ipv4Addr::new(10, 0, 1, 2)),
-            "Should only use healthy backend 10.0.1.2"
+            selected_backends.contains(&backend2),
+            "Should only use healthy backend2 (10.0.1.2)"
         );
         assert!(
-            !selected_backends.contains(&Ipv4Addr::new(10, 0, 1, 1)),
-            "Should NOT use unhealthy backend 10.0.1.1"
+            !selected_backends.contains(&backend1),
+            "Should NOT use unhealthy backend1 (10.0.1.1)"
         );
     }
 
@@ -1550,17 +1550,15 @@ mod tests {
         let router = Router::new();
 
         // Add route with 2 backends
-        let backends = vec![
-            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100),
-            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100),
-        ];
+        let backend_1 = Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100);
+        let backend_2 = Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100);
+        let backends = vec![backend_1, backend_2];
         router
             .add_route(HttpMethod::GET, "/api/users", backends)
             .expect("Add route should succeed");
 
         // Mark first backend for draining (30 second grace period)
-        let backend_to_drain = u32::from(Ipv4Addr::new(10, 0, 1, 1));
-        router.drain_backend(backend_to_drain, Duration::from_secs(30));
+        router.drain_backend(backend_1, Duration::from_secs(30));
 
         // NEW connections should NOT go to draining backend
         // Try 100 times to ensure we don't get the draining backend
@@ -1573,14 +1571,14 @@ mod tests {
                 .expect("Should find backend");
 
             assert_ne!(
-                u32::from(route_match.backend.as_ipv4().unwrap()),
-                backend_to_drain,
+                route_match.backend,
+                backend_1,
                 "New connections should NOT go to draining backend (attempt {})",
                 i
             );
             assert_eq!(
-                route_match.backend.as_ipv4().unwrap(),
-                Ipv4Addr::new(10, 0, 1, 2),
+                route_match.backend,
+                backend_2,
                 "Should route to healthy backend only"
             );
         }
@@ -1588,7 +1586,7 @@ mod tests {
         // Verify draining backend is still in routes (not removed yet)
         // This allows existing connections to finish gracefully
         assert!(
-            router.is_backend_draining(backend_to_drain),
+            router.is_backend_draining(backend_1),
             "Backend should be marked as draining"
         );
     }
