@@ -191,6 +191,57 @@ impl GatewayReconciler {
             // Build listener statuses using actual listener names
             let listener_statuses: Vec<_> = gateway.spec.listeners.iter()
                 .map(|listener| {
+                    // RAUTA currently only supports HTTPRoute
+                    let rauta_supported_kinds = ["HTTPRoute"];
+
+                    // Validate listener.allowedRoutes.kinds
+                    let (resolved_refs_status, resolved_refs_reason, resolved_refs_message, supported_kinds) =
+                        if let Some(allowed_routes) = &listener.allowed_routes {
+                            if let Some(kinds) = &allowed_routes.kinds {
+                                if kinds.is_empty() {
+                                    // Empty kinds list is invalid
+                                    ("False", "InvalidRouteKinds", "No route kinds specified", vec![])
+                                } else {
+                                    // Filter to only supported kinds
+                                    let valid_kinds: Vec<_> = kinds.iter()
+                                        .filter(|k| rauta_supported_kinds.contains(&k.kind.as_str()))
+                                        .collect();
+
+                                    if valid_kinds.is_empty() {
+                                        // No supported kinds found
+                                        ("False", "InvalidRouteKinds", "No supported route kinds found", vec![])
+                                    } else {
+                                        // At least one supported kind found
+                                        let supported: Vec<_> = valid_kinds.iter()
+                                            .map(|k| {
+                                                json!({
+                                                    "group": k.group.as_ref().unwrap_or(&"gateway.networking.k8s.io".to_string()),
+                                                    "kind": k.kind.clone()
+                                                })
+                                            })
+                                            .collect();
+                                        ("True", "ResolvedRefs", "All references resolved", supported)
+                                    }
+                                }
+                            } else {
+                                // No kinds specified, use default based on protocol
+                                ("True", "ResolvedRefs", "All references resolved", vec![
+                                    json!({
+                                        "group": "gateway.networking.k8s.io",
+                                        "kind": "HTTPRoute"
+                                    })
+                                ])
+                            }
+                        } else {
+                            // No allowedRoutes specified, use default based on protocol
+                            ("True", "ResolvedRefs", "All references resolved", vec![
+                                json!({
+                                    "group": "gateway.networking.k8s.io",
+                                    "kind": "HTTPRoute"
+                                })
+                            ])
+                        };
+
                     json!({
                         "attachedRoutes": 0,
                         "conditions": [{
@@ -209,17 +260,14 @@ impl GatewayReconciler {
                             "observedGeneration": generation,
                         }, {
                             "type": "ResolvedRefs",
-                            "status": "True",
-                            "reason": "ResolvedRefs",
-                            "message": "All references resolved",
+                            "status": resolved_refs_status,
+                            "reason": resolved_refs_reason,
+                            "message": resolved_refs_message,
                             "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                             "observedGeneration": generation,
                         }],
                         "name": listener.name.clone(),
-                        "supportedKinds": [{
-                            "group": "gateway.networking.k8s.io",
-                            "kind": "HTTPRoute"
-                        }]
+                        "supportedKinds": supported_kinds
                     })
                 })
                 .collect();
