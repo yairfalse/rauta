@@ -1,71 +1,93 @@
-# RAUTA Gateway Controller - Minimal Build
+# RAUTA Gateway Controller - Optimized Multi-Stage Build
 #
 # Multi-stage Docker build for Gateway API controller only (no BPF)
-# Optimized for kind deployment and testing
+# Optimized for kind deployment and production use
+#
+# Best practices applied:
+# - Multi-stage build to minimize final image size
+# - Dependency caching layer for faster rebuilds
+# - Minimal runtime dependencies
+# - Non-root user for security
+# - Explicit COPY ordering for cache efficiency
 
 # ============================================
 # Build stage - Compile control plane only
 # ============================================
-FROM rust:1.83-bookworm AS builder
+FROM rustlang/rust:nightly-bookworm AS builder
 
-# Install minimal build dependencies
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+# Install minimal build dependencies in single layer
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        pkg-config \
+        libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /rauta
 
-# Copy workspace manifests
-COPY Cargo.toml Cargo.toml
-COPY common/Cargo.toml common/Cargo.toml
-COPY control/Cargo.toml control/Cargo.toml
+# Copy workspace manifests FIRST (better layer caching)
+COPY Cargo.toml ./
+COPY common/Cargo.toml common/
+COPY control/Cargo.toml control/
 
 # Create dummy source files to cache dependencies
 RUN mkdir -p common/src control/src && \
     echo "pub fn dummy() {}" > common/src/lib.rs && \
-    echo "fn main() {}" > control/src/main.rs
+    echo "fn main() {}" > control/src/main.rs && \
+    cd control && \
+    cargo build --release && \
+    rm -rf ../common/src ../control/src \
+        target/release/deps/libcommon* \
+        target/release/deps/common* \
+        target/release/.fingerprint/common* \
+        target/release/control*
 
-# Build dependencies (this layer will be cached)
-RUN cd control && cargo build --release || true
+# Copy actual source code (this invalidates cache when source changes)
+COPY common/src common/src
+COPY control/src control/src
 
-# Remove dummy files AND clean build artifacts
-RUN rm -rf common/src control/src target/release/deps/libcommon* target/release/deps/common* target/release/.fingerprint/common*
-
-# Copy actual source code
-COPY common/ common/
-COPY control/ control/
-
-# Build release binary
-RUN cd control && cargo build --release --bin control
+# Build release binary with optimizations
+RUN cd control && \
+    cargo build --release --bin control && \
+    strip target/release/control
 
 # ============================================
 # Runtime stage - Minimal image
 # ============================================
-FROM ubuntu:24.04
+FROM ubuntu:24.04 AS runtime
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+# Install runtime dependencies in single layer
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl && \
+    rm -rf /var/lib/apt/lists/*
 
-# Create rauta user
-RUN useradd -m -s /bin/bash rauta
+# Create non-root user with specific UID for security
+RUN useradd -m -u 1000 -s /bin/bash rauta
 
-# Copy binary from builder
-COPY --from=builder /rauta/target/release/control /usr/local/bin/control
+# Copy binary from builder (single layer, set permissions in COPY)
+COPY --from=builder --chown=rauta:rauta \
+    /rauta/target/release/control \
+    /usr/local/bin/control
 
-# Set ownership
-RUN chown rauta:rauta /usr/local/bin/control
-
-# Switch to rauta user
+# Switch to non-root user
 USER rauta
 WORKDIR /home/rauta
 
-# Expose ports
+# Expose ports (documentation only, doesn't publish)
 EXPOSE 80 443 9090
 
-# Run control plane
+# Add healthcheck for Kubernetes liveness/readiness
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:9090/metrics || exit 1
+
+# Use exec form for proper signal handling
 ENTRYPOINT ["/usr/local/bin/control"]
+
+# Labels for metadata (OCI standard)
+LABEL org.opencontainers.image.title="RAUTA Gateway Controller" \
+      org.opencontainers.image.description="Kubernetes Gateway API controller with WASM plugin support" \
+      org.opencontainers.image.vendor="RAUTA" \
+      org.opencontainers.image.source="https://github.com/yairfalse/rauta" \
+      org.opencontainers.image.licenses="MIT"
