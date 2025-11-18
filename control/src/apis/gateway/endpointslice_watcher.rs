@@ -441,7 +441,9 @@ mod tests {
                 .select_backend(
                     HttpMethod::GET,
                     "/api/users",
-                    Some(0x0100007f + i), // Vary source IP
+                    Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                        0x0100007f + i,
+                    ))), // Vary source IP
                     Some((i % 65535) as u16),
                 )
                 .expect("Should find backend");
@@ -678,7 +680,9 @@ mod tests {
                 .select_backend(
                     HttpMethod::GET,
                     "/api/users",
-                    Some(0x0100007f + i), // Vary source IP
+                    Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                        0x0100007f + i,
+                    ))), // Vary source IP
                     Some((i % 65535) as u16),
                 )
                 .expect("Should find backend");

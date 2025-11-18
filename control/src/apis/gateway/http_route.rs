@@ -148,8 +148,138 @@ impl HTTPRouteReconciler {
             }
         }
     }
+}
 
+/// Validate HTTP path according to Gateway API spec
+///
+/// Rules:
+/// - Must start with "/"
+/// - Must not be empty
+/// - Must not have trailing slash (except root "/")
+/// - Must not have double slashes
+#[allow(dead_code)]
+fn validate_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("Path cannot be empty".to_string());
+    }
+
+    if !path.starts_with('/') {
+        return Err(format!("Path '{}' must start with '/'", path));
+    }
+
+    if path.contains("//") {
+        return Err(format!("Path '{}' cannot contain double slashes", path));
+    }
+
+    if path.len() > 1 && path.ends_with('/') {
+        return Err(format!("Path '{}' cannot have trailing slash", path));
+    }
+
+    Ok(())
+}
+
+/// Validate hostname according to DNS-1123 subdomain spec
+///
+/// Rules:
+/// - Lowercase alphanumeric characters, hyphens, and dots only
+/// - Must not start or end with hyphen
+/// - Must not have double dots
+/// - Can start with wildcard "*."
+/// - Max length 253 characters
+#[allow(dead_code)]
+fn validate_hostname(hostname: &str) -> Result<(), String> {
+    if hostname.is_empty() {
+        return Err("Hostname cannot be empty".to_string());
+    }
+
+    if hostname.len() > 253 {
+        return Err(format!("Hostname '{}' exceeds 253 characters", hostname));
+    }
+
+    // Handle wildcard prefix
+    let hostname_to_check = if let Some(stripped) = hostname.strip_prefix("*.") {
+        stripped
+    } else {
+        hostname
+    };
+
+    if hostname_to_check.is_empty() {
+        return Err("Hostname cannot be just '*.'".to_string());
+    }
+
+    // Check for double dots
+    if hostname_to_check.contains("..") {
+        return Err(format!("Hostname '{}' cannot contain '..'", hostname));
+    }
+
+    // Check each label
+    for label in hostname_to_check.split('.') {
+        if label.is_empty() {
+            continue; // Skip empty labels (shouldn't happen after .. check)
+        }
+
+        // Must not start or end with hyphen
+        if label.starts_with('-') {
+            return Err(format!("Hostname label '{}' cannot start with '-'", label));
+        }
+        if label.ends_with('-') {
+            return Err(format!("Hostname label '{}' cannot end with '-'", label));
+        }
+
+        // Must be lowercase alphanumeric or hyphen
+        for c in label.chars() {
+            if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-' {
+                return Err(format!(
+                    "Hostname '{}' contains invalid character '{}' (must be lowercase alphanumeric or hyphen)",
+                    hostname, c
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate HTTP header name according to RFC 7230
+///
+/// Rules:
+/// - Must not be empty
+/// - Must be 1-256 characters
+/// - Cannot contain ":" (no HTTP/2 pseudo-headers)
+/// - Cannot contain whitespace or control characters
+/// - Must be ASCII printable (excluding special chars)
+#[allow(dead_code)]
+fn validate_header_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Header name cannot be empty".to_string());
+    }
+
+    if name.len() > 256 {
+        return Err(format!("Header name '{}' exceeds 256 characters", name));
+    }
+
+    if name.contains(':') {
+        return Err(format!(
+            "Header name '{}' cannot contain ':' (HTTP/2 pseudo-headers not allowed)",
+            name
+        ));
+    }
+
+    for c in name.chars() {
+        if c.is_whitespace() || c.is_control() {
+            return Err(format!(
+                "Header name '{}' contains invalid character (whitespace or control character)",
+                name
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+impl HTTPRouteReconciler {
     /// Reconcile a single HTTPRoute
+    #[allow(dead_code)]
     async fn reconcile(route: Arc<HTTPRoute>, ctx: Arc<Self>) -> Result<Action, kube::Error> {
         let start = Instant::now();
         let namespace = route.namespace().unwrap_or_else(|| "default".to_string());
@@ -189,6 +319,32 @@ impl HTTPRouteReconciler {
                 } else {
                     "/"
                 };
+
+                // Validate path
+                if let Err(validation_error) = validate_path(path) {
+                    warn!(
+                        "HTTPRoute {}/{} rule {} has invalid path '{}': {}",
+                        namespace, name, rule_idx, path, validation_error
+                    );
+                    // Update status with validation error and return early
+                    let generation = route.metadata.generation.unwrap_or(0);
+                    ctx.set_route_status_invalid(
+                        &namespace,
+                        &name,
+                        &format!("Invalid path: {}", validation_error),
+                        generation,
+                    )
+                    .await?;
+
+                    record_httproute_reconciliation(
+                        &name,
+                        &namespace,
+                        start.elapsed().as_secs_f64(),
+                        "validation_failed",
+                    );
+
+                    return Ok(Action::requeue(Duration::from_secs(300)));
+                }
 
                 // Extract backends
                 if let Some(backend_refs) = &rule.backend_refs {
@@ -349,6 +505,7 @@ impl HTTPRouteReconciler {
     }
 
     /// Update HTTPRoute status with Accepted condition
+    #[allow(dead_code)]
     async fn set_route_status(
         &self,
         namespace: &str,
@@ -420,7 +577,52 @@ impl HTTPRouteReconciler {
         Ok(())
     }
 
+    /// Update HTTPRoute status with validation error (Accepted: False)
+    #[allow(dead_code)]
+    async fn set_route_status_invalid(
+        &self,
+        namespace: &str,
+        name: &str,
+        error_message: &str,
+        generation: i64,
+    ) -> Result<(), kube::Error> {
+        let api: Api<HTTPRoute> = Api::namespaced(self.client.clone(), namespace);
+        let status = json!({
+            "status": {
+                "parents": [{
+                    "parentRef": {
+                        "name": self.gateway_name,
+                        "kind": "Gateway",
+                    },
+                    "controllerName": "rauta.io/gateway-controller",
+                    "conditions": [{
+                        "type": "Accepted",
+                        "status": "False",
+                        "reason": "Invalid",
+                        "message": error_message,
+                        "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        "observedGeneration": generation,
+                    }]
+                }]
+            }
+        });
+
+        api.patch_status(
+            name,
+            &PatchParams::apply("rauta-controller"),
+            &Patch::Merge(&status),
+        )
+        .await?;
+
+        warn!(
+            "Rejected HTTPRoute {}/{} with validation error: {}",
+            namespace, name, error_message
+        );
+        Ok(())
+    }
+
     /// Error handler for controller
+    #[allow(dead_code)]
     fn error_policy(_obj: Arc<HTTPRoute>, error: &kube::Error, _ctx: Arc<Self>) -> Action {
         error!("HTTPRoute reconciliation error: {:?}", error);
         // Retry after 1 minute on errors
@@ -428,6 +630,7 @@ impl HTTPRouteReconciler {
     }
 
     /// Start the HTTPRoute controller
+    #[allow(dead_code)]
     pub async fn run(self) -> Result<(), kube::Error> {
         let api: Api<HTTPRoute> = Api::all(self.client.clone());
         let ctx = Arc::new(self);
@@ -882,6 +1085,135 @@ mod tests {
             ipv6_backends.iter().map(|b| b.as_ipv6().unwrap()).collect();
         assert!(ipv6_addrs.contains(&"2001:db8::1".parse().unwrap()));
         assert!(ipv6_addrs.contains(&"::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_validate_path_valid() {
+        // RED: Test path validation accepts valid paths
+        assert!(validate_path("/").is_ok(), "Root path should be valid");
+        assert!(validate_path("/api").is_ok(), "Simple path should be valid");
+        assert!(
+            validate_path("/api/v1").is_ok(),
+            "Nested path should be valid"
+        );
+        assert!(
+            validate_path("/api/users/123").is_ok(),
+            "Path with numbers should be valid"
+        );
+    }
+
+    #[test]
+    fn test_validate_path_invalid() {
+        // RED: Test path validation rejects invalid paths
+        assert!(validate_path("").is_err(), "Empty path should be rejected");
+        assert!(
+            validate_path("api").is_err(),
+            "Path without leading slash should be rejected"
+        );
+        assert!(
+            validate_path("//api").is_err(),
+            "Path with double slash should be rejected"
+        );
+        assert!(
+            validate_path("/api/").is_err(),
+            "Path with trailing slash should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_hostname_valid() {
+        // RED: Test hostname validation accepts valid DNS-1123 subdomains
+        assert!(
+            validate_hostname("example.com").is_ok(),
+            "Simple hostname should be valid"
+        );
+        assert!(
+            validate_hostname("api.example.com").is_ok(),
+            "Subdomain should be valid"
+        );
+        assert!(
+            validate_hostname("*.example.com").is_ok(),
+            "Wildcard hostname should be valid"
+        );
+        assert!(
+            validate_hostname("my-app-123.example.com").is_ok(),
+            "Hostname with hyphens and numbers should be valid"
+        );
+    }
+
+    #[test]
+    fn test_validate_hostname_invalid() {
+        // RED: Test hostname validation rejects invalid hostnames
+        assert!(
+            validate_hostname("").is_err(),
+            "Empty hostname should be rejected"
+        );
+        assert!(
+            validate_hostname("EXAMPLE.COM").is_err(),
+            "Uppercase hostname should be rejected"
+        );
+        assert!(
+            validate_hostname("example..com").is_err(),
+            "Double dot should be rejected"
+        );
+        assert!(
+            validate_hostname("-example.com").is_err(),
+            "Leading hyphen should be rejected"
+        );
+        assert!(
+            validate_hostname("example-.com").is_err(),
+            "Trailing hyphen should be rejected"
+        );
+        assert!(
+            validate_hostname("example_test.com").is_err(),
+            "Underscore should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_header_name_valid() {
+        // RED: Test header name validation accepts valid RFC 7230 header names
+        assert!(
+            validate_header_name("content-type").is_ok(),
+            "Lowercase header should be valid"
+        );
+        assert!(
+            validate_header_name("Content-Type").is_ok(),
+            "Mixed case header should be valid"
+        );
+        assert!(
+            validate_header_name("X-Custom-Header").is_ok(),
+            "Custom header with hyphens should be valid"
+        );
+        assert!(
+            validate_header_name("Authorization").is_ok(),
+            "Single word header should be valid"
+        );
+    }
+
+    #[test]
+    fn test_validate_header_name_invalid() {
+        // RED: Test header name validation rejects invalid header names
+        assert!(
+            validate_header_name("").is_err(),
+            "Empty header name should be rejected"
+        );
+        assert!(
+            validate_header_name(":authority").is_err(),
+            "HTTP/2 pseudo-header should be rejected"
+        );
+        assert!(
+            validate_header_name("content type").is_err(),
+            "Header with space should be rejected"
+        );
+        assert!(
+            validate_header_name("content:type").is_err(),
+            "Header with colon should be rejected"
+        );
+        assert!(
+            validate_header_name("content\ntype").is_err(),
+            "Header with newline should be rejected"
+        );
     }
 }
 

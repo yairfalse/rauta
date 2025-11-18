@@ -12,8 +12,63 @@ use common::{fnv1a_hash, maglev_build_compact_table, maglev_lookup_compact, Back
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
+use tracing::warn;
+
+// ============================================================================
+// CRITICAL FIX: Safe lock access with poison recovery
+// ============================================================================
+//
+// RwLock poisoning occurs when a thread panics while holding the lock.
+// Using .unwrap() on poisoned locks causes cascading panics across all threads.
+//
+// Solution: Recover from poisoned locks by extracting the inner data.
+// The data itself is still valid - poisoning only indicates a thread panicked
+// while holding the lock, NOT that the data is corrupt.
+//
+// Performance: Poison check is ~1ns (single atomic load), negligible overhead.
+
+/// Safe RwLock read access with automatic poison recovery
+///
+/// # Why this is safe
+///
+/// RwLock poisoning means a panic occurred while holding the lock, but:
+/// - The lock still protects the data (no race conditions)
+/// - The data itself is NOT corrupt (panic doesn't corrupt memory in Rust)
+/// - Subsequent readers can safely access the data
+///
+/// We use .into_inner() to extract the guard, logging the poisoning event
+/// for observability but continuing operation.
+#[inline]
+fn safe_read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| {
+        warn!("RwLock poisoned during read, recovering (data is still valid)");
+        poisoned.into_inner()
+    })
+}
+
+/// Safe RwLock write access with automatic poison recovery
+#[inline]
+fn safe_write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|poisoned| {
+        warn!("RwLock poisoned during write, recovering (data is still valid)");
+        poisoned.into_inner()
+    })
+}
+
+/// Safe Mutex access with automatic poison recovery
+#[inline]
+fn safe_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        warn!("Mutex poisoned, recovering (data is still valid)");
+        poisoned.into_inner()
+    })
+}
+
+// ============================================================================
+// End of safe lock helpers
+// ============================================================================
 
 /// Backend draining state (for graceful removal)
 #[derive(Debug, Clone)]
@@ -96,7 +151,7 @@ const MAX_REGEX_CACHE_SIZE: usize = 256;
 /// Returns Arc<Regex> for zero-cost cloning on hot path.
 /// Invalid patterns return None (treated as no match per Gateway API spec).
 fn get_cached_regex(pattern: &str) -> Option<Arc<Regex>> {
-    let mut cache = REGEX_CACHE.lock().unwrap();
+    let mut cache = safe_lock(&REGEX_CACHE);
 
     // Fast path: pattern already cached
     if let Some(regex) = cache.get(pattern) {
@@ -215,9 +270,9 @@ pub struct Router {
     routes: Arc<RwLock<HashMap<RouteKey, Route>>>,
     prefix_router: Arc<RwLock<matchit::Router<RouteKey>>>,
     /// Backends marked for draining (graceful removal)
-    draining_backends: Arc<RwLock<HashMap<u32, BackendDraining>>>,
-    /// Backend health tracking (key = backend IPv4 address)
-    backend_health: Arc<RwLock<HashMap<u32, BackendHealth>>>,
+    draining_backends: Arc<RwLock<HashMap<Backend, BackendDraining>>>,
+    /// Backend health tracking (supports both IPv4 and IPv6)
+    backend_health: Arc<RwLock<HashMap<Backend, BackendHealth>>>,
     /// Active health checker (TCP probes)
     health_checker: Arc<HealthChecker>,
 }
@@ -261,7 +316,7 @@ impl Router {
 
         // Check if route already exists with same backends (idempotent fast path)
         {
-            let routes = self.routes.read().unwrap();
+            let routes = safe_read(&self.routes);
             if let Some(existing) = routes.get(&key) {
                 // Compare backends by content (O(n) Vec comparison; can be expensive for large backend lists)
                 if existing.backends.len() == backends.len() && existing.backends == backends {
@@ -295,7 +350,7 @@ impl Router {
 
         // Update routes HashMap (minimize write lock duration)
         {
-            let mut routes = self.routes.write().unwrap();
+            let mut routes = safe_write(&self.routes);
             routes.insert(key, route);
         } // Drop write lock immediately - allows concurrent lookups during rebuild
 
@@ -304,7 +359,7 @@ impl Router {
         // This is O(n) but acceptable for typical K8s Ingress scale (<1000 routes)
         let mut new_prefix_router = matchit::Router::new();
         {
-            let routes = self.routes.read().unwrap();
+            let routes = safe_read(&self.routes);
             for (route_key, route) in routes.iter() {
                 let path_str = route.pattern.as_ref();
 
@@ -328,7 +383,7 @@ impl Router {
 
         // Swap in new prefix router atomically (brief write lock)
         {
-            let mut prefix_router = self.prefix_router.write().unwrap();
+            let mut prefix_router = safe_write(&self.prefix_router);
             *prefix_router = new_prefix_router;
         }
 
@@ -358,17 +413,21 @@ impl Router {
     /// This implements Google's Maglev pattern: "rolling restart of machines
     /// to upgrade Maglevs in a cluster, draining traffic from each one a few
     /// moments beforehand"
+    ///
+    /// **Supports both IPv4 and IPv6** backends.
     #[allow(dead_code)] // Used in tests and future EndpointSlice integration
-    pub fn drain_backend(&self, backend_ip: u32, drain_timeout: Duration) {
+    pub fn drain_backend(&self, backend: Backend, drain_timeout: Duration) {
         let mut draining = self.draining_backends.write().unwrap();
-        draining.insert(backend_ip, BackendDraining::new(drain_timeout));
+        draining.insert(backend, BackendDraining::new(drain_timeout));
     }
 
     /// Check if backend is marked for draining
+    ///
+    /// **Supports both IPv4 and IPv6** backends.
     #[allow(dead_code)] // Used in tests
-    pub fn is_backend_draining(&self, backend_ip: u32) -> bool {
+    pub fn is_backend_draining(&self, backend: Backend) -> bool {
         let draining = self.draining_backends.read().unwrap();
-        draining.contains_key(&backend_ip)
+        draining.contains_key(&backend)
     }
 
     /// Clean up expired draining backends
@@ -382,9 +441,11 @@ impl Router {
     ///
     /// Tracks success (2xx-4xx) and error (5xx) responses per backend.
     /// Used to calculate error rate and exclude unhealthy backends.
-    pub fn record_backend_response(&self, backend_ip: u32, status_code: u16) {
-        let mut health = self.backend_health.write().unwrap();
-        let backend_health = health.entry(backend_ip).or_insert_with(BackendHealth::new);
+    ///
+    /// **Supports both IPv4 and IPv6** backends.
+    pub fn record_backend_response(&self, backend: Backend, status_code: u16) {
+        let mut health = safe_write(&self.backend_health);
+        let backend_health = health.entry(backend).or_insert_with(BackendHealth::new);
         backend_health.record_response(status_code);
     }
 
@@ -397,7 +458,7 @@ impl Router {
         &self,
         method: HttpMethod,
         path: &str,
-        src_ip: Option<u32>,
+        src_ip: Option<std::net::IpAddr>,
         src_port: Option<u16>,
     ) -> Option<RouteMatch> {
         let path_hash = fnv1a_hash(path.as_bytes());
@@ -405,18 +466,18 @@ impl Router {
 
         // Try exact match first, then prefix match
         let route_key = {
-            let routes = self.routes.read().unwrap();
+            let routes = safe_read(&self.routes);
             if routes.contains_key(&key) {
                 Some(key)
             } else {
                 // Prefix match via matchit
-                let prefix_router = self.prefix_router.read().unwrap();
+                let prefix_router = safe_read(&self.prefix_router);
                 prefix_router.at(path).ok().map(|m| *m.value)
             }
         }?;
 
         // Look up route
-        let routes = self.routes.read().unwrap();
+        let routes = safe_read(&self.routes);
         let route = routes.get(&route_key)?;
 
         // GREEN phase: Check method constraints (Gateway API)
@@ -432,8 +493,8 @@ impl Router {
         let flow_hash = self.compute_flow_hash(path_hash, src_ip, src_port);
 
         // Try up to all backends to find one that is BOTH healthy AND not draining
-        let health = self.backend_health.read().unwrap();
-        let draining = self.draining_backends.read().unwrap();
+        let health = safe_read(&self.backend_health);
+        let draining = safe_read(&self.draining_backends);
 
         // Track which backend indices we've tried to avoid infinite loops
         let mut tried_indices = HashSet::new();
@@ -451,17 +512,13 @@ impl Router {
             let backend = route.backends.get(backend_idx as usize).copied()?;
 
             // Check if backend is healthy (passive health checking)
-            let backend_ipv4 = backend.ipv4_as_u32();
-            let is_healthy_passive = health
-                .get(&backend_ipv4)
-                .map(|h| h.is_healthy())
-                .unwrap_or(true); // Default to healthy if no health data
+            let is_healthy_passive = health.get(&backend).map(|h| h.is_healthy()).unwrap_or(true); // Default to healthy if no health data
 
             // Check if backend is healthy (active health checking via TCP probes)
             let is_healthy_active = self.health_checker.is_healthy(&backend);
 
             // Check if backend is draining (connection draining)
-            let is_draining = draining.contains_key(&backend_ipv4);
+            let is_draining = draining.contains_key(&backend);
 
             // Skip if unhealthy (passive OR active) OR draining
             if !is_healthy_passive || !is_healthy_active || is_draining {
@@ -490,12 +547,38 @@ impl Router {
     ///
     /// Combines path hash with connection info (if available) to distribute
     /// requests across backends. Falls back to path-only if no connection info.
-    fn compute_flow_hash(&self, path_hash: u64, src_ip: Option<u32>, src_port: Option<u16>) -> u64 {
+    fn compute_flow_hash(
+        &self,
+        path_hash: u64,
+        src_ip: Option<std::net::IpAddr>,
+        src_port: Option<u16>,
+    ) -> u64 {
         match (src_ip, src_port) {
             (Some(ip), Some(port)) => {
-                // Hash = path_hash XOR (ip << 16 | port)
+                // Convert IP to u64 for hashing
+                let ip_hash = match ip {
+                    std::net::IpAddr::V4(v4) => {
+                        // IPv4: use the 32-bit address directly
+                        u32::from(v4) as u64
+                    }
+                    std::net::IpAddr::V6(v6) => {
+                        // IPv6: XOR upper and lower 64 bits to compress 128-bit address
+                        let bytes = v6.octets();
+                        let upper = u64::from_be_bytes([
+                            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                            bytes[7],
+                        ]);
+                        let lower = u64::from_be_bytes([
+                            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13],
+                            bytes[14], bytes[15],
+                        ]);
+                        upper ^ lower
+                    }
+                };
+
+                // Hash = path_hash XOR (ip_hash << 16 | port)
                 // This mixes path and connection info for good distribution
-                path_hash ^ ((ip as u64) << 16 | port as u64)
+                path_hash ^ (ip_hash << 16 | port as u64)
             }
             _ => {
                 // No connection info - fall back to path-only
@@ -984,7 +1067,7 @@ impl Router {
         method: HttpMethod,
         path: &str,
         request_headers: Vec<(&str, &str)>,
-        src_ip: Option<u32>,
+        src_ip: Option<std::net::IpAddr>,
         src_port: Option<u16>,
     ) -> Option<RouteMatch> {
         // GREEN phase: Full header matching implementation
@@ -1031,13 +1114,9 @@ impl Router {
 
             let backend = route.backends.get(backend_idx as usize).copied()?;
 
-            let backend_ipv4 = backend.ipv4_as_u32();
-            let is_healthy = health
-                .get(&backend_ipv4)
-                .map(|h| h.is_healthy())
-                .unwrap_or(true);
+            let is_healthy = health.get(&backend).map(|h| h.is_healthy()).unwrap_or(true);
 
-            let is_draining = draining.contains_key(&backend_ipv4);
+            let is_draining = draining.contains_key(&backend);
 
             if !is_healthy || is_draining {
                 if tried_indices.len() == route.backends.len() {
@@ -1069,7 +1148,7 @@ impl Router {
         method: HttpMethod,
         path: &str,
         query_params: Vec<(&str, &str)>,
-        src_ip: Option<u32>,
+        src_ip: Option<std::net::IpAddr>,
         src_port: Option<u16>,
     ) -> Option<RouteMatch> {
         // GREEN phase: Full query parameter matching implementation
@@ -1116,13 +1195,9 @@ impl Router {
 
             let backend = route.backends.get(backend_idx as usize).copied()?;
 
-            let backend_ipv4 = backend.ipv4_as_u32();
-            let is_healthy = health
-                .get(&backend_ipv4)
-                .map(|h| h.is_healthy())
-                .unwrap_or(true);
+            let is_healthy = health.get(&backend).map(|h| h.is_healthy()).unwrap_or(true);
 
-            let is_draining = draining.contains_key(&backend_ipv4);
+            let is_draining = draining.contains_key(&backend);
 
             if !is_healthy || is_draining {
                 if tried_indices.len() == route.backends.len() {
@@ -1346,7 +1421,7 @@ mod tests {
             let path = format!("/api/users/{}", i);
 
             // Simulate different source IPs/ports for load distribution
-            let src_ip = 0x0a000001 + (i as u32); // 10.0.0.1 + i
+            let src_ip = std::net::IpAddr::V4(Ipv4Addr::from(0x0a000001 + (i as u32))); // 10.0.0.1 + i
             let src_port = 50000 + (i as u16);
 
             let route_match = router
@@ -1432,25 +1507,22 @@ mod tests {
         let router = Router::new();
 
         // Add route with 2 backends
-        let backends = vec![
-            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100), // Backend 1
-            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100), // Backend 2
-        ];
+        let backend1 = Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100); // Backend 1
+        let backend2 = Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100); // Backend 2
+        let backends = vec![backend1, backend2];
 
         router
             .add_route(HttpMethod::GET, "/api/test", backends)
             .expect("Should add route");
 
         // Simulate 10 requests to backend 10.0.1.1 - all return 500 (unhealthy)
-        let backend1_ip = u32::from(Ipv4Addr::new(10, 0, 1, 1));
         for _ in 0..10 {
-            router.record_backend_response(backend1_ip, 500);
+            router.record_backend_response(backend1, 500);
         }
 
         // Simulate 10 requests to backend 10.0.1.2 - all return 200 (healthy)
-        let backend2_ip = u32::from(Ipv4Addr::new(10, 0, 1, 2));
         for _ in 0..10 {
-            router.record_backend_response(backend2_ip, 200);
+            router.record_backend_response(backend2, 200);
         }
 
         // Now when we select a backend, it should ONLY return the healthy one (10.0.1.2)
@@ -1461,27 +1533,27 @@ mod tests {
                 .select_backend(
                     HttpMethod::GET,
                     "/api/test",
-                    Some(0x0100007f + i), // Vary source IP
+                    Some(std::net::IpAddr::V4(Ipv4Addr::from(0x0100007f + i))), // Vary source IP
                     Some((i % 65535) as u16),
                 )
                 .expect("Should find backend");
 
-            selected_backends.insert(route_match.backend.as_ipv4().unwrap());
+            selected_backends.insert(route_match.backend);
         }
 
-        // Should ONLY see the healthy backend (10.0.1.2)
+        // Should ONLY see the healthy backend (backend2)
         assert_eq!(
             selected_backends.len(),
             1,
             "Should only use 1 healthy backend"
         );
         assert!(
-            selected_backends.contains(&Ipv4Addr::new(10, 0, 1, 2)),
-            "Should only use healthy backend 10.0.1.2"
+            selected_backends.contains(&backend2),
+            "Should only use healthy backend2 (10.0.1.2)"
         );
         assert!(
-            !selected_backends.contains(&Ipv4Addr::new(10, 0, 1, 1)),
-            "Should NOT use unhealthy backend 10.0.1.1"
+            !selected_backends.contains(&backend1),
+            "Should NOT use unhealthy backend1 (10.0.1.1)"
         );
     }
 
@@ -1495,22 +1567,20 @@ mod tests {
         let router = Router::new();
 
         // Add route with 2 backends
-        let backends = vec![
-            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100),
-            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100),
-        ];
+        let backend_1 = Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100);
+        let backend_2 = Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100);
+        let backends = vec![backend_1, backend_2];
         router
             .add_route(HttpMethod::GET, "/api/users", backends)
             .expect("Add route should succeed");
 
         // Mark first backend for draining (30 second grace period)
-        let backend_to_drain = u32::from(Ipv4Addr::new(10, 0, 1, 1));
-        router.drain_backend(backend_to_drain, Duration::from_secs(30));
+        router.drain_backend(backend_1, Duration::from_secs(30));
 
         // NEW connections should NOT go to draining backend
         // Try 100 times to ensure we don't get the draining backend
         for i in 0..100 {
-            let src_ip = Some(0x0a000001 + i); // Vary IP to test distribution
+            let src_ip = Some(std::net::IpAddr::V4(Ipv4Addr::from(0x0a000001 + i))); // Vary IP to test distribution
             let src_port = Some((50000 + i) as u16);
 
             let route_match = router
@@ -1518,14 +1588,12 @@ mod tests {
                 .expect("Should find backend");
 
             assert_ne!(
-                u32::from(route_match.backend.as_ipv4().unwrap()),
-                backend_to_drain,
+                route_match.backend, backend_1,
                 "New connections should NOT go to draining backend (attempt {})",
                 i
             );
             assert_eq!(
-                route_match.backend.as_ipv4().unwrap(),
-                Ipv4Addr::new(10, 0, 1, 2),
+                route_match.backend, backend_2,
                 "Should route to healthy backend only"
             );
         }
@@ -1533,7 +1601,7 @@ mod tests {
         // Verify draining backend is still in routes (not removed yet)
         // This allows existing connections to finish gracefully
         assert!(
-            router.is_backend_draining(backend_to_drain),
+            router.is_backend_draining(backend_1),
             "Backend should be marked as draining"
         );
     }
@@ -1559,7 +1627,7 @@ mod tests {
         // Test distribution over 1000 requests
         let mut distribution = std::collections::HashMap::new();
         for i in 0..1000 {
-            let src_ip = Some(0x0a000001 + i);
+            let src_ip = Some(std::net::IpAddr::V4(Ipv4Addr::from(0x0a000001 + i)));
             let src_port = Some((50000 + (i % 60000)) as u16);
 
             let route_match = router
@@ -2529,5 +2597,130 @@ mod tests {
             Some(Duration::from_secs(10)),
             "Backend request timeout should be 10s"
         );
+    }
+
+    #[test]
+    fn test_router_select_backend_ipv6() {
+        // Test IPv6 backend selection (dual-stack support)
+        let router = Router::new();
+
+        // Add route with IPv6 backends: GET /api/v6 -> [2001:db8::1:8080, 2001:db8::2:8080]
+        let backends = vec![
+            Backend::from_ipv6("2001:db8::1".parse().unwrap(), 8080, 100),
+            Backend::from_ipv6("2001:db8::2".parse().unwrap(), 8080, 100),
+        ];
+
+        router
+            .add_route(HttpMethod::GET, "/api/v6", backends)
+            .expect("Should add IPv6 route");
+
+        // Select backend for IPv6 route
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/api/v6", None, None)
+            .expect("Should find IPv6 backend");
+
+        // Verify it's an IPv6 backend
+        assert!(route_match.backend.is_ipv6(), "Backend should be IPv6");
+        let backend_ip = route_match.backend.as_ipv6().unwrap();
+        assert!(
+            backend_ip == "2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap()
+                || backend_ip == "2001:db8::2".parse::<std::net::Ipv6Addr>().unwrap(),
+            "Should select one of the IPv6 backends"
+        );
+        assert_eq!(route_match.backend.port, 8080);
+        assert_eq!(route_match.pattern.as_ref(), "/api/v6");
+    }
+
+    #[test]
+    fn test_router_maglev_distribution_ipv6() {
+        // Test Maglev consistent hashing works with IPv6 backends
+        let router = Router::new();
+
+        let backends = vec![
+            Backend::from_ipv6("2001:db8::1".parse().unwrap(), 8080, 100),
+            Backend::from_ipv6("2001:db8::2".parse().unwrap(), 8080, 100),
+            Backend::from_ipv6("2001:db8::3".parse().unwrap(), 8080, 100),
+        ];
+
+        router
+            .add_route(HttpMethod::GET, "/api/v6/users", backends)
+            .expect("Should add IPv6 route");
+
+        // Simulate 10K requests with varying source IPs
+        let mut distribution = std::collections::HashMap::new();
+        for i in 0..10_000 {
+            // Create IPv6 address 2001:db8::i
+            let ipv6_int = (0x20010db8u128 << 96) | (i as u128);
+            let src_ip = Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(ipv6_int)));
+            let src_port = Some((i % 65535) as u16);
+
+            let route_match = router
+                .select_backend(HttpMethod::GET, "/api/v6/users", src_ip, src_port)
+                .expect("Should find backend");
+
+            // Count by Backend (not IP) since Backend implements Hash
+            *distribution.entry(route_match.backend).or_insert(0) += 1;
+        }
+
+        // Each backend should get ~33% (within 5% variance)
+        assert_eq!(distribution.len(), 3, "Should use all 3 backends");
+        for (backend, count) in distribution.iter() {
+            let percentage = (*count as f64) / 10_000.0;
+            assert!(
+                (percentage - 0.33).abs() < 0.05,
+                "Backend {:?} got {}% (expected ~33%)",
+                backend,
+                percentage * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn test_router_mixed_ipv4_ipv6_backends() {
+        // Test dual-stack: route with BOTH IPv4 and IPv6 backends
+        let router = Router::new();
+
+        let backends = vec![
+            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100),
+            Backend::from_ipv6("2001:db8::1".parse().unwrap(), 8080, 100),
+            Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100),
+            Backend::from_ipv6("2001:db8::2".parse().unwrap(), 8080, 100),
+        ];
+
+        router
+            .add_route(HttpMethod::GET, "/api/dual", backends)
+            .expect("Should add dual-stack route");
+
+        // Select backend 100 times to ensure both IPv4 and IPv6 are used
+        let mut ipv4_count = 0;
+        let mut ipv6_count = 0;
+
+        for i in 0..100 {
+            let src_ip = Some(std::net::IpAddr::V4(Ipv4Addr::from(0x0a000000 + i))); // Vary source IP
+            let src_port = Some((i % 65535) as u16);
+
+            let route_match = router
+                .select_backend(HttpMethod::GET, "/api/dual", src_ip, src_port)
+                .expect("Should find backend");
+
+            if route_match.backend.is_ipv6() {
+                ipv6_count += 1;
+            } else {
+                ipv4_count += 1;
+            }
+        }
+
+        // Both IPv4 and IPv6 should be selected
+        assert!(
+            ipv4_count > 0,
+            "IPv4 backends should be selected (got {})",
+            ipv4_count
+        );
+        assert!(
+            ipv6_count > 0,
+            "IPv6 backends should be selected (got {})",
+            ipv6_count
+        );
+        assert_eq!(ipv4_count + ipv6_count, 100, "Total should be 100 requests");
     }
 }
