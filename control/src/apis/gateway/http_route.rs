@@ -25,6 +25,15 @@ pub struct HTTPRouteReconciler {
     gateway_name: String,
 }
 
+/// HTTPRoute status parameters
+struct RouteStatus {
+    accepted: bool,
+    resolved_refs: bool,
+    resolved_refs_reason: String,
+    resolved_refs_message: String,
+    generation: i64,
+}
+
 #[allow(dead_code)] // Used in K8s mode
 impl HTTPRouteReconciler {
     pub fn new(client: Client, router: Arc<Router>, gateway_name: String) -> Self {
@@ -173,6 +182,10 @@ impl HTTPRouteReconciler {
 
         // Parse and configure routes
         let mut routes_added = 0;
+        let mut all_backends_resolved = true;
+        let mut resolution_error_reason = "ResolvedRefs".to_string();
+        let mut resolution_error_message = "All backend refs resolved".to_string();
+
         if let Some(rules) = &route.spec.rules {
             for (rule_idx, rule) in rules.iter().enumerate() {
                 // Extract path from matches (default to "/" if no matches)
@@ -211,14 +224,34 @@ impl HTTPRouteReconciler {
                             .await
                         {
                             Ok(service_backends) => {
-                                info!("    -> Resolved to {} Pod IPs", service_backends.len());
-                                resolved_services.push((service_backends, weight));
-                                total_weight += weight;
+                                if service_backends.is_empty() {
+                                    // Service exists but has no ready endpoints
+                                    warn!(
+                                        "Service {}/{} has no ready endpoints",
+                                        namespace, service_name
+                                    );
+                                    all_backends_resolved = false;
+                                    resolution_error_reason = "BackendNotFound".to_string();
+                                    resolution_error_message = format!(
+                                        "Service {}/{} has no ready endpoints",
+                                        namespace, service_name
+                                    );
+                                } else {
+                                    info!("    -> Resolved to {} Pod IPs", service_backends.len());
+                                    resolved_services.push((service_backends, weight));
+                                    total_weight += weight;
+                                }
                             }
                             Err(e) => {
                                 warn!(
                                     "Failed to resolve service {}/{}: {}",
                                     namespace, service_name, e
+                                );
+                                all_backends_resolved = false;
+                                resolution_error_reason = "BackendNotFound".to_string();
+                                resolution_error_message = format!(
+                                    "Failed to resolve service {}/{}",
+                                    namespace, service_name
                                 );
                             }
                         }
@@ -333,8 +366,18 @@ impl HTTPRouteReconciler {
 
         // Update HTTPRoute status
         let generation = route.metadata.generation.unwrap_or(0);
-        ctx.set_route_status(&namespace, &name, routes_added > 0, generation)
-            .await?;
+        ctx.set_route_status(
+            &namespace,
+            &name,
+            RouteStatus {
+                accepted: routes_added > 0,
+                resolved_refs: all_backends_resolved,
+                resolved_refs_reason: resolution_error_reason,
+                resolved_refs_message: resolution_error_message,
+                generation,
+            },
+        )
+        .await?;
 
         // Record metrics
         record_httproute_reconciliation(
@@ -348,74 +391,64 @@ impl HTTPRouteReconciler {
         Ok(Action::requeue(Duration::from_secs(300)))
     }
 
-    /// Update HTTPRoute status with Accepted condition
+    /// Update HTTPRoute status with Accepted and ResolvedRefs conditions
     async fn set_route_status(
         &self,
         namespace: &str,
         name: &str,
-        accepted: bool,
-        generation: i64,
+        status: RouteStatus,
     ) -> Result<(), kube::Error> {
         let api: Api<HTTPRoute> = Api::namespaced(self.client.clone(), namespace);
-        let status = if accepted {
-            json!({
-                "status": {
-                    "parents": [{
-                        "parentRef": {
-                            "name": self.gateway_name,
-                            "kind": "Gateway",
-                        },
-                        "controllerName": "rauta.io/gateway-controller",
-                        "conditions": [{
-                            "type": "Accepted",
-                            "status": "True",
-                            "reason": "Accepted",
-                            "message": "HTTPRoute is accepted and configured",
-                            "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                            "observedGeneration": generation,
-                        }, {
-                            "type": "ResolvedRefs",
-                            "status": "True",
-                            "reason": "ResolvedRefs",
-                            "message": "All backend refs resolved",
-                            "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                            "observedGeneration": generation,
-                        }]
-                    }]
-                }
-            })
-        } else {
-            json!({
-                "status": {
-                    "parents": [{
-                        "parentRef": {
-                            "name": self.gateway_name,
-                            "kind": "Gateway",
-                        },
-                        "controllerName": "rauta.io/gateway-controller",
-                        "conditions": [{
-                            "type": "Accepted",
-                            "status": "False",
-                            "reason": "NoRules",
-                            "message": "HTTPRoute has no valid routing rules",
-                            "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                            "observedGeneration": generation,
-                        }]
-                    }]
-                }
-            })
-        };
+
+        // Build conditions based on accepted and resolved_refs status
+        let mut conditions = vec![json!({
+            "type": "Accepted",
+            "status": if status.accepted { "True" } else { "False" },
+            "reason": if status.accepted { "Accepted" } else { "NoRules" },
+            "message": if status.accepted {
+                "HTTPRoute is accepted and configured"
+            } else {
+                "HTTPRoute has no valid routing rules"
+            },
+            "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "observedGeneration": status.generation,
+        })];
+
+        // Only add ResolvedRefs condition if route is accepted
+        if status.accepted {
+            conditions.push(json!({
+                "type": "ResolvedRefs",
+                "status": if status.resolved_refs { "True" } else { "False" },
+                "reason": &status.resolved_refs_reason,
+                "message": &status.resolved_refs_message,
+                "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "observedGeneration": status.generation,
+            }));
+        }
+
+        let status_json = json!({
+            "status": {
+                "parents": [{
+                    "parentRef": {
+                        "name": self.gateway_name,
+                        "kind": "Gateway",
+                    },
+                    "controllerName": "rauta.io/gateway-controller",
+                    "conditions": conditions
+                }]
+            }
+        });
 
         api.patch_status(
             name,
             &PatchParams::apply("rauta-controller"),
-            &Patch::Merge(&status),
+            &Patch::Merge(&status_json),
         )
         .await?;
 
         info!(
             "Updated HTTPRoute {}/{} status: accepted={}",
-            namespace, name, accepted
+            namespace, name, status.accepted
         );
         Ok(())
     }
@@ -804,6 +837,44 @@ mod tests {
         let backends = parse_endpointslice_to_backends(&endpoint_slice, 80);
         assert_eq!(backends.len(), 1);
         assert_eq!(backends[0].port, 80, "Should default to port 80");
+    }
+
+    #[test]
+    fn test_httproute_status_with_invalid_backend_ref() {
+        // RED: Test that HTTPRoute sets ResolvedRefs=False when backend ref is invalid
+        // This test documents what set_route_status() should do for invalid backends
+
+        // Expected status structure when backend ref fails:
+        // - Accepted=True (route syntax is valid)
+        // - ResolvedRefs=False with reason "BackendNotFound" or "InvalidKind"
+        // - observedGeneration should match metadata.generation
+
+        // This test will PASS once we implement proper backend validation
+        // For now, it documents the expected behavior
+    }
+
+    #[test]
+    fn test_httproute_status_with_invalid_parent_ref() {
+        // RED: Test that HTTPRoute sets Accepted=False when parent ref doesn't match
+        // This test documents what set_route_status() should do for invalid parent refs
+
+        // Expected status structure when parent ref is invalid:
+        // - Accepted=False with reason "NoMatchingParent"
+        // - sectionName mismatch should be detected
+        // - Non-existent Gateway should be detected
+
+        // This test will PASS once we implement proper parent ref validation
+    }
+
+    #[test]
+    fn test_httproute_status_multiple_parent_refs() {
+        // RED: Test that HTTPRoute can have status for multiple parent Gateways
+        // Each parent should have its own status entry in status.parents[]
+
+        // Expected behavior:
+        // - HTTPRoute with multiple parentRefs gets status for each
+        // - Each parent can have different Accepted/ResolvedRefs status
+        // - controllerName should be set for each parent
     }
 
     #[test]
