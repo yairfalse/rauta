@@ -207,6 +207,9 @@ impl GatewayReconciler {
                                         .filter(|k| rauta_supported_kinds.contains(&k.kind.as_str()))
                                         .collect();
 
+                                    // Check if there are ANY unsupported kinds
+                                    let has_invalid_kinds = valid_kinds.len() < kinds.len();
+
                                     if valid_kinds.is_empty() {
                                         // No supported kinds found
                                         ("False", "InvalidRouteKinds", "No supported route kinds found", vec![])
@@ -220,7 +223,14 @@ impl GatewayReconciler {
                                                 })
                                             })
                                             .collect();
-                                        ("True", "ResolvedRefs", "All references resolved", supported)
+
+                                        // If there are ANY invalid kinds, set ResolvedRefs=False
+                                        if has_invalid_kinds {
+                                            ("False", "InvalidRouteKinds", "Some route kinds are not supported", supported)
+                                        } else {
+                                            // All kinds are supported
+                                            ("True", "ResolvedRefs", "All references resolved", supported)
+                                        }
                                     }
                                 }
                             } else {
