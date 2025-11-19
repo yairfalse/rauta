@@ -33,23 +33,24 @@ COPY control/Cargo.toml control/
 # Create dummy source files to cache dependencies
 RUN mkdir -p common/src control/src && \
     echo "pub fn dummy() {}" > common/src/lib.rs && \
-    echo "fn main() {}" > control/src/main.rs && \
-    cd control && \
-    cargo build --release && \
-    rm -rf ../common/src ../control/src \
+    echo "fn main() {}" > control/src/main.rs
+
+# Build dependencies (this layer will be cached)
+RUN cd control && cargo build --release || true
+
+# Remove dummy files AND clean build artifacts for our crates only
+RUN rm -rf common/src control/src \
         target/release/deps/libcommon* \
         target/release/deps/common* \
-        target/release/.fingerprint/common* \
-        target/release/control*
+        target/release/.fingerprint/common*
 
 # Copy actual source code (this invalidates cache when source changes)
 COPY common/src common/src
 COPY control/src control/src
 
 # Build release binary with optimizations
-RUN cd control && \
-    cargo build --release --bin control && \
-    strip target/release/control
+RUN cd control && cargo build --release --bin control && \
+    strip ../target/release/control
 
 # ============================================
 # Runtime stage - Minimal image
@@ -63,8 +64,8 @@ RUN apt-get update && \
         curl && \
     rm -rf /var/lib/apt/lists/*
 
-# Create non-root user with specific UID for security
-RUN useradd -m -u 1000 -s /bin/bash rauta
+# Create non-root user (let system assign UID to avoid conflicts)
+RUN useradd -m -s /bin/bash rauta
 
 # Copy binary from builder (single layer, set permissions in COPY)
 COPY --from=builder --chown=rauta:rauta \
