@@ -487,6 +487,7 @@ impl ProxyServer {
 }
 
 /// Convert IPv4 u32 to string format (e.g., "192.168.1.1")
+#[allow(dead_code)]
 fn ipv4_to_string(ipv4: u32) -> String {
     format!(
         "{}.{}.{}.{}",
@@ -709,12 +710,10 @@ async fn forward_to_backend(
         .map(|pq| pq.as_str())
         .unwrap_or("/");
 
-    let backend_uri = format!(
-        "http://{}:{}{}",
-        ipv4_to_string(backend.ipv4_as_u32()),
-        backend.port,
-        path_and_query
-    );
+    // Backend::Display formats correctly for both IPv4 and IPv6:
+    // IPv4: "1.2.3.4:8080" → "http://1.2.3.4:8080/path"
+    // IPv6: "[2001:db8::1]:8080" → "http://[2001:db8::1]:8080/path"
+    let backend_uri = format!("http://{}{}", backend, path_and_query);
 
     // Save method for logging before we move parts.method
     let method_str = parts.method.to_string();
@@ -730,12 +729,12 @@ async fn forward_to_backend(
         }
     }
 
-    // Set Host header to match backend address
-    let backend_host = format!("{}:{}", ipv4_to_string(backend.ipv4_as_u32()), backend.port);
+    // Set Host header to match backend address (supports IPv4 and IPv6)
+    let backend_host = backend.to_string();
     backend_req_builder = backend_req_builder.header("Host", backend_host);
 
     // Check protocol cache BEFORE cloning body (optimization: avoid clone on hot path)
-    let backend_key = format!("{}:{}", ipv4_to_string(backend.ipv4_as_u32()), backend.port);
+    let backend_key = backend.to_string();
     let protocol_cached = {
         let cache = protocol_cache.lock().await;
         cache.get(&backend_key).copied()
@@ -800,7 +799,7 @@ async fn forward_to_backend(
     info!(
         request_id = %request_id,
         stage = "backend_request_built",
-        network.peer.address = %ipv4_to_string(backend.ipv4_as_u32()),
+        network.peer.address = %backend,
         network.peer.port = backend.port,
         url.full = %backend_uri,
         http.request.method = %method_str,
@@ -889,14 +888,7 @@ async fn forward_to_backend(
                         let fallback_req = Request::builder()
                             .method(method)
                             .uri(&backend_uri)
-                            .header(
-                                "Host",
-                                format!(
-                                    "{}:{}",
-                                    ipv4_to_string(backend.ipv4_as_u32()),
-                                    backend.port
-                                ),
-                            )
+                            .header("Host", backend.to_string()) // Supports IPv4 and IPv6
                             .body(Full::new(fallback_body))
                             .map_err(|e| format!("Failed to build fallback request: {}", e))?;
 
@@ -933,7 +925,7 @@ async fn forward_to_backend(
                     request_id = %request_id,
                     error.message = %e,
                     error.type = "backend_connection",
-                    network.peer.address = %ipv4_to_string(backend.ipv4_as_u32()),
+                    network.peer.address = %backend,
                     network.peer.port = backend.port,
                     elapsed_us = backend_connect_start.elapsed().as_micros() as u64,
                     "Backend connection failed"
@@ -950,7 +942,7 @@ async fn forward_to_backend(
         request_id = %request_id,
         stage = "backend_response_received",
         http.response.status_code = response_status,
-        network.peer.address = %ipv4_to_string(backend.ipv4_as_u32()),
+        network.peer.address = %backend,
         network.peer.port = backend.port,
         elapsed_us = backend_connect_duration.as_micros() as u64,
         "Backend responded"
@@ -977,7 +969,7 @@ async fn forward_to_backend(
         request_id = %request_id,
         stage = "request_complete",
         http.response.status_code = response_status,
-        network.peer.address = %ipv4_to_string(backend.ipv4_as_u32()),
+        network.peer.address = %backend,
         network.peer.port = backend.port,
         timing.total_us = total_duration.as_micros() as u64,
         timing.backend_us = backend_connect_duration.as_micros() as u64,
@@ -1177,8 +1169,7 @@ async fn handle_request(
                 request_id = %request_id,
                 stage = "route_matched",
                 route.pattern = %route_match.pattern,
-                network.peer.address = %ipv4_to_string(u32::from(route_match.backend.as_ipv4().unwrap())),
-                network.peer.port = route_match.backend.port,
+                network.peer.address = %route_match.backend,  // Backend::Display handles both IPv4 and IPv6
                 worker_index = ?worker_index,
                 "Route matched, forwarding to backend"
             );
@@ -1214,11 +1205,8 @@ async fn handle_request(
                         .with_label_values(&[method_str, route_pattern, status_str])
                         .observe(duration.as_secs_f64());
 
-                    // Record backend health for passive health checking
-                    router.record_backend_response(
-                        u32::from(route_match.backend.as_ipv4().unwrap()),
-                        status_code,
-                    );
+                    // Record backend health for passive health checking (supports IPv4 and IPv6)
+                    router.record_backend_response(route_match.backend, status_code);
                 }
                 Err(e) => {
                     HTTP_REQUESTS_TOTAL
@@ -1228,11 +1216,8 @@ async fn handle_request(
                         .with_label_values(&[method_str, route_pattern, "500"])
                         .observe(duration.as_secs_f64());
 
-                    // Record backend health (treat connection errors as 500)
-                    router.record_backend_response(
-                        u32::from(route_match.backend.as_ipv4().unwrap()),
-                        500,
-                    );
+                    // Record backend health (treat connection errors as 500, supports IPv4 and IPv6)
+                    router.record_backend_response(route_match.backend, 500);
 
                     error!(
                         request_id = %request_id,
