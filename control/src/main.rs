@@ -116,31 +116,85 @@ async fn main() -> Result<()> {
         add_example_routes(&router)?;
     }
 
-    // Determine bind address from environment variable or default
-    let bind_addr = env::var("RAUTA_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+    // In K8s mode, listeners are created dynamically by ListenerManager
+    // In standalone mode, create a static ProxyServer
+    if k8s_mode {
+        info!("🎯 K8s mode: Listeners will be created dynamically by Gateway reconciliation");
+        info!("Press Ctrl-C to exit.");
 
-    // Use per-core workers for lock-free performance (Stage 2!)
-    let num_cpus = num_cpus::get();
-    info!(
-        "🔥 Initializing per-core workers (lock-free mode): {} workers",
-        num_cpus
-    );
-    let server = ProxyServer::new_with_workers(bind_addr.clone(), router, num_cpus)
-        .map_err(|e| anyhow::anyhow!("Failed to create server: {}", e))?;
+        // Run controllers only (no static server)
+        run_controllers_only(controller_handles).await
+    } else {
+        // Standalone mode: create static server
+        let bind_addr =
+            env::var("RAUTA_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
 
-    info!(
-        "🚀 HTTP proxy server listening on {} (per-core workers enabled)",
-        bind_addr
-    );
-    if !k8s_mode {
+        let num_cpus = num_cpus::get();
+        info!(
+            "🔥 Initializing per-core workers (lock-free mode): {} workers",
+            num_cpus
+        );
+        let server = ProxyServer::new_with_workers(bind_addr.clone(), router, num_cpus)
+            .map_err(|e| anyhow::anyhow!("Failed to create server: {}", e))?;
+
+        info!(
+            "🚀 HTTP proxy server listening on {} (per-core workers enabled)",
+            bind_addr
+        );
         info!("📋 Routes configured:");
         info!("   GET /api/*       -> 127.0.0.1:9090 (Python backend)");
-    }
-    info!("");
-    info!("Press Ctrl-C to exit.");
+        info!("");
+        info!("Press Ctrl-C to exit.");
 
-    // Run server with graceful shutdown (SIGTERM + Ctrl-C)
-    run_with_signal_handling(server, controller_handles).await
+        // Run server with graceful shutdown (SIGTERM + Ctrl-C)
+        run_with_signal_handling(server, controller_handles).await
+    }
+}
+
+/// Run controllers only (K8s mode - listeners created dynamically)
+/// Handles both SIGTERM (Kubernetes) and Ctrl-C (local development)
+async fn run_controllers_only(controller_handles: Vec<tokio::task::JoinHandle<()>>) -> Result<()> {
+    // Create shutdown signal that triggers on SIGTERM or Ctrl-C
+    let shutdown_signal = async {
+        let ctrl_c = async {
+            signal::ctrl_c()
+                .await
+                .expect("Failed to install Ctrl-C handler");
+        };
+
+        #[cfg(unix)]
+        let terminate = async {
+            signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("Failed to install SIGTERM handler")
+                .recv()
+                .await;
+        };
+
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => {
+                info!("Received Ctrl-C signal");
+            }
+            _ = terminate => {
+                info!("Received SIGTERM signal");
+            }
+        }
+    };
+
+    // Wait for shutdown signal
+    shutdown_signal.await;
+
+    info!("🛑 Shutting down controllers...");
+
+    // Wait for all controller tasks to complete
+    for handle in controller_handles {
+        let _ = handle.await;
+    }
+
+    info!("✅ Controllers shut down gracefully");
+    Ok(())
 }
 
 /// Run server with proper signal handling for graceful shutdown
