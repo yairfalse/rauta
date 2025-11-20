@@ -3,7 +3,7 @@
 //! Watches Gateway resources and configures listeners (HTTP, HTTPS, TCP).
 
 use crate::apis::metrics::record_gateway_reconciliation;
-use crate::proxy::listener_manager::{ListenerConfig, ListenerManager, Protocol};
+use crate::proxy::listener_manager::{GatewayRef, ListenerConfig, ListenerManager, Protocol};
 use futures::StreamExt;
 use gateway_api::apis::standard::gateways::Gateway;
 use k8s_openapi::api::core::v1::Node;
@@ -136,19 +136,26 @@ impl GatewayReconciler {
             };
 
             let config = ListenerConfig {
-                name: listener.name.clone(),
-                protocol,
                 port: listener.port as u16,
-                hostname: listener.hostname.clone(),
-                gateway_namespace: namespace.clone(),
-                gateway_name: name.clone(),
+                protocol: protocol.clone(),
             };
 
-            match ctx.listener_manager.upsert_listener(config).await {
-                Ok(listener_id) => {
+            let gateway_ref = GatewayRef {
+                namespace: namespace.clone(),
+                name: name.clone(),
+                listener_name: listener.name.clone(),
+                hostname: listener.hostname.clone(),
+            };
+
+            match ctx
+                .listener_manager
+                .register_gateway(config, gateway_ref)
+                .await
+            {
+                Ok(()) => {
                     info!(
-                        "Configured listener {} for Gateway {}/{}",
-                        listener_id, namespace, name
+                        "Registered Gateway {}/{} listener '{}' on port {}",
+                        namespace, name, listener.name, listener.port
                     );
                 }
                 Err(e) => {
@@ -157,7 +164,6 @@ impl GatewayReconciler {
                         listener.name, namespace, name, e
                     );
                     // Continue with other listeners even if one fails
-                    // TODO: Update listener status to reflect failure
                 }
             }
         }
