@@ -8,9 +8,7 @@
 [![Gateway API](https://img.shields.io/badge/Gateway%20API-v1.2.0-purple.svg)](https://gateway-api.sigs.k8s.io/)
 [![Tests](https://img.shields.io/badge/tests-90%20passing-brightgreen.svg)]()
 [![Performance](https://img.shields.io/badge/throughput-129K%20req%2Fs-orange.svg)]()
-<sub>Note: Badge shows average throughput on 12-core machine; ADR claims are peak per-core/node throughput under ideal conditions.</sub>
 
-**Tech Stack:**
 [![Tokio](https://img.shields.io/badge/async-tokio-blue.svg?logo=rust)](https://tokio.rs)
 [![Hyper](https://img.shields.io/badge/HTTP-hyper-blue.svg?logo=rust)](https://hyper.rs)
 [![Kubernetes](https://img.shields.io/badge/K8s-kube--rs-326CE5.svg?logo=kubernetes&logoColor=white)](https://kube.rs)
@@ -64,16 +62,6 @@ A learning project exploring Rust and Kubernetes Gateway API - built for fun, ha
 - Per-worker connection pools (lock-free)
 - Auto-fallback to HTTP/1.1
 
-**Reliability** ✅
-- Connection timeout (5s for dead backends)
-- Request timeout (30s for slow backends)
-- Circuit breakers (3-state: Healthy → Degraded → Unhealthy)
-- Graceful shutdown with connection draining (SIGTERM-safe)
-
-**Observability** ✅
-- Prometheus metrics (request rates, latencies, pool stats)
-- Structured logging (OpenTelemetry-style fields)
-- Per-request tracing with request IDs
 
 ---
 
