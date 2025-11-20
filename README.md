@@ -252,34 +252,6 @@ All features follow Test-Driven Development:
 
 See `CLAUDE.md` for detailed guidelines.
 
----
-
-## What's Implemented
-
-**Core Routing:**
-- ✅ Gateway API controller (GatewayClass, Gateway, HTTPRoute)
-- ✅ EndpointSlice resolution for dynamic backends
-- ✅ Maglev consistent hashing
-- ✅ Weighted routing (canary deployments)
-
-**Performance:**
-- ✅ Multi-core workers (lock-free, per-worker pools)
-- ✅ HTTP/2 connection pooling
-- ✅ Connection multiplexing
-
-**Reliability:**
-- ✅ Passive health checking
-- ✅ Circuit breakers (3-state)
-- ✅ Connection draining
-- ✅ Graceful shutdown
-- ✅ Connection/request timeouts
-
-**Observability:**
-- ✅ Prometheus metrics
-- ✅ Structured logging
-- ✅ Request tracing
-
----
 
 ## Using This Code
 
@@ -302,13 +274,7 @@ This is a learning project, but the code is:
 
 ## Naming
 
-**Rauta** (Finnish: "iron") - Part of the Finnish tool naming theme:
-- **TAPIO**: Kubernetes observer 🌲
-- **AHTI**: Event correlation 🌊
-- **RAUTA**: Ingress controller ⚙️
-- **URPO**: Trace explorer 🔍
-
-Built in Rust, the language that prevents memory bugs.
+**Rauta** (Finnish: "iron") 
 
 ---
 
