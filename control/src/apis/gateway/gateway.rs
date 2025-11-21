@@ -195,7 +195,7 @@ impl GatewayReconciler {
         &self,
         cert_refs: &[gateway_api::apis::standard::gateways::GatewayListenersTlsCertificateRefs],
         gateway_namespace: &str,
-    ) -> (String, String, String) {
+    ) -> (&'static str, &'static str, String) {
         use k8s_openapi::api::core::v1::Secret;
         use kube::api::Api;
 
@@ -209,8 +209,8 @@ impl GatewayReconciler {
                         group
                     );
                     return (
-                        String::from("False"),
-                        String::from("InvalidCertificateRef"),
+                        "False",
+                        "InvalidCertificateRef",
                         format!("Unsupported group '{}' for certificateRef", group),
                     );
                 }
@@ -225,8 +225,8 @@ impl GatewayReconciler {
                         kind
                     );
                     return (
-                        String::from("False"),
-                        String::from("InvalidCertificateRef"),
+                        "False",
+                        "InvalidCertificateRef",
                         format!("Unsupported kind '{}' for certificateRef", kind),
                     );
                 }
@@ -250,8 +250,8 @@ impl GatewayReconciler {
                                 secret_namespace, secret_name, has_cert, has_key
                             );
                             return (
-                                String::from("False"),
-                                String::from("InvalidCertificateRef"),
+                                "False",
+                                "InvalidCertificateRef",
                                 format!(
                                     "Secret {}/{} is missing required fields (needs both tls.crt and tls.key)",
                                     secret_namespace, secret_name
@@ -267,8 +267,8 @@ impl GatewayReconciler {
                             secret_namespace, secret_name
                         );
                         return (
-                            String::from("False"),
-                            String::from("InvalidCertificateRef"),
+                            "False",
+                            "InvalidCertificateRef",
                             format!("Secret {}/{} has no data", secret_namespace, secret_name),
                         );
                     }
@@ -278,10 +278,19 @@ impl GatewayReconciler {
                         "Failed to get Secret {}/{}: {}",
                         secret_namespace, secret_name, e
                     );
+                    // Distinguish 404 from other errors
+                    let message = match e {
+                        kube::Error::Api(api_err) if api_err.code == 404 => {
+                            format!("Secret {}/{} not found", secret_namespace, secret_name)
+                        }
+                        _ => {
+                            format!("Failed to access Secret {}/{}: {}", secret_namespace, secret_name, e)
+                        }
+                    };
                     return (
-                        String::from("False"),
-                        String::from("InvalidCertificateRef"),
-                        format!("Secret {}/{} not found", secret_namespace, secret_name),
+                        "False",
+                        "InvalidCertificateRef",
+                        message,
                     );
                 }
             }
@@ -289,8 +298,8 @@ impl GatewayReconciler {
 
         // All validations passed
         (
-            String::from("True"),
-            String::from("ResolvedRefs"),
+            "True",
+            "ResolvedRefs",
             String::from("All references resolved"),
         )
     }
@@ -321,16 +330,16 @@ impl GatewayReconciler {
                         } else {
                             // No certificateRefs specified (TLS passthrough mode)
                             (
-                                String::from("True"),
-                                String::from("ResolvedRefs"),
+                                "True",
+                                "ResolvedRefs",
                                 String::from("All references resolved"),
                             )
                         }
                     } else {
                         // No TLS configured (HTTP listener)
                         (
-                            String::from("True"),
-                            String::from("ResolvedRefs"),
+                            "True",
+                            "ResolvedRefs",
                             String::from("All references resolved"),
                         )
                     }
@@ -345,16 +354,16 @@ impl GatewayReconciler {
                 .spec
                 .listeners
                 .iter()
-                .zip(tls_validation_results.iter())
+                .zip(tls_validation_results.into_iter())
                 .map(|(listener, tls_validation)| {
                     // RAUTA currently only supports HTTPRoute
                     let rauta_supported_kinds = ["HTTPRoute"];
 
                     // If TLS validation failed, skip route kinds validation
                     let (resolved_refs_status, resolved_refs_reason, resolved_refs_message, supported_kinds) =
-                        if tls_validation.0.as_str() == "False" {
-                            // TLS validation failed - return immediately
-                            (tls_validation.0.clone(), tls_validation.1.clone(), tls_validation.2.clone(), vec![
+                        if tls_validation.0 == "False" {
+                            // TLS validation failed - return immediately (move values, no clone)
+                            (tls_validation.0, tls_validation.1, tls_validation.2, vec![
                                 json!({
                                     "group": "gateway.networking.k8s.io",
                                     "kind": "HTTPRoute"
@@ -364,7 +373,7 @@ impl GatewayReconciler {
                             if let Some(kinds) = &allowed_routes.kinds {
                                 if kinds.is_empty() {
                                     // Empty kinds list is invalid
-                                    (String::from("False"), String::from("InvalidRouteKinds"), String::from("No route kinds specified"), vec![])
+                                    ("False", "InvalidRouteKinds", String::from("No route kinds specified"), vec![])
                                 } else {
                                     // Filter to only supported kinds
                                     let valid_kinds: Vec<_> = kinds.iter()
@@ -376,7 +385,7 @@ impl GatewayReconciler {
 
                                     if valid_kinds.is_empty() {
                                         // No supported kinds found
-                                        (String::from("False"), String::from("InvalidRouteKinds"), String::from("No supported route kinds found"), vec![])
+                                        ("False", "InvalidRouteKinds", String::from("No supported route kinds found"), vec![])
                                     } else {
                                         // At least one supported kind found
                                         let supported: Vec<_> = valid_kinds.iter()
@@ -390,16 +399,16 @@ impl GatewayReconciler {
 
                                         // If there are ANY invalid kinds, set ResolvedRefs=False
                                         if has_invalid_kinds {
-                                            (String::from("False"), String::from("InvalidRouteKinds"), String::from("Some route kinds are not supported"), supported)
+                                            ("False", "InvalidRouteKinds", String::from("Some route kinds are not supported"), supported)
                                         } else {
                                             // All kinds are supported
-                                            (String::from("True"), String::from("ResolvedRefs"), String::from("All references resolved"), supported)
+                                            ("True", "ResolvedRefs", String::from("All references resolved"), supported)
                                         }
                                     }
                                 }
                             } else {
                                 // No kinds specified, use default based on protocol
-                                (String::from("True"), String::from("ResolvedRefs"), String::from("All references resolved"), vec![
+                                ("True", "ResolvedRefs", String::from("All references resolved"), vec![
                                     json!({
                                         "group": "gateway.networking.k8s.io",
                                         "kind": "HTTPRoute"
@@ -408,7 +417,7 @@ impl GatewayReconciler {
                             }
                         } else {
                             // No allowedRoutes specified, use default based on protocol
-                            (String::from("True"), String::from("ResolvedRefs"), String::from("All references resolved"), vec![
+                            ("True", "ResolvedRefs", String::from("All references resolved"), vec![
                                 json!({
                                     "group": "gateway.networking.k8s.io",
                                     "kind": "HTTPRoute"
