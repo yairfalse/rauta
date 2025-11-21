@@ -190,12 +190,15 @@ impl GatewayReconciler {
     /// 1. certificateRef.group must be "" or "core"
     /// 2. certificateRef.kind must be "Secret"
     /// 3. Secret must exist in the specified namespace
-    /// 4. Secret must contain valid tls.crt and tls.key data (future: PEM validation)
-    fn validate_certificate_refs(
+    /// 4. Secret must contain valid tls.crt and tls.key data
+    async fn validate_certificate_refs(
         &self,
         cert_refs: &[gateway_api::apis::standard::gateways::GatewayListenersTlsCertificateRefs],
-        _gateway_namespace: &str,
-    ) -> (&'static str, &'static str, &'static str) {
+        gateway_namespace: &str,
+    ) -> (String, String, String) {
+        use k8s_openapi::api::core::v1::Secret;
+        use kube::api::Api;
+
         for cert_ref in cert_refs {
             // Validation 1: Check group
             if let Some(group) = &cert_ref.group {
@@ -206,9 +209,9 @@ impl GatewayReconciler {
                         group
                     );
                     return (
-                        "False",
-                        "InvalidCertificateRef",
-                        "Unsupported group for certificateRef",
+                        String::from("False"),
+                        String::from("InvalidCertificateRef"),
+                        format!("Unsupported group '{}' for certificateRef", group),
                     );
                 }
             }
@@ -222,24 +225,74 @@ impl GatewayReconciler {
                         kind
                     );
                     return (
-                        "False",
-                        "InvalidCertificateRef",
-                        "Unsupported kind for certificateRef",
+                        String::from("False"),
+                        String::from("InvalidCertificateRef"),
+                        format!("Unsupported kind '{}' for certificateRef", kind),
                     );
                 }
             }
 
-            // Validation 3: Check if Secret exists (synchronous check)
-            // Note: We can't make async calls in this synchronous map() context
-            // For now, we'll skip Secret existence check and rely on conformance tests
-            // to detect when we're missing this validation.
-            //
-            // TODO: Refactor set_gateway_status to be async-aware for Secret lookups
-            // For now, we validate group/kind which catches most conformance test cases
+            // Validation 3: Check if Secret exists
+            let secret_namespace = cert_ref.namespace.as_deref().unwrap_or(gateway_namespace);
+            let secret_name = &cert_ref.name;
+
+            let secret_api: Api<Secret> = Api::namespaced(self.client.clone(), secret_namespace);
+            match secret_api.get(secret_name).await {
+                Ok(secret) => {
+                    // Validation 4: Check if Secret contains tls.crt and tls.key
+                    if let Some(data) = &secret.data {
+                        let has_cert = data.contains_key("tls.crt");
+                        let has_key = data.contains_key("tls.key");
+
+                        if !has_cert || !has_key {
+                            warn!(
+                                "Secret {}/{} is missing required fields (tls.crt: {}, tls.key: {})",
+                                secret_namespace, secret_name, has_cert, has_key
+                            );
+                            return (
+                                String::from("False"),
+                                String::from("InvalidCertificateRef"),
+                                format!(
+                                    "Secret {}/{} is missing required fields (needs both tls.crt and tls.key)",
+                                    secret_namespace, secret_name
+                                ),
+                            );
+                        }
+
+                        // Future: Validate PEM format here
+                        // For now, just check presence
+                    } else {
+                        warn!(
+                            "Secret {}/{} has no data field",
+                            secret_namespace, secret_name
+                        );
+                        return (
+                            String::from("False"),
+                            String::from("InvalidCertificateRef"),
+                            format!("Secret {}/{} has no data", secret_namespace, secret_name),
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to get Secret {}/{}: {}",
+                        secret_namespace, secret_name, e
+                    );
+                    return (
+                        String::from("False"),
+                        String::from("InvalidCertificateRef"),
+                        format!("Secret {}/{} not found", secret_namespace, secret_name),
+                    );
+                }
+            }
         }
 
         // All validations passed
-        ("True", "ResolvedRefs", "All references resolved")
+        (
+            String::from("True"),
+            String::from("ResolvedRefs"),
+            String::from("All references resolved"),
+        )
     }
 
     /// Update Gateway status with Accepted and Programmed conditions
@@ -256,31 +309,52 @@ impl GatewayReconciler {
         let addresses = self.get_node_addresses().await;
 
         let status = if accepted {
-            // Build listener statuses using actual listener names
-            let listener_statuses: Vec<_> = gateway.spec.listeners.iter()
-                .map(|listener| {
-                    // RAUTA currently only supports HTTPRoute
-                    let rauta_supported_kinds = ["HTTPRoute"];
-
-                    // TLS validation takes precedence over route kinds validation
-                    // If TLS certificateRefs are invalid, set ResolvedRefs=False immediately
-                    let tls_validation = if let Some(tls) = &listener.tls {
+            // Validate all listeners' TLS refs concurrently (async-aware)
+            let tls_validations_futures: Vec<_> = gateway
+                .spec
+                .listeners
+                .iter()
+                .map(|listener| async {
+                    if let Some(tls) = &listener.tls {
                         if let Some(cert_refs) = &tls.certificate_refs {
-                            self.validate_certificate_refs(cert_refs, namespace)
+                            self.validate_certificate_refs(cert_refs, namespace).await
                         } else {
                             // No certificateRefs specified (TLS passthrough mode)
-                            ("True", "ResolvedRefs", "All references resolved")
+                            (
+                                String::from("True"),
+                                String::from("ResolvedRefs"),
+                                String::from("All references resolved"),
+                            )
                         }
                     } else {
                         // No TLS configured (HTTP listener)
-                        ("True", "ResolvedRefs", "All references resolved")
-                    };
+                        (
+                            String::from("True"),
+                            String::from("ResolvedRefs"),
+                            String::from("All references resolved"),
+                        )
+                    }
+                })
+                .collect();
+
+            // Await all TLS validations concurrently
+            let tls_validation_results = futures::future::join_all(tls_validations_futures).await;
+
+            // Build listener statuses using actual listener names
+            let listener_statuses: Vec<_> = gateway
+                .spec
+                .listeners
+                .iter()
+                .zip(tls_validation_results.iter())
+                .map(|(listener, tls_validation)| {
+                    // RAUTA currently only supports HTTPRoute
+                    let rauta_supported_kinds = ["HTTPRoute"];
 
                     // If TLS validation failed, skip route kinds validation
                     let (resolved_refs_status, resolved_refs_reason, resolved_refs_message, supported_kinds) =
-                        if tls_validation.0 == "False" {
+                        if tls_validation.0.as_str() == "False" {
                             // TLS validation failed - return immediately
-                            (tls_validation.0, tls_validation.1, tls_validation.2, vec![
+                            (tls_validation.0.clone(), tls_validation.1.clone(), tls_validation.2.clone(), vec![
                                 json!({
                                     "group": "gateway.networking.k8s.io",
                                     "kind": "HTTPRoute"
@@ -290,7 +364,7 @@ impl GatewayReconciler {
                             if let Some(kinds) = &allowed_routes.kinds {
                                 if kinds.is_empty() {
                                     // Empty kinds list is invalid
-                                    ("False", "InvalidRouteKinds", "No route kinds specified", vec![])
+                                    (String::from("False"), String::from("InvalidRouteKinds"), String::from("No route kinds specified"), vec![])
                                 } else {
                                     // Filter to only supported kinds
                                     let valid_kinds: Vec<_> = kinds.iter()
@@ -302,7 +376,7 @@ impl GatewayReconciler {
 
                                     if valid_kinds.is_empty() {
                                         // No supported kinds found
-                                        ("False", "InvalidRouteKinds", "No supported route kinds found", vec![])
+                                        (String::from("False"), String::from("InvalidRouteKinds"), String::from("No supported route kinds found"), vec![])
                                     } else {
                                         // At least one supported kind found
                                         let supported: Vec<_> = valid_kinds.iter()
@@ -316,16 +390,16 @@ impl GatewayReconciler {
 
                                         // If there are ANY invalid kinds, set ResolvedRefs=False
                                         if has_invalid_kinds {
-                                            ("False", "InvalidRouteKinds", "Some route kinds are not supported", supported)
+                                            (String::from("False"), String::from("InvalidRouteKinds"), String::from("Some route kinds are not supported"), supported)
                                         } else {
                                             // All kinds are supported
-                                            ("True", "ResolvedRefs", "All references resolved", supported)
+                                            (String::from("True"), String::from("ResolvedRefs"), String::from("All references resolved"), supported)
                                         }
                                     }
                                 }
                             } else {
                                 // No kinds specified, use default based on protocol
-                                ("True", "ResolvedRefs", "All references resolved", vec![
+                                (String::from("True"), String::from("ResolvedRefs"), String::from("All references resolved"), vec![
                                     json!({
                                         "group": "gateway.networking.k8s.io",
                                         "kind": "HTTPRoute"
@@ -334,7 +408,7 @@ impl GatewayReconciler {
                             }
                         } else {
                             // No allowedRoutes specified, use default based on protocol
-                            ("True", "ResolvedRefs", "All references resolved", vec![
+                            (String::from("True"), String::from("ResolvedRefs"), String::from("All references resolved"), vec![
                                 json!({
                                     "group": "gateway.networking.k8s.io",
                                     "kind": "HTTPRoute"
