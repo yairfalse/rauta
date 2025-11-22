@@ -39,10 +39,17 @@ lazy_static! {
             0.001, 0.005, 0.010, 0.025, 0.050, 0.075, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000,
         ]);
         let histogram = HistogramVec::new(opts, &["method", "path", "status"])
-            .expect("Failed to create HTTP request duration histogram");
-        METRICS_REGISTRY
-            .register(Box::new(histogram.clone()))
-            .expect("Failed to register HTTP request duration histogram with metrics registry");
+            .unwrap_or_else(|e| {
+                eprintln!("WARN: Failed to create http_request_duration_seconds histogram: {}", e);
+                HistogramVec::new(
+                    HistogramOpts::new("dummy", "dummy"),
+                    &["method", "path", "status"]
+                ).unwrap()
+            });
+        if let Err(e) = METRICS_REGISTRY.register(Box::new(histogram.clone())) {
+            eprintln!("WARN: Failed to register http_request_duration_seconds histogram: {}", e);
+            eprintln!("WARN: Metrics collection will be degraded but gateway will continue");
+        }
         histogram
     };
 
@@ -50,10 +57,17 @@ lazy_static! {
     static ref HTTP_REQUESTS_TOTAL: IntCounterVec = {
         let opts = Opts::new("http_requests_total", "Total number of HTTP requests (with per-worker distribution)");
         let counter = IntCounterVec::new(opts, &["method", "path", "status", "worker_id"])
-            .expect("Failed to create HTTP request counter");
-        METRICS_REGISTRY
-            .register(Box::new(counter.clone()))
-            .expect("Failed to register HTTP request counter with metrics registry");
+            .unwrap_or_else(|e| {
+                eprintln!("WARN: Failed to create http_requests_total counter: {}", e);
+                IntCounterVec::new(
+                    Opts::new("dummy", "dummy"),
+                    &["method", "path", "status", "worker_id"]
+                ).unwrap()
+            });
+        if let Err(e) = METRICS_REGISTRY.register(Box::new(counter.clone())) {
+            eprintln!("WARN: Failed to register http_requests_total counter: {}", e);
+            eprintln!("WARN: Metrics collection will be degraded but gateway will continue");
+        }
         counter
     };
 }
@@ -2683,7 +2697,7 @@ mod tests {
             }
         }
 
-        eprintln!("DEBUG: success={}, error={}", success_count, error_count);
+        // Passive health check verification happens via assertions below
 
         // After health checking is integrated, we should see:
         // - success_count ~= 100 (all requests go to healthy backend2)

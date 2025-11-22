@@ -18,10 +18,17 @@ lazy_static! {
             "HTTPRoute reconciliation duration in seconds",
         );
         let histogram = HistogramVec::new(opts, &["httproute", "namespace"])
-            .expect("Failed to create histogram");
-        CONTROLLER_METRICS_REGISTRY
-            .register(Box::new(histogram.clone()))
-            .expect("Failed to register histogram");
+            .unwrap_or_else(|e| {
+                eprintln!("WARN: Failed to create httproute_reconciliation_duration histogram: {}", e);
+                HistogramVec::new(
+                    HistogramOpts::new("dummy", "dummy"),
+                    &["httproute", "namespace"]
+                ).unwrap()
+            });
+        if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(histogram.clone())) {
+            eprintln!("WARN: Failed to register httproute_reconciliation_duration histogram: {}", e);
+            eprintln!("WARN: Metrics collection will be degraded but gateway will continue");
+        }
         histogram
     };
 
@@ -32,10 +39,17 @@ lazy_static! {
             "Total number of httproute reconciliations",
         );
         let counter = IntCounterVec::new(opts, &["httproute", "namespace", "result"])
-            .expect("Failed to create counter");
-        CONTROLLER_METRICS_REGISTRY
-            .register(Box::new(counter.clone()))
-            .expect("Failed to register counter");
+            .unwrap_or_else(|e| {
+                eprintln!("WARN: Failed to create httproute_reconciliations_total counter: {}", e);
+                IntCounterVec::new(
+                    Opts::new("dummy", "dummy"),
+                    &["httproute", "namespace", "result"]
+                ).unwrap()
+            });
+        if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(counter.clone())) {
+            eprintln!("WARN: Failed to register httproute_reconciliations_total counter: {}", e);
+            eprintln!("WARN: Metrics collection will be degraded but gateway will continue");
+        }
         counter
     };
 
@@ -46,10 +60,17 @@ lazy_static! {
             "Gateway reconciliation duration in seconds",
         );
         let histogram = HistogramVec::new(opts, &["gateway", "namespace"])
-            .expect("Failed to create histogram");
-        CONTROLLER_METRICS_REGISTRY
-            .register(Box::new(histogram.clone()))
-            .expect("Failed to register histogram");
+            .unwrap_or_else(|e| {
+                eprintln!("WARN: Failed to create gateway_reconciliation_duration histogram: {}", e);
+                HistogramVec::new(
+                    HistogramOpts::new("dummy", "dummy"),
+                    &["gateway", "namespace"]
+                ).unwrap()
+            });
+        if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(histogram.clone())) {
+            eprintln!("WARN: Failed to register gateway_reconciliation_duration histogram: {}", e);
+            eprintln!("WARN: Metrics collection will be degraded but gateway will continue");
+        }
         histogram
     };
 
@@ -60,10 +81,17 @@ lazy_static! {
             "Total number of gateway reconciliations",
         );
         let counter = IntCounterVec::new(opts, &["gateway", "namespace", "result"])
-            .expect("Failed to create counter");
-        CONTROLLER_METRICS_REGISTRY
-            .register(Box::new(counter.clone()))
-            .expect("Failed to register counter");
+            .unwrap_or_else(|e| {
+                eprintln!("WARN: Failed to create gateway_reconciliations_total counter: {}", e);
+                IntCounterVec::new(
+                    Opts::new("dummy", "dummy"),
+                    &["gateway", "namespace", "result"]
+                ).unwrap()
+            });
+        if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(counter.clone())) {
+            eprintln!("WARN: Failed to register gateway_reconciliations_total counter: {}", e);
+            eprintln!("WARN: Metrics collection will be degraded but gateway will continue");
+        }
         counter
     };
 
@@ -74,10 +102,17 @@ lazy_static! {
             "GatewayClass reconciliation duration in seconds",
         );
         let histogram = HistogramVec::new(opts, &["gatewayclass"])
-            .expect("Failed to create histogram");
-        CONTROLLER_METRICS_REGISTRY
-            .register(Box::new(histogram.clone()))
-            .expect("Failed to register histogram");
+            .unwrap_or_else(|e| {
+                eprintln!("WARN: Failed to create gatewayclass_reconciliation_duration histogram: {}", e);
+                HistogramVec::new(
+                    HistogramOpts::new("dummy", "dummy"),
+                    &["gatewayclass"]
+                ).unwrap()
+            });
+        if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(histogram.clone())) {
+            eprintln!("WARN: Failed to register gatewayclass_reconciliation_duration histogram: {}", e);
+            eprintln!("WARN: Metrics collection will be degraded but gateway will continue");
+        }
         histogram
     };
 
@@ -88,10 +123,17 @@ lazy_static! {
             "Total number of gatewayclass reconciliations",
         );
         let counter = IntCounterVec::new(opts, &["gatewayclass", "result"])
-            .expect("Failed to create counter");
-        CONTROLLER_METRICS_REGISTRY
-            .register(Box::new(counter.clone()))
-            .expect("Failed to register counter");
+            .unwrap_or_else(|e| {
+                eprintln!("WARN: Failed to create gatewayclass_reconciliations_total counter: {}", e);
+                IntCounterVec::new(
+                    Opts::new("dummy", "dummy"),
+                    &["gatewayclass", "result"]
+                ).unwrap()
+            });
+        if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(counter.clone())) {
+            eprintln!("WARN: Failed to register gatewayclass_reconciliations_total counter: {}", e);
+            eprintln!("WARN: Metrics collection will be degraded but gateway will continue");
+        }
         counter
     };
 }

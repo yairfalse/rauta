@@ -62,4 +62,13 @@ rustls = { version = "0.23", features = ["ring"] }  # Use ring crypto provider
 tokio-rustls = "0.26"
 rustls-pemfile = "2.1"
 
+[lints.clippy]
+# CRITICAL: Prevent lock poisoning panics and unwraps in production code
+# These lints ensure we use safe_read/safe_write/safe_lock helpers for locks
+# and proper error handling (Result/Option) instead of unwrap/expect
+# Note: Tests are allowed to use unwrap/expect via #[cfg_attr(test, allow(...))]
+unwrap_used = "warn"  # Start with warn to see violations, then move to deny
+expect_used = "warn"
+panic = "warn"
+
 [build-dependencies]
