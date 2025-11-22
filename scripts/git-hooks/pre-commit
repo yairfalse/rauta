@@ -62,6 +62,14 @@ for FILE in $STAGED_RS_FILES; do
     EXPECT_LINES=$(grep -n '\.expect(' "$FILE" 2>/dev/null | grep -v '^\s*//' | grep -v '^\s*\*' || true)
     if [ -n "$EXPECT_LINES" ]; then
         if ! grep -q '#\[cfg(test)\]' "$FILE" 2>/dev/null; then
+            echo "❌ Found .expect() in production code in $FILE"
+            VIOLATIONS_FOUND=1
+        fi
+    fi
+    # Check for .expect() outside test modules
+    EXPECT_LINES=$(grep -n '\.expect(' "$FILE" 2>/dev/null | grep -v '^\s*//' | grep -v '^\s*\*' || true)
+    if [ -n "$EXPECT_LINES" ]; then
+        if ! grep -q '#\[cfg(test)\]' "$FILE" 2>/dev/null; then
             # Allow .expect() in lazy_static blocks for fallback metrics
             if ! grep -q 'lazy_static!' "$FILE" 2>/dev/null; then
                 echo "❌ Found .expect() in production code in $FILE"
