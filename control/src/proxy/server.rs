@@ -42,19 +42,9 @@ lazy_static! {
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create http_request_duration_seconds histogram: {}", e);
                 HistogramVec::new(
-                    HistogramOpts::new("dummy", "dummy"),
+                    HistogramOpts::new("http_request_duration_seconds_fallback", "Fallback metric for HTTP request duration"),
                     &["method", "path", "status"]
-                ).unwrap_or_else(|e2| {
-                    eprintln!("ERROR: Failed to create dummy http_request_duration_seconds histogram: {}", e2);
-                    // Return a minimal dummy histogram (with no buckets) to avoid panicking
-                    HistogramVec::new(
-                        HistogramOpts::new("dummy_fallback", "dummy_fallback"),
-                        &["method", "path", "status"]
-                    ).unwrap_or_else(|_| {
-                        // As a last resort, panic with a clear error message
-                        panic!("Failed to create any http_request_duration_seconds histogram (including dummy fallback)");
-                    })
-                })
+                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
             });
         if let Err(e) = METRICS_REGISTRY.register(Box::new(histogram.clone())) {
             eprintln!("WARN: Failed to register http_request_duration_seconds histogram: {}", e);
@@ -70,9 +60,9 @@ lazy_static! {
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create http_requests_total counter: {}", e);
                 IntCounterVec::new(
-                    Opts::new("dummy", "dummy"),
+                    Opts::new("http_requests_total_fallback", "Fallback metric for HTTP requests total"),
                     &["method", "path", "status", "worker_id"]
-                ).unwrap()
+                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
             });
         if let Err(e) = METRICS_REGISTRY.register(Box::new(counter.clone())) {
             eprintln!("WARN: Failed to register http_requests_total counter: {}", e);

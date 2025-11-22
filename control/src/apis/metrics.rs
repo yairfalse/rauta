@@ -21,9 +21,9 @@ lazy_static! {
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create httproute_reconciliation_duration histogram: {}", e);
                 HistogramVec::new(
-                    HistogramOpts::new("dummy", "dummy"),
+                    HistogramOpts::new("httproute_reconciliation_duration_seconds_fallback", "Fallback metric for HTTPRoute reconciliation duration"),
                     &["httproute", "namespace"]
-                ).unwrap()
+                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
             });
         if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(histogram.clone())) {
             eprintln!("WARN: Failed to register httproute_reconciliation_duration histogram: {}", e);
@@ -42,9 +42,9 @@ lazy_static! {
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create httproute_reconciliations_total counter: {}", e);
                 IntCounterVec::new(
-                    Opts::new("dummy", "dummy"),
+                    Opts::new("httproute_reconciliations_total_fallback", "Fallback metric for HTTPRoute reconciliations"),
                     &["httproute", "namespace", "result"]
-                ).unwrap()
+                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
             });
         if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(counter.clone())) {
             eprintln!("WARN: Failed to register httproute_reconciliations_total counter: {}", e);
@@ -63,9 +63,9 @@ lazy_static! {
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create gateway_reconciliation_duration histogram: {}", e);
                 HistogramVec::new(
-                    HistogramOpts::new("dummy", "dummy"),
+                    HistogramOpts::new("gateway_reconciliation_duration_seconds_fallback", "Fallback metric for Gateway reconciliation duration"),
                     &["gateway", "namespace"]
-                ).unwrap()
+                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
             });
         if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(histogram.clone())) {
             eprintln!("WARN: Failed to register gateway_reconciliation_duration histogram: {}", e);
@@ -84,9 +84,9 @@ lazy_static! {
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create gateway_reconciliations_total counter: {}", e);
                 IntCounterVec::new(
-                    Opts::new("dummy", "dummy"),
+                    Opts::new("gateway_reconciliations_total_fallback", "Fallback metric for Gateway reconciliations"),
                     &["gateway", "namespace", "result"]
-                ).unwrap()
+                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
             });
         if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(counter.clone())) {
             eprintln!("WARN: Failed to register gateway_reconciliations_total counter: {}", e);
@@ -105,9 +105,9 @@ lazy_static! {
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create gatewayclass_reconciliation_duration histogram: {}", e);
                 HistogramVec::new(
-                    HistogramOpts::new("dummy", "dummy"),
+                    HistogramOpts::new("gatewayclass_reconciliation_duration_seconds_fallback", "Fallback metric for GatewayClass reconciliation duration"),
                     &["gatewayclass"]
-                ).unwrap()
+                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
             });
         if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(histogram.clone())) {
             eprintln!("WARN: Failed to register gatewayclass_reconciliation_duration histogram: {}", e);
@@ -126,9 +126,9 @@ lazy_static! {
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create gatewayclass_reconciliations_total counter: {}", e);
                 IntCounterVec::new(
-                    Opts::new("dummy", "dummy"),
+                    Opts::new("gatewayclass_reconciliations_total_fallback", "Fallback metric for GatewayClass reconciliations"),
                     &["gatewayclass", "result"]
-                ).unwrap()
+                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
             });
         if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(counter.clone())) {
             eprintln!("WARN: Failed to register gatewayclass_reconciliations_total counter: {}", e);

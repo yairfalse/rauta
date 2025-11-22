@@ -38,9 +38,9 @@ lazy_static! {
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create http2_pool_connections_active gauge: {}", e);
                 IntGaugeVec::new(
-                    Opts::new("dummy", "dummy"),
+                    Opts::new("http2_pool_connections_active_fallback", "Fallback metric for active connections"),
                     &["backend", "worker_id"]
-                ).unwrap()
+                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
             });
         if let Err(e) = POOL_METRICS_REGISTRY.register(Box::new(gauge.clone())) {
             eprintln!("WARN: Failed to register http2_pool_connections_active gauge: {}", e);
@@ -60,9 +60,9 @@ lazy_static! {
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create http2_pool_max_concurrent_streams gauge: {}", e);
                 IntGaugeVec::new(
-                    Opts::new("dummy", "dummy"),
+                    Opts::new("http2_pool_max_concurrent_streams_fallback", "Fallback metric for max concurrent streams"),
                     &["backend", "worker_id"]
-                ).unwrap()
+                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
             });
         if let Err(e) = POOL_METRICS_REGISTRY.register(Box::new(gauge.clone())) {
             eprintln!("WARN: Failed to register http2_pool_max_concurrent_streams gauge: {}", e);
@@ -81,9 +81,9 @@ lazy_static! {
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create http2_pool_connections_created_total counter: {}", e);
                 IntCounterVec::new(
-                    Opts::new("dummy", "dummy"),
+                    Opts::new("http2_pool_connections_created_total_fallback", "Fallback metric for connections created"),
                     &["backend", "worker_id"]
-                ).unwrap()
+                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
             });
         if let Err(e) = POOL_METRICS_REGISTRY.register(Box::new(counter.clone())) {
             eprintln!("WARN: Failed to register http2_pool_connections_created_total counter: {}", e);
@@ -102,9 +102,9 @@ lazy_static! {
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create http2_pool_connections_failed_total counter: {}", e);
                 IntCounterVec::new(
-                    Opts::new("dummy", "dummy"),
+                    Opts::new("http2_pool_connections_failed_total_fallback", "Fallback metric for connection failures"),
                     &["backend", "worker_id"]
-                ).unwrap()
+                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
             });
         if let Err(e) = POOL_METRICS_REGISTRY.register(Box::new(counter.clone())) {
             eprintln!("WARN: Failed to register http2_pool_connections_failed_total counter: {}", e);
@@ -122,43 +122,10 @@ lazy_static! {
         let counter = IntCounterVec::new(opts, &["backend", "worker_id"])
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create http2_pool_requests_queued_total counter: {}", e);
-                match IntCounterVec::new(
-                    Opts::new("dummy", "dummy"),
+                IntCounterVec::new(
+                    Opts::new("http2_pool_requests_queued_total_fallback", "Fallback metric for queued requests"),
                     &["backend", "worker_id"]
-                ) {
-                    Ok(dummy) => dummy,
-                    Err(e2) => {
-                        eprintln!("ERROR: Failed to create dummy IntCounterVec: {}", e2);
-                        // Return a no-op IntCounterVec (cannot create, so abort with a static empty metric)
-                        // SAFETY: This is a hack; ideally, we would return a static dummy metric.
-                        // For now, panic is avoided, but metrics will be missing.
-                        IntCounterVec::new(
-                            Opts::new("dummy_fallback", "dummy_fallback"),
-                            &["backend", "worker_id"]
-                        ).unwrap_or_else(|_| {
-                            // As a last resort, create a dummy metric with no labels
-                            IntCounterVec::new(
-                                Opts::new("dummy_final", "dummy_final"),
-                                &[]
-                            ).unwrap_or_else(|_| {
-                                eprintln!("CRITICAL: Unable to create any IntCounterVec, returning empty metric");
-                                // This is a hack: create a metric with no labels, which should always succeed
-                                // If even this fails, return a zeroed metric (not registered)
-                                // This avoids panicking.
-                                IntCounterVec::new(
-                                    Opts::new("dummy_zero", "dummy_zero"),
-                                    &[]
-                                ).unwrap_or_else(|_| {
-                                    // As a last resort, panic (should never happen)
-                                    eprintln!("FATAL: Unable to create any IntCounterVec, aborting metrics");
-                                    // Return a dummy metric (not registered)
-                                    // This is unreachable, but required for type
-                                    unsafe { std::mem::zeroed() }
-                                })
-                            })
-                        })
-                    }
-                }
+                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
             });
         if let Err(e) = POOL_METRICS_REGISTRY.register(Box::new(counter.clone())) {
             eprintln!("WARN: Failed to register http2_pool_requests_queued_total counter: {}", e);
@@ -435,11 +402,7 @@ impl Http2Pool {
 
         // Update active connections gauge if we removed any
         if before_cleanup != after_cleanup {
-            let backend_label = format!(
-                "{}:{}",
-                format_backend(&self.backend),
-                self.backend.port
-            );
+            let backend_label = format_backend(&self.backend);
             let worker_label = self.worker_id.to_string();
             POOL_CONNECTIONS_ACTIVE
                 .with_label_values(&[&backend_label, &worker_label])
@@ -484,11 +447,7 @@ impl Http2Pool {
         self.metrics.requests_queued += 1;
 
         // Update Prometheus metrics
-        let backend_label = format!(
-            "{}:{}",
-            format_backend(&self.backend),
-            self.backend.port
-        );
+        let backend_label = format_backend(&self.backend);
         let worker_label = self.worker_id.to_string();
         POOL_REQUESTS_QUEUED
             .with_label_values(&[&backend_label, &worker_label])
@@ -592,11 +551,7 @@ impl Http2Pool {
         self.metrics.connections_failed += 1;
 
         // Update Prometheus metrics
-        let backend_label = format!(
-            "{}:{}",
-            format_backend(&self.backend),
-            self.backend.port
-        );
+        let backend_label = format_backend(&self.backend);
         let worker_label = self.worker_id.to_string();
         POOL_CONNECTIONS_FAILED
             .with_label_values(&[&backend_label, &worker_label])
@@ -751,11 +706,9 @@ mod tests {
         );
 
         // Check value is at least 1 (with worker_id label)
-        // Note: backend label format is "IP:port:port" due to format_backend() already including port
-        // This is a pre-existing issue in the production code, not related to metrics changes
         assert!(
-            metrics_output.contains("http2_pool_connections_failed_total{backend=\"127.0.0.1:1:1\",worker_id=\"0\"}"),
-            "Missing count for backend 127.0.0.1:1:1"
+            metrics_output.contains("http2_pool_connections_failed_total{backend=\"127.0.0.1:1\",worker_id=\"0\"}"),
+            "Missing count for backend 127.0.0.1:1"
         );
     }
 

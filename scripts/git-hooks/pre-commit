@@ -58,6 +58,18 @@ for FILE in $STAGED_RS_FILES; do
         fi
     fi
 
+    # Check for .expect() outside test modules
+    EXPECT_LINES=$(grep -n '\.expect(' "$FILE" 2>/dev/null | grep -v '^\s*//' | grep -v '^\s*\*' || true)
+    if [ -n "$EXPECT_LINES" ]; then
+        if ! grep -q '#\[cfg(test)\]' "$FILE" 2>/dev/null; then
+            # Allow .expect() in lazy_static blocks for fallback metrics
+            if ! grep -q 'lazy_static!' "$FILE" 2>/dev/null; then
+                echo "❌ Found .expect() in production code in $FILE"
+                VIOLATIONS_FOUND=1
+            fi
+        fi
+    fi
+
     # Check for panic!() outside test modules
     PANIC_LINES=$(grep -n 'panic!(' "$FILE" 2>/dev/null | grep -v '^\s*//' | grep -v '^\s*\*' | grep -v '//.*panic!' || true)
     if [ -n "$PANIC_LINES" ]; then
@@ -79,6 +91,7 @@ if [ $VIOLATIONS_FOUND -eq 1 ]; then
     echo "  • Use safe_read/safe_write/safe_lock for locks (not .unwrap())"
     echo "  • Use proper error handling (Result/Option) instead of .expect()"
     echo "  • Tests (in #[cfg(test)] modules) can use unwrap/expect"
+    echo "  • .expect() is allowed in lazy_static! blocks for fallback metrics"
     echo ""
     echo "If this is a false positive (all unwraps are in tests), you can:"
     echo "  • Run: git commit --no-verify  (skip this check)"
