@@ -284,14 +284,13 @@ impl GatewayReconciler {
                             format!("Secret {}/{} not found", secret_namespace, secret_name)
                         }
                         _ => {
-                            format!("Failed to access Secret {}/{}: {}", secret_namespace, secret_name, e)
+                            format!(
+                                "Failed to access Secret {}/{}: {}",
+                                secret_namespace, secret_name, e
+                            )
                         }
                     };
-                    return (
-                        "False",
-                        "InvalidCertificateRef",
-                        message,
-                    );
+                    return ("False", "InvalidCertificateRef", message);
                 }
             }
         }

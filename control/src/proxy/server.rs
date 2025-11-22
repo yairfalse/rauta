@@ -30,6 +30,9 @@ lazy_static! {
     static ref METRICS_REGISTRY: Registry = Registry::new();
 
     /// HTTP request duration histogram (in seconds)
+    ///
+    /// Note: Fallback metrics use .expect() as last line of defense - if Prometheus itself is broken, we should panic
+    #[allow(clippy::expect_used)]
     static ref HTTP_REQUEST_DURATION: HistogramVec = {
         let opts = HistogramOpts::new(
             "http_request_duration_seconds",
@@ -41,10 +44,13 @@ lazy_static! {
         let histogram = HistogramVec::new(opts, &["method", "path", "status"])
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create http_request_duration_seconds histogram: {}", e);
-                HistogramVec::new(
-                    HistogramOpts::new("http_request_duration_seconds_fallback", "Fallback metric for HTTP request duration"),
-                    &["method", "path", "status"]
-                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                #[allow(clippy::expect_used)]
+                {
+                    HistogramVec::new(
+                        HistogramOpts::new("http_request_duration_seconds_fallback", "Fallback metric for HTTP request duration"),
+                        &["method", "path", "status"]
+                    ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                }
             });
         if let Err(e) = METRICS_REGISTRY.register(Box::new(histogram.clone())) {
             eprintln!("WARN: Failed to register http_request_duration_seconds histogram: {}", e);
@@ -54,15 +60,21 @@ lazy_static! {
     };
 
     /// HTTP request counter with per-worker distribution
+    ///
+    /// Note: Fallback metrics use .expect() as last line of defense - if Prometheus itself is broken, we should panic
+    #[allow(clippy::expect_used)]
     static ref HTTP_REQUESTS_TOTAL: IntCounterVec = {
         let opts = Opts::new("http_requests_total", "Total number of HTTP requests (with per-worker distribution)");
         let counter = IntCounterVec::new(opts, &["method", "path", "status", "worker_id"])
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create http_requests_total counter: {}", e);
-                IntCounterVec::new(
-                    Opts::new("http_requests_total_fallback", "Fallback metric for HTTP requests total"),
-                    &["method", "path", "status", "worker_id"]
-                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                #[allow(clippy::expect_used)]
+                {
+                    IntCounterVec::new(
+                        Opts::new("http_requests_total_fallback", "Fallback metric for HTTP requests total"),
+                        &["method", "path", "status", "worker_id"]
+                    ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                }
             });
         if let Err(e) = METRICS_REGISTRY.register(Box::new(counter.clone())) {
             eprintln!("WARN: Failed to register http_requests_total counter: {}", e);
@@ -648,7 +660,7 @@ fn build_redirect_response(
     };
 
     // Build response
-    Ok(Response::builder()
+    Response::builder()
         .status(status)
         .header("Location", location)
         .body(
@@ -656,7 +668,7 @@ fn build_redirect_response(
                 .map_err(|never| match never {}) // Handle infallible error type
                 .boxed(),
         )
-        .unwrap())
+        .map_err(|e| format!("Failed to build redirect response: {}", e))
 }
 
 /// Forward request to backend server
@@ -1076,7 +1088,7 @@ async fn handle_request(
         // Encode proxy + controller metrics
         if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
             error!("Failed to encode metrics: {}", e);
-            return Ok(Response::builder()
+            let error_response = Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .header("Content-Type", "text/plain")
                 .body(
@@ -1084,7 +1096,8 @@ async fn handle_request(
                         .map_err(|never| match never {})
                         .boxed(),
                 )
-                .unwrap());
+                .map_err(|build_err| format!("Failed to build error response: {}", build_err))?;
+            return Ok(error_response);
         }
 
         // Append HTTP/2 pool metrics
@@ -1094,6 +1107,8 @@ async fn handle_request(
             warn!("Failed to gather HTTP/2 pool metrics");
         }
 
+        // Response builder with valid status/headers should never fail
+        #[allow(clippy::unwrap_used)]
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", encoder.format_type())
@@ -1146,6 +1161,7 @@ async fn handle_request(
                             error = %e,
                             "Failed to build redirect response"
                         );
+                        #[allow(clippy::unwrap_used)]
                         return Ok(Response::builder()
                             .status(StatusCode::INTERNAL_SERVER_ERROR)
                             .header("Content-Type", "text/plain")
@@ -1167,6 +1183,7 @@ async fn handle_request(
                         error = %e,
                         "Failed to apply request header filters"
                     );
+                    #[allow(clippy::unwrap_used)]
                     return Ok(Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
                         .header("Content-Type", "text/plain")
@@ -1256,15 +1273,21 @@ async fn handle_request(
                                 "Failed to apply response header filters"
                             );
                             // Return error response if filter application fails
-                            Ok(Response::builder()
-                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                .header("Content-Type", "text/plain")
-                                .body(
-                                    Full::new(Bytes::from(format!("Response filter error: {}", e)))
+                            #[allow(clippy::unwrap_used)]
+                            {
+                                Ok(Response::builder()
+                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                    .header("Content-Type", "text/plain")
+                                    .body(
+                                        Full::new(Bytes::from(format!(
+                                            "Response filter error: {}",
+                                            e
+                                        )))
                                         .map_err(|never| match never {})
                                         .boxed(),
-                                )
-                                .unwrap())
+                                    )
+                                    .unwrap())
+                            }
                         } else {
                             Ok(resp)
                         }
@@ -1296,15 +1319,18 @@ async fn handle_request(
                 "No route found"
             );
 
-            Ok(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header("X-Request-ID", request_id)
-                .body(
-                    Full::new(Bytes::from("Not Found"))
-                        .map_err(|never| match never {})
-                        .boxed(),
-                )
-                .unwrap())
+            #[allow(clippy::unwrap_used)]
+            {
+                Ok(Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header("X-Request-ID", request_id)
+                    .body(
+                        Full::new(Bytes::from("Not Found"))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .unwrap())
+            }
         }
     }
 }

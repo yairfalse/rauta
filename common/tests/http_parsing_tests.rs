@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use common::{fnv1a_hash, HttpMethod};
 
 /// Test HTTP method parsing from byte slices

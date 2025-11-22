@@ -29,6 +29,9 @@ lazy_static! {
     static ref POOL_METRICS_REGISTRY: Registry = Registry::new();
 
     /// Active HTTP/2 connections per backend and worker (Gauge)
+    ///
+    /// Note: Fallback metrics use .expect() as last line of defense - if Prometheus itself is broken, we should panic
+    #[allow(clippy::expect_used)]
     static ref POOL_CONNECTIONS_ACTIVE: IntGaugeVec = {
         let opts = Opts::new(
             "http2_pool_connections_active",
@@ -37,10 +40,13 @@ lazy_static! {
         let gauge = IntGaugeVec::new(opts, &["backend", "worker_id"])
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create http2_pool_connections_active gauge: {}", e);
-                IntGaugeVec::new(
-                    Opts::new("http2_pool_connections_active_fallback", "Fallback metric for active connections"),
-                    &["backend", "worker_id"]
-                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                #[allow(clippy::expect_used)]
+                {
+                    IntGaugeVec::new(
+                        Opts::new("http2_pool_connections_active_fallback", "Fallback metric for active connections"),
+                        &["backend", "worker_id"]
+                    ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                }
             });
         if let Err(e) = POOL_METRICS_REGISTRY.register(Box::new(gauge.clone())) {
             eprintln!("WARN: Failed to register http2_pool_connections_active gauge: {}", e);
@@ -51,6 +57,9 @@ lazy_static! {
 
     /// Max concurrent streams configured per connection (Gauge)
     /// Phase 1: Tracks SETTINGS_MAX_CONCURRENT_STREAMS value (RFC 7540)
+    ///
+    /// Note: Fallback metrics use .expect() as last line of defense - if Prometheus itself is broken, we should panic
+    #[allow(clippy::expect_used)]
     static ref POOL_MAX_CONCURRENT_STREAMS: IntGaugeVec = {
         let opts = Opts::new(
             "http2_pool_max_concurrent_streams",
@@ -59,10 +68,13 @@ lazy_static! {
         let gauge = IntGaugeVec::new(opts, &["backend", "worker_id"])
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create http2_pool_max_concurrent_streams gauge: {}", e);
-                IntGaugeVec::new(
-                    Opts::new("http2_pool_max_concurrent_streams_fallback", "Fallback metric for max concurrent streams"),
-                    &["backend", "worker_id"]
-                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                #[allow(clippy::expect_used)]
+                {
+                    IntGaugeVec::new(
+                        Opts::new("http2_pool_max_concurrent_streams_fallback", "Fallback metric for max concurrent streams"),
+                        &["backend", "worker_id"]
+                    ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                }
             });
         if let Err(e) = POOL_METRICS_REGISTRY.register(Box::new(gauge.clone())) {
             eprintln!("WARN: Failed to register http2_pool_max_concurrent_streams gauge: {}", e);
@@ -72,6 +84,9 @@ lazy_static! {
     };
 
     /// Total HTTP/2 connections created per backend and worker (Counter)
+    ///
+    /// Note: Fallback metrics use .expect() as last line of defense - if Prometheus itself is broken, we should panic
+    #[allow(clippy::expect_used)]
     static ref POOL_CONNECTIONS_CREATED: IntCounterVec = {
         let opts = Opts::new(
             "http2_pool_connections_created_total",
@@ -80,10 +95,13 @@ lazy_static! {
         let counter = IntCounterVec::new(opts, &["backend", "worker_id"])
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create http2_pool_connections_created_total counter: {}", e);
-                IntCounterVec::new(
-                    Opts::new("http2_pool_connections_created_total_fallback", "Fallback metric for connections created"),
-                    &["backend", "worker_id"]
-                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                #[allow(clippy::expect_used)]
+                {
+                    IntCounterVec::new(
+                        Opts::new("http2_pool_connections_created_total_fallback", "Fallback metric for connections created"),
+                        &["backend", "worker_id"]
+                    ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                }
             });
         if let Err(e) = POOL_METRICS_REGISTRY.register(Box::new(counter.clone())) {
             eprintln!("WARN: Failed to register http2_pool_connections_created_total counter: {}", e);
@@ -93,6 +111,9 @@ lazy_static! {
     };
 
     /// Total HTTP/2 connection failures per backend and worker (Counter)
+    ///
+    /// Note: Fallback metrics use .expect() as last line of defense - if Prometheus itself is broken, we should panic
+    #[allow(clippy::expect_used)]
     static ref POOL_CONNECTIONS_FAILED: IntCounterVec = {
         let opts = Opts::new(
             "http2_pool_connections_failed_total",
@@ -101,10 +122,13 @@ lazy_static! {
         let counter = IntCounterVec::new(opts, &["backend", "worker_id"])
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create http2_pool_connections_failed_total counter: {}", e);
-                IntCounterVec::new(
-                    Opts::new("http2_pool_connections_failed_total_fallback", "Fallback metric for connection failures"),
-                    &["backend", "worker_id"]
-                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                #[allow(clippy::expect_used)]
+                {
+                    IntCounterVec::new(
+                        Opts::new("http2_pool_connections_failed_total_fallback", "Fallback metric for connection failures"),
+                        &["backend", "worker_id"]
+                    ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                }
             });
         if let Err(e) = POOL_METRICS_REGISTRY.register(Box::new(counter.clone())) {
             eprintln!("WARN: Failed to register http2_pool_connections_failed_total counter: {}", e);
@@ -114,6 +138,9 @@ lazy_static! {
     };
 
     /// Total requests queued waiting for connection per backend and worker (Counter)
+    ///
+    /// Note: Fallback metrics use .expect() as last line of defense - if Prometheus itself is broken, we should panic
+    #[allow(clippy::expect_used)]
     static ref POOL_REQUESTS_QUEUED: IntCounterVec = {
         let opts = Opts::new(
             "http2_pool_requests_queued_total",
@@ -122,10 +149,13 @@ lazy_static! {
         let counter = IntCounterVec::new(opts, &["backend", "worker_id"])
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create http2_pool_requests_queued_total counter: {}", e);
-                IntCounterVec::new(
-                    Opts::new("http2_pool_requests_queued_total_fallback", "Fallback metric for queued requests"),
-                    &["backend", "worker_id"]
-                ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                #[allow(clippy::expect_used)]
+                {
+                    IntCounterVec::new(
+                        Opts::new("http2_pool_requests_queued_total_fallback", "Fallback metric for queued requests"),
+                        &["backend", "worker_id"]
+                    ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                }
             });
         if let Err(e) = POOL_METRICS_REGISTRY.register(Box::new(counter.clone())) {
             eprintln!("WARN: Failed to register http2_pool_requests_queued_total counter: {}", e);
@@ -597,12 +627,6 @@ impl Http2Connection {
     }
 }
 
-/// Convert IPv4 u32 to string format (e.g., "192.168.1.1")
-fn ipv4_to_string(ipv4: u32) -> String {
-    let bytes = ipv4.to_be_bytes();
-    format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3])
-}
-
 /// Gather HTTP/2 pool metrics for Prometheus export
 pub fn gather_pool_metrics() -> Result<String, String> {
     let mut buffer = vec![];
@@ -707,7 +731,9 @@ mod tests {
 
         // Check value is at least 1 (with worker_id label)
         assert!(
-            metrics_output.contains("http2_pool_connections_failed_total{backend=\"127.0.0.1:1\",worker_id=\"0\"}"),
+            metrics_output.contains(
+                "http2_pool_connections_failed_total{backend=\"127.0.0.1:1\",worker_id=\"0\"}"
+            ),
             "Missing count for backend 127.0.0.1:1"
         );
     }

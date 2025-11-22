@@ -158,7 +158,7 @@ async fn run_controllers_only(controller_handles: Vec<tokio::task::JoinHandle<()
     let shutdown_signal = async {
         let ctrl_c = async {
             match signal::ctrl_c().await {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => {
                     error!("Failed to install Ctrl-C handler: {}", e);
                     error!("Graceful shutdown via Ctrl-C will not work!");
@@ -171,7 +171,7 @@ async fn run_controllers_only(controller_handles: Vec<tokio::task::JoinHandle<()
             match signal::unix::signal(signal::unix::SignalKind::terminate()) {
                 Ok(mut stream) => {
                     stream.recv().await;
-                },
+                }
                 Err(e) => {
                     error!("Failed to install SIGTERM handler: {}", e);
                     error!("Graceful shutdown via SIGTERM will not work!");
@@ -217,7 +217,7 @@ async fn run_with_signal_handling(
     let shutdown_signal = async {
         let ctrl_c = async {
             match signal::ctrl_c().await {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => {
                     error!("Failed to install Ctrl-C handler: {}", e);
                     error!("Graceful shutdown via Ctrl-C will not work!");
@@ -230,7 +230,7 @@ async fn run_with_signal_handling(
             match signal::unix::signal(signal::unix::SignalKind::terminate()) {
                 Ok(mut stream) => {
                     stream.recv().await;
-                },
+                }
                 Err(e) => {
                     error!("Failed to install SIGTERM handler: {}", e);
                     error!("Graceful shutdown via SIGTERM will not work!");

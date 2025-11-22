@@ -310,16 +310,16 @@ impl ListenerManager {
         debug!("Request: {} {}", method, path);
 
         // TODO: Use router to select backend
-        let response = Response::builder()
+        // Response builder with static values should never fail
+        #[allow(clippy::expect_used)]
+        Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(
                 Full::new(Bytes::from("Not Found"))
                     .map_err(std::io::Error::other)
                     .boxed(),
             )
-            .unwrap();
-
-        Ok(response)
+            .expect("Building 404 response with static values should never fail"))
     }
 }
 

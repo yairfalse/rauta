@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 // Parser Contract Tests
 //
 // Goal: Validate HTTP method parsing behavior

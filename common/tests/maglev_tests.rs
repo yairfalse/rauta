@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 /// Maglev Consistent Hashing Tests
 ///
 /// Testing the Maglev algorithm implementation for backend selection.

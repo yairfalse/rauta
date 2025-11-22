@@ -238,6 +238,7 @@ impl Backend {
     ///
     /// **Note**: This helper reduces code duplication from the common pattern:
     /// `u32::from(backend.as_ipv4().unwrap())`
+    #[allow(clippy::expect_used)]
     pub fn ipv4_as_u32(&self) -> u32 {
         u32::from(self.as_ipv4().expect("Backend must be IPv4"))
     }
@@ -255,8 +256,9 @@ impl Backend {
                 0, // scope_id
             ))
         } else {
+            // Safe: is_ipv6 == false means this must be IPv4
             core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
-                self.as_ipv4().unwrap(),
+                core::net::Ipv4Addr::new(self.ip[0], self.ip[1], self.ip[2], self.ip[3]),
                 self.port,
             ))
         }
@@ -269,7 +271,8 @@ impl Backend {
             core::net::Ipv6Addr::from(self.ip)
         } else {
             // IPv4 - convert to IPv4-mapped IPv6
-            let ipv4 = self.as_ipv4().unwrap();
+            // Safe: is_ipv6 == false means this must be IPv4
+            let ipv4 = core::net::Ipv4Addr::new(self.ip[0], self.ip[1], self.ip[2], self.ip[3]);
             ipv4.to_ipv6_mapped()
         }
     }
@@ -647,6 +650,7 @@ pub fn maglev_lookup_compact(flow_key: u64, table: &[u8]) -> u8 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     extern crate std;
     use super::*;

@@ -224,3 +224,77 @@ cargo test --test '*'
 # With coverage (requires cargo-tarpaulin)
 cargo tarpaulin --all-features --workspace --timeout 120
 ```
+
+---
+
+# Integration Test Framework
+
+**A comprehensive, modular testing framework for Gateway API implementation, performance validation, and failure mode testing.**
+
+## Features
+
+- ✅ **Modular Test Scenarios** - Easy to add/remove test scenarios via config
+- ✅ **Kind Cluster Management** - Automatic cluster creation, reuse, and cleanup
+- ✅ **Gateway API Assertions** - Helper functions for status validation
+- ✅ **Performance Testing** - Built-in load testing with metrics collection
+- ✅ **Network Sniffing** - tcpdump/wireshark integration for deep packet inspection
+- ✅ **Failure Mode Testing** - Lock poisoning, pod failures, chaos engineering
+- ✅ **CI/CD Ready** - Designed for GitHub Actions integration
+
+## Quick Start (Integration Tests)
+
+```bash
+# Run all enabled test scenarios
+cargo test --test integration_test
+
+# Run with full output
+cargo test --test integration_test -- --nocapture
+
+# Run specific scenario (edit config.toml first)
+cargo test --test integration_test tls_validation
+```
+
+## Configuration (`tests/integration/config.toml`)
+
+```toml
+[cluster]
+name = "rauta-test"
+reuse = true       # Reuse existing cluster (faster iteration)
+cleanup = true     # Delete cluster after tests
+
+[scenarios]
+tls_validation = true          # Enable TLS cert validation tests
+basic_routing = true           # Enable HTTP routing tests
+endpointslice_updates = true   # Enable dynamic backend tests
+lock_poisoning = false         # Requires fault injection (advanced)
+load_testing = false           # Expensive, run manually
+
+[sniffer]
+enabled = false          # Enable packet capture
+interface = "eth0"       # Network interface
+filter = "tcp port 80 or tcp port 443"
+output_dir = "test-captures"
+```
+
+## Test Scenarios
+
+### ✅ TLS Certificate Validation
+
+Tests Gateway API TLS certificateRef validation:
+- Valid TLS Secret → `ResolvedRefs=True`
+- Nonexistent Secret → `ResolvedRefs=False`, "not found"
+- Malformed Secret → `ResolvedRefs=False`, "missing required fields"
+
+### 🚧 Basic HTTP Routing (TODO)
+
+- Deploy backend + Gateway + HTTPRoute
+- Send HTTP request → verify 200 OK
+- Verify metrics incremented
+
+### 🚧 Performance Testing (TODO)
+
+- Run wrk load test (30s, 400 connections)
+- Scrape Prometheus metrics
+- Assert p99 < 50ms, RPS > 10,000
+
+See full documentation in `tests/integration/README.md`.
