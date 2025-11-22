@@ -71,4 +71,9 @@ unwrap_used = "warn"  # Start with warn to see violations, then move to deny
 expect_used = "warn"
 panic = "warn"
 
+[dev-dependencies]
+# Certificate generation for integration tests
+rcgen = "0.13"
+time = "0.3"  # Required by rcgen for certificate validity dates
+
 [build-dependencies]

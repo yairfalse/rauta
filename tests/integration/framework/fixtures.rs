@@ -135,21 +135,41 @@ spec:
     )
 }
 
-/// Generate test TLS certificate (self-signed)
+/// Generate test TLS certificate (self-signed) at runtime
+///
+/// Uses rcgen to create a proper self-signed certificate for testing.
+/// This avoids hardcoding private keys in the repository (which triggers security scanners).
 pub fn generate_test_cert() -> (Vec<u8>, Vec<u8>) {
-    // For testing, we'll use a dummy cert/key
-    // In production tests, generate proper self-signed cert with openssl
-    let cert = b"-----BEGIN CERTIFICATE-----
-MIICljCCAX4CCQCKz8Vz8vZ8ZDANBgkqhkiG9w0BAQsFADANMQswCQYDVQQGEwJV
-UzAeFw0yNTAxMDEwMDAwMDBaFw0yNjAxMDEwMDAwMDBaMA0xCzAJBgNVBAYTAlVT
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0Z8Vz8vZ8ZDANBgkqhki
------END CERTIFICATE-----"
-        .to_vec();
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 
-    let key = b"-----BEGIN PRIVATE KEY-----
-MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDRnxXPy9nxkMA0
------END PRIVATE KEY-----"
-        .to_vec();
+    // Generate a new key pair
+    let key_pair = KeyPair::generate().expect("Failed to generate key pair");
 
-    (cert, key)
+    // Configure certificate parameters
+    let mut params = CertificateParams::new(vec![
+        "example.com".to_string(),
+        "*.example.com".to_string(),
+    ]).expect("Failed to create certificate params");
+
+    // Set distinguished name
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CountryName, "US");
+    dn.push(DnType::OrganizationName, "RAUTA Test");
+    dn.push(DnType::CommonName, "example.com");
+    params.distinguished_name = dn;
+
+    // Set validity period (1 year)
+    params.not_before = time::OffsetDateTime::now_utc();
+    params.not_after = params.not_before + time::Duration::days(365);
+
+    // Generate self-signed certificate
+    let cert = params
+        .self_signed(&key_pair)
+        .expect("Failed to generate self-signed certificate");
+
+    // Serialize to PEM format
+    let cert_pem = cert.pem().into_bytes();
+    let key_pem = key_pair.serialize_pem().into_bytes();
+
+    (cert_pem, key_pem)
 }
