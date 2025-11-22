@@ -796,6 +796,107 @@ spec:
 
 ---
 
+## DEVELOPMENT WORKFLOW
+
+### Initial Setup
+
+After cloning the repository:
+
+```bash
+# Install pre-commit hooks (REQUIRED)
+./scripts/git-hooks/install.sh
+```
+
+**What the pre-commit hook does:**
+- ✅ Blocks `.unwrap()` in production code
+- ✅ Blocks `.expect()` in production code
+- ✅ Blocks `panic!()` in production code
+- ❌ Allows all of the above in test code (`#[cfg(test)]` modules)
+
+**Why this matters:**
+- Lock poisoning from `.unwrap()` on RwLock/Mutex causes cascading panics → gateway crash
+- Metric registration failures shouldn't kill the gateway
+- Production code must be resilient to failures
+
+### Safe Lock Helpers (MANDATORY)
+
+**NEVER use `.unwrap()` on locks.** Always use these helpers:
+
+```rust
+use crate::proxy::router::{safe_read, safe_write, safe_lock};
+
+// ❌ BAD - Will panic on lock poisoning, cascades to all threads
+let routes = self.routes.read().unwrap();
+
+// ✅ GOOD - Recovers from poisoning, logs warning, continues
+let routes = safe_read(&self.routes);
+
+// ❌ BAD - RwLock write
+let mut routes = self.routes.write().unwrap();
+
+// ✅ GOOD
+let mut routes = safe_write(&self.routes);
+
+// ❌ BAD - Mutex
+let inner = self.inner.lock().unwrap();
+
+// ✅ GOOD
+let inner = safe_lock(&self.inner);
+```
+
+**How the helpers work:**
+```rust
+/// Safe RwLock read with automatic poison recovery
+#[inline]
+fn safe_read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| {
+        warn!("RwLock poisoned during read, recovering (data is still valid)");
+        poisoned.into_inner()  // Extract data, continue operation
+    })
+}
+```
+
+**Why poison recovery is safe:**
+- Lock poisoning means a thread panicked while holding the lock
+- The DATA is still valid (Rust prevents memory corruption)
+- Extracting the data and continuing is safer than cascading panics
+- Warning is logged for observability
+
+### Error Handling Rules
+
+1. **Production Code**:
+   - Use `Result<T, E>` and propagate errors with `?`
+   - Use `Option<T>` with `.ok_or()` or early returns
+   - Never use `.unwrap()` or `.expect()`
+   - Graceful degradation (e.g., metrics failures shouldn't crash gateway)
+
+2. **Test Code**:
+   - `.unwrap()` and `.expect()` are FINE in tests
+   - Tests should panic on unexpected failures
+   - Use descriptive messages: `.expect("Should parse test certificate")`
+
+3. **Metrics and Observability**:
+   - Metric registration failures log warnings but don't crash
+   - Gateway runs even with degraded observability
+   - Better to serve traffic without metrics than not serve at all
+
+### Commit Workflow
+
+```bash
+# Make changes
+git add .
+
+# Pre-commit hook runs automatically
+git commit -m "feat: your change"
+
+# If hook blocks you:
+# 1. Check if unwrap/expect are in production code (fix them)
+# 2. If they're in tests, the hook has a bug (override)
+git commit --no-verify -m "feat: your change"
+```
+
+---
+
 ## DEFINITION OF DONE
 
 A feature is complete when:

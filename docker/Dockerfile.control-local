@@ -1,0 +1,22 @@
+# RAUTA Gateway Controller - Local Binary
+# Fast build: just copies pre-built binary
+
+FROM ubuntu:22.04
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy pre-built binary from local build
+COPY target/release/control /usr/local/bin/control
+
+# Set permissions
+RUN chmod +x /usr/local/bin/control
+
+# Expose ports
+EXPOSE 80 443 9090
+
+# Run control plane
+ENTRYPOINT ["/usr/local/bin/control"]

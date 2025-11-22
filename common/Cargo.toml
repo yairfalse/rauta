@@ -9,3 +9,9 @@ serde = { version = "1.0", features = ["derive"], optional = true }
 [features]
 default = ["serde"]
 std = []
+
+[lints.clippy]
+# CRITICAL: Prevent unwraps and panics in production code
+unwrap_used = "warn"  # Start with warn, then move to deny after fixing all violations
+expect_used = "warn"
+panic = "warn"

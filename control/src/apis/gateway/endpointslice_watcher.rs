@@ -354,7 +354,7 @@ mod tests {
             .expect("Should find initial backend");
 
         assert_eq!(
-            route_match.backend.as_ipv4().unwrap(),
+            route_match.backend.as_ipv4().expect("Test backend should be IPv4"),
             std::net::Ipv4Addr::new(10, 0, 1, 1),
             "Initial backend should be 10.0.1.1"
         );
@@ -448,7 +448,7 @@ mod tests {
                 )
                 .expect("Should find backend");
 
-            backend_ips.insert(route_match.backend.as_ipv4().unwrap());
+            backend_ips.insert(route_match.backend.as_ipv4().expect("Test backend should be IPv4"));
         }
 
         // Should see BOTH new backends (10.0.1.2 and 10.0.1.3), NOT the old one (10.0.1.1)
@@ -687,7 +687,7 @@ mod tests {
                 )
                 .expect("Should find backend");
 
-            backend_ips.insert(route_match.backend.as_ipv4().unwrap());
+            backend_ips.insert(route_match.backend.as_ipv4().expect("Test backend should be IPv4"));
         }
 
         // Must see ALL 5 backends (aggregated from 3 slices)
@@ -803,7 +803,7 @@ mod tests {
         // Should have 1 IPv4 backend
         assert_eq!(ipv4_backends.len(), 1, "Should have 1 IPv4 backend");
         assert_eq!(
-            ipv4_backends[0].as_ipv4().unwrap(),
+            ipv4_backends[0].as_ipv4().expect("Test backend should be IPv4"),
             std::net::Ipv4Addr::new(10, 0, 1, 1),
             "Should have IPv4 backend 10.0.1.1"
         );
@@ -812,7 +812,7 @@ mod tests {
         assert_eq!(ipv6_backends.len(), 2, "Should have 2 IPv6 backends");
 
         let ipv6_addrs: Vec<std::net::Ipv6Addr> =
-            ipv6_backends.iter().map(|b| b.as_ipv6().unwrap()).collect();
+            ipv6_backends.iter().map(|b| b.as_ipv6().expect("Test backend should be IPv6")).collect();
 
         assert!(
             ipv6_addrs.contains(&"2001:db8::1".parse().unwrap()),

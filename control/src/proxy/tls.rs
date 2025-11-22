@@ -8,8 +8,28 @@
 use rustls::ServerConfig;
 use rustls_pemfile::{certs, private_key};
 use std::io::{self, BufReader};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio_rustls::TlsAcceptor;
+use tracing::warn;
+
+/// Safe Mutex access with automatic poison recovery
+///
+/// # Why this is safe
+///
+/// Mutex poisoning means a panic occurred while holding the lock, but:
+/// - The lock still protects the data (no race conditions)
+/// - The data itself is NOT corrupt (panic doesn't corrupt memory in Rust)
+/// - Subsequent threads can safely access the data
+///
+/// We use .into_inner() to extract the guard, logging the poisoning event
+/// for observability but continuing operation.
+#[inline]
+fn safe_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        warn!("Mutex poisoned in TLS module, recovering (data is still valid)");
+        poisoned.into_inner()
+    })
+}
 
 /// TLS configuration for a Gateway listener
 #[allow(dead_code)] // Used in gateway controller (not yet integrated)
@@ -153,12 +173,12 @@ impl SniResolver {
         let certified_key = Self::parse_certified_key(&cert)?;
 
         // Add to resolver
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = safe_lock(&self.inner);
         inner
             .add(&hostname, certified_key)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let mut hostnames = self.hostnames.lock().unwrap();
+        let mut hostnames = safe_lock(&self.hostnames);
         hostnames.insert(hostname);
         Ok(())
     }
@@ -174,7 +194,7 @@ impl SniResolver {
         let certified_key = Self::parse_certified_key(&cert)?;
 
         // Update resolver (this replaces existing cert for hostname)
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = safe_lock(&self.inner);
         inner
             .add(&hostname, certified_key)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -188,7 +208,7 @@ impl SniResolver {
     pub fn get_acceptor(&self, hostname: &str) -> Option<TlsAcceptor> {
         // This is deprecated - we should use to_server_config() for dynamic SNI
         // For backwards compatibility with existing tests, we build a single-cert config
-        let hostnames = self.hostnames.lock().unwrap();
+        let hostnames = safe_lock(&self.hostnames);
         if !hostnames.contains(hostname) {
             return None;
         }
@@ -217,7 +237,7 @@ impl SniResolver {
                 &self,
                 client_hello: rustls::server::ClientHello,
             ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-                let inner = self.inner.lock().unwrap();
+                let inner = safe_lock(&self.inner);
                 inner.resolve(client_hello)
             }
         }
@@ -232,7 +252,7 @@ impl SniResolver {
 
     /// Check if a hostname has a certificate configured
     pub fn has_cert(&self, hostname: &str) -> bool {
-        let hostnames = self.hostnames.lock().unwrap();
+        let hostnames = safe_lock(&self.hostnames);
         hostnames.contains(hostname)
     }
 }
