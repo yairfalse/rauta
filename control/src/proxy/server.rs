@@ -44,7 +44,17 @@ lazy_static! {
                 HistogramVec::new(
                     HistogramOpts::new("dummy", "dummy"),
                     &["method", "path", "status"]
-                ).unwrap()
+                ).unwrap_or_else(|e2| {
+                    eprintln!("ERROR: Failed to create dummy http_request_duration_seconds histogram: {}", e2);
+                    // Return a minimal dummy histogram (with no buckets) to avoid panicking
+                    HistogramVec::new(
+                        HistogramOpts::new("dummy_fallback", "dummy_fallback"),
+                        &["method", "path", "status"]
+                    ).unwrap_or_else(|_| {
+                        // As a last resort, panic with a clear error message
+                        panic!("Failed to create any http_request_duration_seconds histogram (including dummy fallback)");
+                    })
+                })
             });
         if let Err(e) = METRICS_REGISTRY.register(Box::new(histogram.clone())) {
             eprintln!("WARN: Failed to register http_request_duration_seconds histogram: {}", e);
