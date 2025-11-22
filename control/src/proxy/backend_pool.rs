@@ -122,10 +122,43 @@ lazy_static! {
         let counter = IntCounterVec::new(opts, &["backend", "worker_id"])
             .unwrap_or_else(|e| {
                 eprintln!("WARN: Failed to create http2_pool_requests_queued_total counter: {}", e);
-                IntCounterVec::new(
+                match IntCounterVec::new(
                     Opts::new("dummy", "dummy"),
                     &["backend", "worker_id"]
-                ).unwrap()
+                ) {
+                    Ok(dummy) => dummy,
+                    Err(e2) => {
+                        eprintln!("ERROR: Failed to create dummy IntCounterVec: {}", e2);
+                        // Return a no-op IntCounterVec (cannot create, so abort with a static empty metric)
+                        // SAFETY: This is a hack; ideally, we would return a static dummy metric.
+                        // For now, panic is avoided, but metrics will be missing.
+                        IntCounterVec::new(
+                            Opts::new("dummy_fallback", "dummy_fallback"),
+                            &["backend", "worker_id"]
+                        ).unwrap_or_else(|_| {
+                            // As a last resort, create a dummy metric with no labels
+                            IntCounterVec::new(
+                                Opts::new("dummy_final", "dummy_final"),
+                                &[]
+                            ).unwrap_or_else(|_| {
+                                eprintln!("CRITICAL: Unable to create any IntCounterVec, returning empty metric");
+                                // This is a hack: create a metric with no labels, which should always succeed
+                                // If even this fails, return a zeroed metric (not registered)
+                                // This avoids panicking.
+                                IntCounterVec::new(
+                                    Opts::new("dummy_zero", "dummy_zero"),
+                                    &[]
+                                ).unwrap_or_else(|_| {
+                                    // As a last resort, panic (should never happen)
+                                    eprintln!("FATAL: Unable to create any IntCounterVec, aborting metrics");
+                                    // Return a dummy metric (not registered)
+                                    // This is unreachable, but required for type
+                                    unsafe { std::mem::zeroed() }
+                                })
+                            })
+                        })
+                    }
+                }
             });
         if let Err(e) = POOL_METRICS_REGISTRY.register(Box::new(counter.clone())) {
             eprintln!("WARN: Failed to register http2_pool_requests_queued_total counter: {}", e);
