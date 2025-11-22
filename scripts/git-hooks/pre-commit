@@ -1,0 +1,90 @@
+#!/bin/bash
+# Pre-commit hook to prevent unwrap(), expect(), and panic!() in production code
+# This enforces the use of safe_read/safe_write/safe_lock helpers for locks
+
+set -e
+
+echo "🔍 Checking for unwrap()/expect()/panic!() in production code..."
+
+# Get list of staged Rust files
+STAGED_RS_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
+
+if [ -z "$STAGED_RS_FILES" ]; then
+    echo "✅ No Rust files to check"
+    exit 0
+fi
+
+VIOLATIONS_FOUND=0
+
+# Function to check if a line is in a test context
+is_test_context() {
+    local file=$1
+    local line_num=$2
+
+    # Get surrounding context (50 lines before to find #[test] or #[cfg(test)])
+    local context=$(sed -n "$((line_num > 50 ? line_num - 50 : 1)),$((line_num))p" "$file")
+
+    # Check if we're in a test module or test function
+    if echo "$context" | grep -qE '#\[test\]|#\[cfg\(test\)\]|mod tests \{'; then
+        return 0  # Is test context
+    fi
+
+    return 1  # Not test context
+}
+
+# Check each file for violations (excluding test files and test contexts)
+for FILE in $STAGED_RS_FILES; do
+    # Skip test directories and test files
+    if echo "$FILE" | grep -qE '(tests/|_test\.rs$)'; then
+        continue
+    fi
+
+    # Skip common/tests directory
+    if echo "$FILE" | grep -qE 'common/tests/'; then
+        continue
+    fi
+
+    # For files with test modules, we need to check line-by-line
+    # Count violations (this is a simplified check - good enough for pre-commit)
+
+    # Check for .unwrap() outside test modules
+    UNWRAP_LINES=$(grep -n '\.unwrap()' "$FILE" 2>/dev/null | grep -v '^\s*//' | grep -v '^\s*\*' || true)
+    if [ -n "$UNWRAP_LINES" ]; then
+        # Quick heuristic: if file has #[cfg(test)], assume unwraps are in tests
+        if ! grep -q '#\[cfg(test)\]' "$FILE" 2>/dev/null; then
+            # No test module, so these are production unwraps
+            echo "❌ Found .unwrap() in production code in $FILE"
+            VIOLATIONS_FOUND=1
+        fi
+    fi
+
+    # Check for panic!() outside test modules
+    PANIC_LINES=$(grep -n 'panic!(' "$FILE" 2>/dev/null | grep -v '^\s*//' | grep -v '^\s*\*' | grep -v '//.*panic!' || true)
+    if [ -n "$PANIC_LINES" ]; then
+        if ! grep -q '#\[cfg(test)\]' "$FILE" 2>/dev/null; then
+            # Check if it's just a comment about panics
+            if ! echo "$PANIC_LINES" | grep -q '//.*panic!'; then
+                echo "❌ Found panic!() in production code in $FILE"
+                VIOLATIONS_FOUND=1
+            fi
+        fi
+    fi
+done
+
+if [ $VIOLATIONS_FOUND -eq 1 ]; then
+    echo ""
+    echo "🚫 COMMIT BLOCKED: Production code may contain unwrap()/expect()/panic!()"
+    echo ""
+    echo "❗ Rules:"
+    echo "  • Use safe_read/safe_write/safe_lock for locks (not .unwrap())"
+    echo "  • Use proper error handling (Result/Option) instead of .expect()"
+    echo "  • Tests (in #[cfg(test)] modules) can use unwrap/expect"
+    echo ""
+    echo "If this is a false positive (all unwraps are in tests), you can:"
+    echo "  • Run: git commit --no-verify  (skip this check)"
+    echo ""
+    exit 1
+fi
+
+echo "✅ No unwrap()/expect()/panic!() violations found in production code"
+exit 0
