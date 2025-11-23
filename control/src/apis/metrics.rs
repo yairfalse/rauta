@@ -18,10 +18,20 @@ lazy_static! {
             "HTTPRoute reconciliation duration in seconds",
         );
         let histogram = HistogramVec::new(opts, &["httproute", "namespace"])
-            .expect("Failed to create histogram");
-        CONTROLLER_METRICS_REGISTRY
-            .register(Box::new(histogram.clone()))
-            .expect("Failed to register histogram");
+            .unwrap_or_else(|e| {
+                eprintln!("WARN: Failed to create httproute_reconciliation_duration histogram: {}", e);
+                #[allow(clippy::expect_used)]
+                {
+                    HistogramVec::new(
+                        HistogramOpts::new("httproute_reconciliation_duration_seconds_fallback", "Fallback metric for HTTPRoute reconciliation duration"),
+                        &["httproute", "namespace"]
+                    ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                }
+            });
+        if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(histogram.clone())) {
+            eprintln!("WARN: Failed to register httproute_reconciliation_duration histogram: {}", e);
+            eprintln!("WARN: Metrics collection will be degraded but gateway will continue");
+        }
         histogram
     };
 
@@ -32,10 +42,20 @@ lazy_static! {
             "Total number of httproute reconciliations",
         );
         let counter = IntCounterVec::new(opts, &["httproute", "namespace", "result"])
-            .expect("Failed to create counter");
-        CONTROLLER_METRICS_REGISTRY
-            .register(Box::new(counter.clone()))
-            .expect("Failed to register counter");
+            .unwrap_or_else(|e| {
+                eprintln!("WARN: Failed to create httproute_reconciliations_total counter: {}", e);
+                #[allow(clippy::expect_used)]
+                {
+                    IntCounterVec::new(
+                        Opts::new("httproute_reconciliations_total_fallback", "Fallback metric for HTTPRoute reconciliations"),
+                        &["httproute", "namespace", "result"]
+                    ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                }
+            });
+        if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(counter.clone())) {
+            eprintln!("WARN: Failed to register httproute_reconciliations_total counter: {}", e);
+            eprintln!("WARN: Metrics collection will be degraded but gateway will continue");
+        }
         counter
     };
 
@@ -46,10 +66,20 @@ lazy_static! {
             "Gateway reconciliation duration in seconds",
         );
         let histogram = HistogramVec::new(opts, &["gateway", "namespace"])
-            .expect("Failed to create histogram");
-        CONTROLLER_METRICS_REGISTRY
-            .register(Box::new(histogram.clone()))
-            .expect("Failed to register histogram");
+            .unwrap_or_else(|e| {
+                eprintln!("WARN: Failed to create gateway_reconciliation_duration histogram: {}", e);
+                #[allow(clippy::expect_used)]
+                {
+                    HistogramVec::new(
+                        HistogramOpts::new("gateway_reconciliation_duration_seconds_fallback", "Fallback metric for Gateway reconciliation duration"),
+                        &["gateway", "namespace"]
+                    ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                }
+            });
+        if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(histogram.clone())) {
+            eprintln!("WARN: Failed to register gateway_reconciliation_duration histogram: {}", e);
+            eprintln!("WARN: Metrics collection will be degraded but gateway will continue");
+        }
         histogram
     };
 
@@ -60,10 +90,20 @@ lazy_static! {
             "Total number of gateway reconciliations",
         );
         let counter = IntCounterVec::new(opts, &["gateway", "namespace", "result"])
-            .expect("Failed to create counter");
-        CONTROLLER_METRICS_REGISTRY
-            .register(Box::new(counter.clone()))
-            .expect("Failed to register counter");
+            .unwrap_or_else(|e| {
+                eprintln!("WARN: Failed to create gateway_reconciliations_total counter: {}", e);
+                #[allow(clippy::expect_used)]
+                {
+                    IntCounterVec::new(
+                        Opts::new("gateway_reconciliations_total_fallback", "Fallback metric for Gateway reconciliations"),
+                        &["gateway", "namespace", "result"]
+                    ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                }
+            });
+        if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(counter.clone())) {
+            eprintln!("WARN: Failed to register gateway_reconciliations_total counter: {}", e);
+            eprintln!("WARN: Metrics collection will be degraded but gateway will continue");
+        }
         counter
     };
 
@@ -74,10 +114,20 @@ lazy_static! {
             "GatewayClass reconciliation duration in seconds",
         );
         let histogram = HistogramVec::new(opts, &["gatewayclass"])
-            .expect("Failed to create histogram");
-        CONTROLLER_METRICS_REGISTRY
-            .register(Box::new(histogram.clone()))
-            .expect("Failed to register histogram");
+            .unwrap_or_else(|e| {
+                eprintln!("WARN: Failed to create gatewayclass_reconciliation_duration histogram: {}", e);
+                #[allow(clippy::expect_used)]
+                {
+                    HistogramVec::new(
+                        HistogramOpts::new("gatewayclass_reconciliation_duration_seconds_fallback", "Fallback metric for GatewayClass reconciliation duration"),
+                        &["gatewayclass"]
+                    ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                }
+            });
+        if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(histogram.clone())) {
+            eprintln!("WARN: Failed to register gatewayclass_reconciliation_duration histogram: {}", e);
+            eprintln!("WARN: Metrics collection will be degraded but gateway will continue");
+        }
         histogram
     };
 
@@ -88,10 +138,20 @@ lazy_static! {
             "Total number of gatewayclass reconciliations",
         );
         let counter = IntCounterVec::new(opts, &["gatewayclass", "result"])
-            .expect("Failed to create counter");
-        CONTROLLER_METRICS_REGISTRY
-            .register(Box::new(counter.clone()))
-            .expect("Failed to register counter");
+            .unwrap_or_else(|e| {
+                eprintln!("WARN: Failed to create gatewayclass_reconciliations_total counter: {}", e);
+                #[allow(clippy::expect_used)]
+                {
+                    IntCounterVec::new(
+                        Opts::new("gatewayclass_reconciliations_total_fallback", "Fallback metric for GatewayClass reconciliations"),
+                        &["gatewayclass", "result"]
+                    ).expect("Fallback metric creation should never fail - if this panics, Prometheus is broken")
+                }
+            });
+        if let Err(e) = CONTROLLER_METRICS_REGISTRY.register(Box::new(counter.clone())) {
+            eprintln!("WARN: Failed to register gatewayclass_reconciliations_total counter: {}", e);
+            eprintln!("WARN: Metrics collection will be degraded but gateway will continue");
+        }
         counter
     };
 }

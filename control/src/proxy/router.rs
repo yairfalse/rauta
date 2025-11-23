@@ -417,7 +417,7 @@ impl Router {
     /// **Supports both IPv4 and IPv6** backends.
     #[allow(dead_code)] // Used in tests and future EndpointSlice integration
     pub fn drain_backend(&self, backend: Backend, drain_timeout: Duration) {
-        let mut draining = self.draining_backends.write().unwrap();
+        let mut draining = safe_write(&self.draining_backends);
         draining.insert(backend, BackendDraining::new(drain_timeout));
     }
 
@@ -426,14 +426,14 @@ impl Router {
     /// **Supports both IPv4 and IPv6** backends.
     #[allow(dead_code)] // Used in tests
     pub fn is_backend_draining(&self, backend: Backend) -> bool {
-        let draining = self.draining_backends.read().unwrap();
+        let draining = safe_read(&self.draining_backends);
         draining.contains_key(&backend)
     }
 
     /// Clean up expired draining backends
     #[allow(dead_code)] // Will be used in EndpointSlice watcher integration
     fn cleanup_expired_draining_backends(&self) {
-        let mut draining = self.draining_backends.write().unwrap();
+        let mut draining = safe_write(&self.draining_backends);
         draining.retain(|_ip, state| !state.is_expired());
     }
 
@@ -619,14 +619,14 @@ impl Router {
 
         // Update routes HashMap
         {
-            let mut routes = self.routes.write().unwrap();
+            let mut routes = safe_write(&self.routes);
             routes.insert(key, route);
         }
 
         // Rebuild matchit router (same as add_route)
         let mut new_prefix_router = matchit::Router::new();
         {
-            let routes = self.routes.read().unwrap();
+            let routes = safe_read(&self.routes);
             for (route_key, route) in routes.iter() {
                 let path_str = route.pattern.as_ref();
 
@@ -647,7 +647,7 @@ impl Router {
         }
 
         {
-            let mut prefix_router = self.prefix_router.write().unwrap();
+            let mut prefix_router = safe_write(&self.prefix_router);
             *prefix_router = new_prefix_router;
         }
 
@@ -685,14 +685,14 @@ impl Router {
 
         // Update routes HashMap
         {
-            let mut routes = self.routes.write().unwrap();
+            let mut routes = safe_write(&self.routes);
             routes.insert(key, route);
         }
 
         // Rebuild matchit router (same as add_route)
         let mut new_prefix_router = matchit::Router::new();
         {
-            let routes = self.routes.read().unwrap();
+            let routes = safe_read(&self.routes);
             for (route_key, route) in routes.iter() {
                 let path_str = route.pattern.as_ref();
 
@@ -713,7 +713,7 @@ impl Router {
         }
 
         {
-            let mut prefix_router = self.prefix_router.write().unwrap();
+            let mut prefix_router = safe_write(&self.prefix_router);
             *prefix_router = new_prefix_router;
         }
 
@@ -751,14 +751,14 @@ impl Router {
 
         // Update routes HashMap
         {
-            let mut routes = self.routes.write().unwrap();
+            let mut routes = safe_write(&self.routes);
             routes.insert(key, route);
         }
 
         // Rebuild matchit router (same as add_route)
         let mut new_prefix_router = matchit::Router::new();
         {
-            let routes = self.routes.read().unwrap();
+            let routes = safe_read(&self.routes);
             for (route_key, route) in routes.iter() {
                 let path_str = route.pattern.as_ref();
 
@@ -779,7 +779,7 @@ impl Router {
         }
 
         {
-            let mut prefix_router = self.prefix_router.write().unwrap();
+            let mut prefix_router = safe_write(&self.prefix_router);
             *prefix_router = new_prefix_router;
         }
 
@@ -817,12 +817,12 @@ impl Router {
 
         // Update routes HashMap
         {
-            let mut routes = self.routes.write().unwrap();
+            let mut routes = safe_write(&self.routes);
             routes.insert(key, route);
         }
 
         // Rebuild matchit router from scratch (since matchit doesn't support updates)
-        let routes = self.routes.read().unwrap();
+        let routes = safe_read(&self.routes);
         let mut new_prefix_router = matchit::Router::new();
 
         for (route_key, route) in routes.iter() {
@@ -846,7 +846,7 @@ impl Router {
         }
 
         {
-            let mut prefix_router = self.prefix_router.write().unwrap();
+            let mut prefix_router = safe_write(&self.prefix_router);
             *prefix_router = new_prefix_router;
         }
 
@@ -884,12 +884,12 @@ impl Router {
 
         // Update routes HashMap
         {
-            let mut routes = self.routes.write().unwrap();
+            let mut routes = safe_write(&self.routes);
             routes.insert(key, route);
         }
 
         // Rebuild matchit router from scratch (since matchit doesn't support updates)
-        let routes = self.routes.read().unwrap();
+        let routes = safe_read(&self.routes);
         let mut new_prefix_router = matchit::Router::new();
 
         for (route_key, route) in routes.iter() {
@@ -913,7 +913,7 @@ impl Router {
         }
 
         {
-            let mut prefix_router = self.prefix_router.write().unwrap();
+            let mut prefix_router = safe_write(&self.prefix_router);
             *prefix_router = new_prefix_router;
         }
 
@@ -951,12 +951,12 @@ impl Router {
 
         // Update routes HashMap
         {
-            let mut routes = self.routes.write().unwrap();
+            let mut routes = safe_write(&self.routes);
             routes.insert(key, route);
         }
 
         // Rebuild matchit router from scratch (since matchit doesn't support updates)
-        let routes = self.routes.read().unwrap();
+        let routes = safe_read(&self.routes);
         let mut new_prefix_router = matchit::Router::new();
 
         for (route_key, route) in routes.iter() {
@@ -980,7 +980,7 @@ impl Router {
         }
 
         {
-            let mut prefix_router = self.prefix_router.write().unwrap();
+            let mut prefix_router = safe_write(&self.prefix_router);
             *prefix_router = new_prefix_router;
         }
 
@@ -1020,12 +1020,12 @@ impl Router {
 
         // Update routes HashMap
         {
-            let mut routes = self.routes.write().unwrap();
+            let mut routes = safe_write(&self.routes);
             routes.insert(key, route);
         }
 
         // Rebuild matchit router from scratch (since matchit doesn't support updates)
-        let routes = self.routes.read().unwrap();
+        let routes = safe_read(&self.routes);
         let mut new_prefix_router = matchit::Router::new();
 
         for (route_key, route) in routes.iter() {
@@ -1049,7 +1049,7 @@ impl Router {
         }
 
         {
-            let mut prefix_router = self.prefix_router.write().unwrap();
+            let mut prefix_router = safe_write(&self.prefix_router);
             *prefix_router = new_prefix_router;
         }
 
@@ -1076,17 +1076,17 @@ impl Router {
 
         // Try exact match first, then prefix match (same as select_backend)
         let route_key = {
-            let routes = self.routes.read().unwrap();
+            let routes = safe_read(&self.routes);
             if routes.contains_key(&key) {
                 Some(key)
             } else {
-                let prefix_router = self.prefix_router.read().unwrap();
+                let prefix_router = safe_read(&self.prefix_router);
                 prefix_router.at(path).ok().map(|m| *m.value)
             }
         }?;
 
         // Look up route
-        let routes = self.routes.read().unwrap();
+        let routes = safe_read(&self.routes);
         let route = routes.get(&route_key)?;
 
         // Check header matches (ALL must match - AND logic)
@@ -1099,8 +1099,8 @@ impl Router {
         // Headers match (or no header constraints) - select backend using Maglev
         let flow_hash = self.compute_flow_hash(path_hash, src_ip, src_port);
 
-        let health = self.backend_health.read().unwrap();
-        let draining = self.draining_backends.read().unwrap();
+        let health = safe_read(&self.backend_health);
+        let draining = safe_read(&self.draining_backends);
         let mut tried_indices = HashSet::new();
 
         for attempt in 0..route.backends.len() * 10 {
@@ -1157,17 +1157,17 @@ impl Router {
 
         // Try exact match first, then prefix match (same as select_backend)
         let route_key = {
-            let routes = self.routes.read().unwrap();
+            let routes = safe_read(&self.routes);
             if routes.contains_key(&key) {
                 Some(key)
             } else {
-                let prefix_router = self.prefix_router.read().unwrap();
+                let prefix_router = safe_read(&self.prefix_router);
                 prefix_router.at(path).ok().map(|m| *m.value)
             }
         }?;
 
         // Look up route
-        let routes = self.routes.read().unwrap();
+        let routes = safe_read(&self.routes);
         let route = routes.get(&route_key)?;
 
         // Check query parameter matches (ALL must match - AND logic)
@@ -1180,8 +1180,8 @@ impl Router {
         // Query params match (or no query param constraints) - select backend using Maglev
         let flow_hash = self.compute_flow_hash(path_hash, src_ip, src_port);
 
-        let health = self.backend_health.read().unwrap();
-        let draining = self.draining_backends.read().unwrap();
+        let health = safe_read(&self.backend_health);
+        let draining = safe_read(&self.draining_backends);
         let mut tried_indices = HashSet::new();
 
         for attempt in 0..route.backends.len() * 10 {
@@ -1294,6 +1294,7 @@ fn query_params_match(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;

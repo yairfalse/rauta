@@ -153,6 +153,7 @@ async fn handle_secret_apply(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::proxy::tls::TlsCertificate;

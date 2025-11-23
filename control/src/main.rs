@@ -6,7 +6,7 @@ use std::env;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::signal;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -157,17 +157,27 @@ async fn run_controllers_only(controller_handles: Vec<tokio::task::JoinHandle<()
     // Create shutdown signal that triggers on SIGTERM or Ctrl-C
     let shutdown_signal = async {
         let ctrl_c = async {
-            signal::ctrl_c()
-                .await
-                .expect("Failed to install Ctrl-C handler");
+            match signal::ctrl_c().await {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("Failed to install Ctrl-C handler: {}", e);
+                    error!("Graceful shutdown via Ctrl-C will not work!");
+                }
+            }
         };
 
         #[cfg(unix)]
         let terminate = async {
-            signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("Failed to install SIGTERM handler")
-                .recv()
-                .await;
+            match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+                Ok(mut stream) => {
+                    stream.recv().await;
+                }
+                Err(e) => {
+                    error!("Failed to install SIGTERM handler: {}", e);
+                    error!("Graceful shutdown via SIGTERM will not work!");
+                    std::future::pending::<()>().await;
+                }
+            }
         };
 
         #[cfg(not(unix))]
@@ -206,17 +216,27 @@ async fn run_with_signal_handling(
     // Create shutdown signal that triggers on SIGTERM or Ctrl-C
     let shutdown_signal = async {
         let ctrl_c = async {
-            signal::ctrl_c()
-                .await
-                .expect("Failed to install Ctrl-C handler");
+            match signal::ctrl_c().await {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("Failed to install Ctrl-C handler: {}", e);
+                    error!("Graceful shutdown via Ctrl-C will not work!");
+                }
+            }
         };
 
         #[cfg(unix)]
         let terminate = async {
-            signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("Failed to install SIGTERM handler")
-                .recv()
-                .await;
+            match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+                Ok(mut stream) => {
+                    stream.recv().await;
+                }
+                Err(e) => {
+                    error!("Failed to install SIGTERM handler: {}", e);
+                    error!("Graceful shutdown via SIGTERM will not work!");
+                    std::future::pending::<()>().await;
+                }
+            }
         };
 
         #[cfg(not(unix))]

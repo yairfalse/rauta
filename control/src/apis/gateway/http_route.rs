@@ -446,6 +446,8 @@ impl HTTPRouteReconciler {
                             .collect();
 
                         // Sort by remainder descending (largest first)
+                        // Safe: remainders are always valid f64 values (not NaN)
+                        #[allow(clippy::unwrap_used)]
                         indexed_remainders.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
                         // Give one extra slot to top N services (where N = remaining_slots)
@@ -762,6 +764,7 @@ fn parse_endpointslice_to_backends(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use gateway_api::apis::standard::httproutes::{HTTPRoute, HTTPRouteSpec};

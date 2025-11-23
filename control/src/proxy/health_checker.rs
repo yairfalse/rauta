@@ -8,12 +8,30 @@
 use common::Backend;
 use prometheus::{CounterVec, HistogramOpts, HistogramVec, IntGaugeVec, Opts, Registry};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+/// Safe RwLock read helper that recovers from poisoning
+#[inline]
+fn safe_read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| {
+        warn!("RwLock poisoned during read, recovering (data is still valid)");
+        poisoned.into_inner()
+    })
+}
+
+/// Safe RwLock write helper that recovers from poisoning
+#[inline]
+fn safe_write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|poisoned| {
+        warn!("RwLock poisoned during write, recovering (data is still valid)");
+        poisoned.into_inner()
+    })
+}
 
 /// Health check configuration
 #[derive(Debug, Clone)]
@@ -118,6 +136,9 @@ pub struct HealthChecker {
 
 impl HealthChecker {
     /// Create new health checker with metrics registered in the given registry
+    ///
+    /// Note: Uses .expect() for metric creation/registration - if these fail, Prometheus is fundamentally broken
+    #[allow(clippy::expect_used)]
     pub fn new(config: HealthCheckConfig, registry: &Registry) -> Self {
         // Create metrics
         let backend_health_status = IntGaugeVec::new(
@@ -204,7 +225,7 @@ impl HealthChecker {
 
     /// Check if a backend is healthy
     pub fn is_healthy(&self, backend: &Backend) -> bool {
-        let states = self.states.read().unwrap();
+        let states = safe_read(&self.states);
         states
             .get(backend)
             .map(|state| state.status == HealthStatus::Healthy)
@@ -214,7 +235,7 @@ impl HealthChecker {
     /// Get health status for all backends
     #[allow(dead_code)] // Will be used for debugging/admin endpoints
     pub fn get_all_statuses(&self) -> HashMap<Backend, HealthStatus> {
-        let states = self.states.read().unwrap();
+        let states = safe_read(&self.states);
         states
             .iter()
             .map(|(backend, state)| (*backend, state.status))
@@ -237,7 +258,7 @@ impl HealthChecker {
 
         // Ensure all backends are tracked
         {
-            let mut states_lock = states.write().unwrap();
+            let mut states_lock = safe_write(&states);
             for backend in &backends {
                 states_lock
                     .entry(*backend)
@@ -331,7 +352,7 @@ impl HealthChecker {
 
             // Update state based on result
             let (probe_result, old_status, new_status) = {
-                let mut states_lock = states.write().unwrap();
+                let mut states_lock = safe_write(&states);
                 let state = states_lock
                     .entry(backend)
                     .or_insert_with(BackendHealthState::new);
@@ -418,7 +439,7 @@ impl HealthChecker {
                 .observe(latency_seconds);
 
             let consecutive_failures = {
-                let states_lock = states.read().unwrap();
+                let states_lock = safe_read(&states);
                 states_lock
                     .get(&backend)
                     .map(|s| s.consecutive_failures)
@@ -433,6 +454,7 @@ impl HealthChecker {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use prometheus::Registry;
