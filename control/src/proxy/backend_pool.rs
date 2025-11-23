@@ -640,6 +640,7 @@ pub fn gather_pool_metrics() -> Result<String, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;

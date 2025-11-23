@@ -528,6 +528,7 @@ impl GatewayReconciler {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use gateway_api::apis::standard::gateways::{Gateway, GatewayListeners, GatewaySpec};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;

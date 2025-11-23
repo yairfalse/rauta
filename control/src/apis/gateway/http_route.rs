@@ -764,6 +764,7 @@ fn parse_endpointslice_to_backends(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use gateway_api::apis::standard::httproutes::{HTTPRoute, HTTPRouteSpec};
