@@ -45,8 +45,19 @@ async fn main() -> Result<()> {
     // Create shared router (Arc for sharing with controllers)
     let router = Arc::new(Router::new());
 
+    // Create rate limiter and circuit breaker (shared across all components)
+    let rate_limiter = Arc::new(proxy::rate_limiter::RateLimiter::new());
+    let circuit_breaker = Arc::new(proxy::circuit_breaker::CircuitBreakerManager::new(
+        5,                                   // 5 consecutive failures to open circuit
+        std::time::Duration::from_secs(30), // 30s timeout before Half-Open
+    ));
+
     // Create listener manager for Gateway API dynamic listeners
-    let listener_manager = Arc::new(ListenerManager::new(router.clone()));
+    let listener_manager = Arc::new(ListenerManager::new(
+        router.clone(),
+        rate_limiter.clone(),
+        circuit_breaker.clone(),
+    ));
 
     // Kubernetes Gateway API controllers (optional)
     let mut controller_handles = vec![];
@@ -87,7 +98,15 @@ async fn main() -> Result<()> {
                 // Spawn HTTPRoute controller (with Router integration)
                 let hr_client = client.clone();
                 let hr_router = router.clone();
-                let hr_reconciler = HTTPRouteReconciler::new(hr_client, hr_router, gateway_name);
+                let hr_rate_limiter = rate_limiter.clone();
+                let hr_circuit_breaker = circuit_breaker.clone();
+                let hr_reconciler = HTTPRouteReconciler::new(
+                    hr_client,
+                    hr_router,
+                    gateway_name,
+                    hr_rate_limiter,
+                    hr_circuit_breaker,
+                );
                 controller_handles.push(tokio::spawn(async move {
                     if let Err(e) = hr_reconciler.run().await {
                         tracing::error!("HTTPRoute controller error: {}", e);

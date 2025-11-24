@@ -74,15 +74,25 @@ pub struct ListenerManager {
     listeners: Arc<RwLock<HashMap<u16, ActiveListener>>>,
     /// Shared router for all listeners
     router: Arc<Router>,
+    /// Rate limiter for request throttling
+    rate_limiter: Arc<crate::proxy::rate_limiter::RateLimiter>,
+    /// Circuit breaker for backend health management
+    circuit_breaker: Arc<crate::proxy::circuit_breaker::CircuitBreakerManager>,
 }
 
 #[allow(dead_code)] // Methods used in Gateway reconciliation and tests
 impl ListenerManager {
     /// Create new ListenerManager
-    pub fn new(router: Arc<Router>) -> Self {
+    pub fn new(
+        router: Arc<Router>,
+        rate_limiter: Arc<crate::proxy::rate_limiter::RateLimiter>,
+        circuit_breaker: Arc<crate::proxy::circuit_breaker::CircuitBreakerManager>,
+    ) -> Self {
         Self {
             listeners: Arc::new(RwLock::new(HashMap::new())),
             router,
+            rate_limiter,
+            circuit_breaker,
         }
     }
 
@@ -216,6 +226,8 @@ impl ListenerManager {
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
 
         let router = self.router.clone();
+        let rate_limiter = self.rate_limiter.clone();
+        let circuit_breaker = self.circuit_breaker.clone();
         let bind_addr = config.bind_addr();
         let protocol = config.protocol.clone();
 
@@ -235,6 +247,8 @@ impl ListenerManager {
                                 debug!("Accepted connection from {} on {}", peer_addr, bind_addr);
 
                                 let router = router.clone();
+                                let rate_limiter = rate_limiter.clone();
+                                let circuit_breaker = circuit_breaker.clone();
                                 let protocol = protocol.clone();
 
                                 // Spawn connection handler
@@ -244,15 +258,17 @@ impl ListenerManager {
                                     // Create service that uses the router
                                     let service = service_fn(move |req: Request<hyper::body::Incoming>| {
                                         let router = router.clone();
+                                        let rate_limiter = rate_limiter.clone();
+                                        let circuit_breaker = circuit_breaker.clone();
                                         async move {
-                                            Self::handle_request(req, router).await
+                                            Self::handle_request(req, router, rate_limiter, circuit_breaker).await
                                         }
                                     });
 
                                     // Serve connection based on protocol
                                     let result = match protocol {
                                         Protocol::HTTP => {
-                                            http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                                            http1::Builder::new()
                                                 .serve_connection(io, service)
                                                 .await
                                         }
@@ -292,34 +308,210 @@ impl ListenerManager {
         })
     }
 
-    /// Handle HTTP request using router
+    /// Handle HTTP request using router with rate limiting and circuit breaking
     async fn handle_request(
         req: Request<hyper::body::Incoming>,
-        _router: Arc<Router>,
+        router: Arc<Router>,
+        rate_limiter: Arc<crate::proxy::rate_limiter::RateLimiter>,
+        circuit_breaker: Arc<crate::proxy::circuit_breaker::CircuitBreakerManager>,
     ) -> Result<
         Response<http_body_util::combinators::BoxBody<hyper::body::Bytes, std::io::Error>>,
         hyper::Error,
     > {
-        use http_body_util::{BodyExt, Full};
+        use http_body_util::{BodyExt, Empty, Full};
         use hyper::body::Bytes;
+        use hyper::client::conn::http1::SendRequest;
+        use std::net::Ipv4Addr;
 
         let method = req.method().clone();
         let uri = req.uri().clone();
         let path = uri.path();
+        let headers = req.headers();
 
         debug!("Request: {} {}", method, path);
 
-        // TODO: Use router to select backend
-        // Response builder with static values should never fail
-        #[allow(clippy::expect_used)]
-        Ok(Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(
-                Full::new(Bytes::from("Not Found"))
-                    .map_err(std::io::Error::other)
-                    .boxed(),
-            )
-            .expect("Building 404 response with static values should never fail"))
+        // Extract Host header for routing
+        let host_header = headers
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+
+        // Convert hyper Method to router HttpMethod
+        let http_method = match *req.method() {
+            hyper::Method::GET => common::HttpMethod::GET,
+            hyper::Method::POST => common::HttpMethod::POST,
+            hyper::Method::PUT => common::HttpMethod::PUT,
+            hyper::Method::DELETE => common::HttpMethod::DELETE,
+            hyper::Method::PATCH => common::HttpMethod::PATCH,
+            hyper::Method::HEAD => common::HttpMethod::HEAD,
+            hyper::Method::OPTIONS => common::HttpMethod::OPTIONS,
+            _ => {
+                // Response builder with static values should never fail
+                #[allow(clippy::expect_used)]
+                return Ok(Response::builder()
+                    .status(StatusCode::METHOD_NOT_ALLOWED)
+                    .body(
+                        Full::new(Bytes::from("Method Not Allowed"))
+                            .map_err(std::io::Error::other)
+                            .boxed(),
+                    )
+                    .expect("Building 405 response should never fail"));
+            }
+        };
+
+        // Select backend using router
+        let route_match = router.select_backend_with_headers(
+            http_method,
+            path,
+            vec![("host", host_header)],
+            None,  // src_ip - TODO: extract from connection
+            None,  // src_port
+        );
+
+        let route_match = match route_match {
+            Some(m) => m,
+            None => {
+                debug!("No route found for {} {} (host: {})", method, path, host_header);
+                // Response builder with static values should never fail
+                #[allow(clippy::expect_used)]
+                return Ok(Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(
+                        Full::new(Bytes::from("Not Found"))
+                            .map_err(std::io::Error::other)
+                            .boxed(),
+                    )
+                    .expect("Building 404 response should never fail"));
+            }
+        };
+
+        let backend = route_match.backend;
+        let pattern = route_match.pattern;
+
+        // Check rate limit for this route
+        if !rate_limiter.check_rate_limit(&pattern) {
+            debug!("Rate limit exceeded for {} {}", method, path);
+            // Response builder with static values should never fail
+            #[allow(clippy::expect_used)]
+            return Ok(Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .body(
+                    Full::new(Bytes::from("Too Many Requests"))
+                        .map_err(std::io::Error::other)
+                        .boxed(),
+                )
+                .expect("Building 429 response should never fail"));
+        }
+
+        // Check circuit breaker for backend
+        let backend_id = format!("{}:{}",
+            backend.as_ipv4().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string()),
+            backend.port
+        );
+
+        if !circuit_breaker.allow_request(&backend_id) {
+            debug!("Circuit breaker open for backend {}", backend_id);
+            // Response builder with static values should never fail
+            #[allow(clippy::expect_used)]
+            return Ok(Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(
+                    Full::new(Bytes::from("Service Unavailable"))
+                        .map_err(std::io::Error::other)
+                        .boxed(),
+                )
+                .expect("Building 503 response should never fail"));
+        }
+
+        // Convert backend IP to SocketAddr
+        let backend_addr = if let Some(ipv4) = backend.as_ipv4() {
+            std::net::SocketAddr::from((ipv4, backend.port))
+        } else if let Some(ipv6) = backend.as_ipv6() {
+            std::net::SocketAddr::from((ipv6, backend.port))
+        } else {
+            error!("Backend has invalid IP address");
+            // Response builder with static values should never fail
+            #[allow(clippy::expect_used)]
+            return Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(
+                    Full::new(Bytes::from("Internal Server Error"))
+                        .map_err(std::io::Error::other)
+                        .boxed(),
+                )
+                .expect("Building 500 response should never fail"));
+        };
+
+        debug!(
+            "Proxying {} {} to {}",
+            method, path, backend_addr
+        );
+
+        // Connect to backend
+        let stream = match tokio::net::TcpStream::connect(backend_addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to connect to backend {}: {}", backend_addr, e);
+                // Response builder with static values should never fail
+                #[allow(clippy::expect_used)]
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(
+                        Full::new(Bytes::from("Bad Gateway"))
+                            .map_err(std::io::Error::other)
+                            .boxed(),
+                    )
+                    .expect("Building 502 response should never fail"));
+            }
+        };
+
+        let io = TokioIo::new(stream);
+
+        // Create HTTP/1 connection to backend
+        let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to handshake with backend {}: {}", backend_addr, e);
+                // Response builder with static values should never fail
+                #[allow(clippy::expect_used)]
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(
+                        Full::new(Bytes::from("Bad Gateway"))
+                            .map_err(std::io::Error::other)
+                            .boxed(),
+                    )
+                    .expect("Building 502 response should never fail"));
+            }
+        };
+
+        // Spawn connection driver
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                debug!("Backend connection error: {}", e);
+            }
+        });
+
+        // Forward request to backend
+        let backend_response = match sender.send_request(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to send request to backend {}: {}", backend_addr, e);
+                // Response builder with static values should never fail
+                #[allow(clippy::expect_used)]
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(
+                        Full::new(Bytes::from("Bad Gateway"))
+                            .map_err(std::io::Error::other)
+                            .boxed(),
+                    )
+                    .expect("Building 502 response should never fail"));
+            }
+        };
+
+        // Return backend response
+        Ok(backend_response.map(|body| body.map_err(std::io::Error::other).boxed()))
     }
 }
 
