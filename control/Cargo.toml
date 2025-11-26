@@ -76,4 +76,12 @@ panic = "warn"
 rcgen = "0.13"
 time = "0.3"  # Required by rcgen for certificate validity dates
 
+# Integration test dependencies
+async-trait = "0.1"  # For async trait methods
+reqwest = "0.12"     # HTTP client for testing
+toml = "0.8"         # Config file parsing
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
+
 [build-dependencies]

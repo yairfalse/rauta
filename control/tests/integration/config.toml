@@ -1,0 +1,41 @@
+# RAUTA Integration Test Configuration
+#
+# This file controls which test scenarios run and how they execute.
+
+[cluster]
+# Kind cluster configuration
+name = "rauta-test"
+# Reuse existing cluster if available (faster iteration)
+reuse = true
+# Cleanup cluster after tests (set to false for debugging)
+cleanup = true
+
+[scenarios]
+# Enable/disable test scenarios
+tls_validation = true
+basic_routing = true
+endpointslice_updates = true
+lock_poisoning = false  # Requires fault injection
+load_testing = false    # Expensive, run manually
+
+[timeouts]
+# Test timeouts (seconds)
+gateway_ready = 30
+route_ready = 30
+backend_ready = 60
+reconciliation = 300  # 5 min for periodic reconciliation
+
+[performance]
+# Load testing configuration
+tool = "wrk"  # Options: wrk, vegeta, hey
+duration_seconds = 30
+connections = 400
+threads = 12
+target_rps = 10000
+
+[sniffer]
+# Network capture configuration
+enabled = false  # Enable packet capture
+interface = "eth0"
+filter = "tcp port 80 or tcp port 443"
+output_dir = "test-captures"

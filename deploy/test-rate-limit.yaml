@@ -1,0 +1,116 @@
+---
+# HTTPRoute with Rate Limiting - allows 10 requests/second, burst of 20
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: rate-limited-api
+  namespace: demo
+  annotations:
+    rauta.io/rate-limit: "10rps,burst=20"
+spec:
+  parentRefs:
+    - name: rauta-gateway
+  hostnames:
+    - "api.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      backendRefs:
+        - name: echo-stable
+          port: 80
+---
+# HTTPRoute without Rate Limiting - for comparison
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: unlimited-api
+  namespace: demo
+spec:
+  parentRefs:
+    - name: rauta-gateway
+  hostnames:
+    - "unlimited.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      backendRefs:
+        - name: echo-stable
+          port: 80
+---
+# Test backend that can simulate failures for circuit breaking
+apiVersion: v1
+kind: Pod
+metadata:
+  name: failing-backend
+  namespace: demo
+  labels:
+    app: failing
+spec:
+  containers:
+    - name: nginx
+      image: nginx:alpine
+      ports:
+        - containerPort: 80
+      volumeMounts:
+        - name: config
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+  volumes:
+    - name: config
+      configMap:
+        name: failing-backend-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: failing-backend-config
+  namespace: demo
+data:
+  nginx.conf: |
+    events {}
+    http {
+      server {
+        listen 80;
+        # Return 500 errors to trigger circuit breaker
+        location / {
+          return 500 "Backend failure - testing circuit breaker\n";
+        }
+      }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: failing-backend
+  namespace: demo
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 80
+  selector:
+    app: failing
+---
+# HTTPRoute pointing to failing backend - should trigger circuit breaker
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: circuit-breaker-test
+  namespace: demo
+spec:
+  parentRefs:
+    - name: rauta-gateway
+  hostnames:
+    - "circuit.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /fail
+      backendRefs:
+        - name: failing-backend
+          port: 80
