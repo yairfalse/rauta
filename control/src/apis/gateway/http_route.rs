@@ -3,6 +3,8 @@
 //! Watches HTTPRoute resources and updates routing rules.
 
 use crate::apis::metrics::record_httproute_reconciliation;
+use crate::proxy::circuit_breaker::CircuitBreakerManager;
+use crate::proxy::rate_limiter::RateLimiter;
 use crate::proxy::router::Router;
 use common::{Backend, HttpMethod};
 use futures::StreamExt;
@@ -23,6 +25,8 @@ pub struct HTTPRouteReconciler {
     router: Arc<Router>,
     /// Gateway name to watch routes for
     gateway_name: String,
+    rate_limiter: Arc<RateLimiter>,
+    circuit_breaker: Arc<CircuitBreakerManager>,
 }
 
 /// HTTPRoute status parameters
@@ -36,11 +40,19 @@ struct RouteStatus {
 
 #[allow(dead_code)] // Used in K8s mode
 impl HTTPRouteReconciler {
-    pub fn new(client: Client, router: Arc<Router>, gateway_name: String) -> Self {
+    pub fn new(
+        client: Client,
+        router: Arc<Router>,
+        gateway_name: String,
+        rate_limiter: Arc<RateLimiter>,
+        circuit_breaker: Arc<CircuitBreakerManager>,
+    ) -> Self {
         Self {
             client,
             router,
             gateway_name,
+            rate_limiter,
+            circuit_breaker,
         }
     }
 
@@ -498,13 +510,35 @@ impl HTTPRouteReconciler {
                     if !backends.is_empty() {
                         let backend_count = backends.len();
                         // Add route to router (using GET as default method)
-                        match ctx.router.add_route(HttpMethod::GET, path, backends) {
+                        match ctx.router.add_route(HttpMethod::GET, path, backends.clone()) {
                             Ok(_) => {
                                 info!(
                                     "  - Added route: {} -> {} total backends",
                                     path, backend_count
                                 );
                                 routes_added += 1;
+
+                                // Configure rate limiting from annotations
+                                if let Some(annotations) = &route.metadata.annotations {
+                                    if let Some(rate_limit_config) = annotations.get("rauta.io/rate-limit") {
+                                        match parse_rate_limit_annotation(rate_limit_config) {
+                                            Ok((rate, burst)) => {
+                                                ctx.rate_limiter.configure_route(path, rate, burst);
+                                                info!(
+                                                    "  - Configured rate limit: {} ({}rps, burst={})",
+                                                    path, rate, burst
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!("Failed to parse rate limit annotation '{}': {}", rate_limit_config, e);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Note: Circuit breaker is per-backend, not per-route
+                                // It's automatically configured with default thresholds for all backends
+                                // Future: Support BackendPolicy for per-backend customization
                             }
                             Err(e) => {
                                 warn!("Failed to add route {}: {}", path, e);
@@ -761,6 +795,51 @@ fn parse_endpointslice_to_backends(
     }
 
     backends
+}
+
+/// Parse rate limit annotation
+///
+/// Format: "100rps,burst=200" or "50rps" (burst defaults to rate)
+///
+/// Returns: (rate, burst) or error message
+fn parse_rate_limit_annotation(annotation: &str) -> Result<(f64, u64), String> {
+    let parts: Vec<&str> = annotation.split(',').collect();
+
+    // Parse rate (required)
+    let rate_str = parts
+        .first()
+        .ok_or_else(|| "Missing rate specification".to_string())?
+        .trim();
+
+    if !rate_str.ends_with("rps") {
+        return Err(format!("Rate must end with 'rps', got: {}", rate_str));
+    }
+
+    let rate: f64 = rate_str
+        .trim_end_matches("rps")
+        .parse()
+        .map_err(|_| format!("Invalid rate number: {}", rate_str))?;
+
+    if rate <= 0.0 {
+        return Err("Rate must be positive".to_string());
+    }
+
+    // Parse burst (optional, defaults to rate)
+    let burst = if parts.len() > 1 {
+        let burst_str = parts[1].trim();
+        if !burst_str.starts_with("burst=") {
+            return Err(format!("Expected 'burst=N', got: {}", burst_str));
+        }
+
+        burst_str
+            .trim_start_matches("burst=")
+            .parse()
+            .map_err(|_| format!("Invalid burst number: {}", burst_str))?
+    } else {
+        rate as u64 // Default burst to rate
+    };
+
+    Ok((rate, burst))
 }
 
 #[cfg(test)]
