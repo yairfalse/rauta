@@ -286,12 +286,14 @@ impl RateLimiter {
     }
 
     /// Remove rate limit configuration for a route
+    #[allow(dead_code)] // Part of public API, may be used for cleanup
     pub fn remove_route(&self, route: &str) {
         let mut buckets = safe_write(&self.buckets);
         buckets.remove(route);
     }
 
     /// Get available tokens for a route (for testing/metrics)
+    #[allow(dead_code)] // Part of public API, used in tests
     pub fn available_tokens(&self, route: &str) -> Option<f64> {
         let buckets = safe_read(&self.buckets);
         buckets.get(route).map(|bucket| bucket.available_tokens())

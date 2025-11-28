@@ -12,7 +12,7 @@
 //! - Reference counting: listener shutdown when last Gateway removed
 
 use crate::proxy::router::Router;
-use hyper::server::conn::{http1, http2};
+use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -318,10 +318,8 @@ impl ListenerManager {
         Response<http_body_util::combinators::BoxBody<hyper::body::Bytes, std::io::Error>>,
         hyper::Error,
     > {
-        use http_body_util::{BodyExt, Empty, Full};
+        use http_body_util::{BodyExt, Full};
         use hyper::body::Bytes;
-        use hyper::client::conn::http1::SendRequest;
-        use std::net::Ipv4Addr;
 
         let method = req.method().clone();
         let uri = req.uri().clone();

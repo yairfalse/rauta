@@ -12,6 +12,12 @@ use integration::scenarios::load_test::LoadTestScenario;
 
 #[tokio::test]
 async fn run_integration_tests() {
+    // Initialize rustls crypto provider (needed for K8s TLS client)
+    // Must be called before any kube client creation
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     // Load configuration
     let config = TestConfig::load().expect("Failed to load test config");
 

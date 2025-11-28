@@ -369,6 +369,7 @@ impl CircuitBreaker {
     }
 
     /// Get current failure count
+    #[allow(dead_code)] // Part of public API, used in tests
     pub fn failure_count(&self) -> u32 {
         *safe_read(&self.failure_count)
     }
@@ -543,12 +544,14 @@ impl CircuitBreakerManager {
     }
 
     /// Get backend circuit state
+    #[allow(dead_code)] // Part of public API, used in tests
     pub fn get_state(&self, backend_id: &str) -> Option<CircuitState> {
         let breakers = safe_read(&self.breakers);
         breakers.get(backend_id).map(|b| b.state())
     }
 
     /// Remove circuit breaker for backend
+    #[allow(dead_code)] // Part of public API, may be used for cleanup
     pub fn remove_backend(&self, backend_id: &str) {
         let mut breakers = safe_write(&self.breakers);
         breakers.remove(backend_id);
