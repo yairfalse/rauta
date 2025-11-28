@@ -534,10 +534,20 @@ impl ListenerManager {
 mod tests {
     use super::*;
 
+    /// Test helper: create a ListenerManager with default rate limiter and circuit breaker
+    fn create_test_manager(router: Arc<Router>) -> ListenerManager {
+        let rate_limiter = Arc::new(crate::proxy::rate_limiter::RateLimiter::new());
+        let circuit_breaker = Arc::new(crate::proxy::circuit_breaker::CircuitBreakerManager::new(
+            5,
+            std::time::Duration::from_secs(30),
+        ));
+        ListenerManager::new(router, rate_limiter, circuit_breaker)
+    }
+
     #[tokio::test]
     async fn test_shared_listener_multiple_gateways_same_port() {
         let router = Arc::new(Router::new());
-        let manager = ListenerManager::new(router);
+        let manager = create_test_manager(router);
 
         let config = ListenerConfig {
             port: 0, // OS assigns port
@@ -590,7 +600,7 @@ mod tests {
     #[tokio::test]
     async fn test_unregister_gateway_keeps_listener_alive() {
         let router = Arc::new(Router::new());
-        let manager = ListenerManager::new(router);
+        let manager = create_test_manager(router);
 
         let config = ListenerConfig {
             port: 0,
@@ -642,7 +652,7 @@ mod tests {
     #[tokio::test]
     async fn test_unregister_last_gateway_shuts_down_listener() {
         let router = Arc::new(Router::new());
-        let manager = ListenerManager::new(router);
+        let manager = create_test_manager(router);
 
         let config = ListenerConfig {
             port: 0,
@@ -677,7 +687,7 @@ mod tests {
     #[tokio::test]
     async fn test_protocol_mismatch_rejected() {
         let router = Arc::new(Router::new());
-        let manager = ListenerManager::new(router);
+        let manager = create_test_manager(router);
 
         let http_config = ListenerConfig {
             port: 0,
@@ -722,7 +732,7 @@ mod tests {
     #[tokio::test]
     async fn test_idempotent_registration() {
         let router = Arc::new(Router::new());
-        let manager = ListenerManager::new(router);
+        let manager = create_test_manager(router);
 
         let config = ListenerConfig {
             port: 0,
