@@ -51,9 +51,57 @@ pub struct TestConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClusterConfig {
+    #[serde(rename = "type")]
+    pub cluster_type: String, // "kind", "k3s", "eks", "aks", "gke", "existing"
     pub name: String,
     pub reuse: bool,
     pub cleanup: bool,
+
+    // Provider-specific configs
+    pub kind: Option<KindClusterConfig>,
+    pub k3s: Option<K3sClusterConfig>,
+    pub eks: Option<EKSClusterConfig>,
+    pub aks: Option<AKSClusterConfig>,
+    pub gke: Option<GKEClusterConfig>,
+    pub existing: Option<ExistingClusterConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KindClusterConfig {
+    pub worker_nodes: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct K3sClusterConfig {
+    pub nodes: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EKSClusterConfig {
+    pub region: String,
+    pub node_count: u32,
+    pub instance_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AKSClusterConfig {
+    pub resource_group: String,
+    pub node_count: u32,
+    pub vm_size: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GKEClusterConfig {
+    pub project: String,
+    pub zone: String,
+    pub node_count: u32,
+    pub machine_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExistingClusterConfig {
+    pub kubeconfig_path: String,
+    pub context: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,6 +136,72 @@ pub struct SnifferConfig {
     pub interface: String,
     pub filter: String,
     pub output_dir: String,
+}
+
+impl ClusterConfig {
+    /// Convert configuration to ClusterType enum
+    pub fn to_cluster_type(&self) -> Result<framework::cluster_provider::ClusterType, String> {
+        use framework::cluster_provider::ClusterType;
+
+        match self.cluster_type.as_str() {
+            "kind" => {
+                let kind_config = self.kind.as_ref()
+                    .ok_or("Missing [cluster.kind] configuration")?;
+                Ok(ClusterType::Kind {
+                    name: self.name.clone(),
+                    nodes: kind_config.worker_nodes,
+                })
+            }
+            "k3s" => {
+                let k3s_config = self.k3s.as_ref()
+                    .ok_or("Missing [cluster.k3s] configuration")?;
+                Ok(ClusterType::K3s {
+                    name: self.name.clone(),
+                    nodes: k3s_config.nodes,
+                })
+            }
+            "eks" => {
+                let eks_config = self.eks.as_ref()
+                    .ok_or("Missing [cluster.eks] configuration")?;
+                Ok(ClusterType::EKS {
+                    region: eks_config.region.clone(),
+                    cluster_name: self.name.clone(),
+                    node_count: eks_config.node_count,
+                    instance_type: eks_config.instance_type.clone(),
+                })
+            }
+            "aks" => {
+                let aks_config = self.aks.as_ref()
+                    .ok_or("Missing [cluster.aks] configuration")?;
+                Ok(ClusterType::AKS {
+                    resource_group: aks_config.resource_group.clone(),
+                    cluster_name: self.name.clone(),
+                    node_count: aks_config.node_count,
+                    vm_size: aks_config.vm_size.clone(),
+                })
+            }
+            "gke" => {
+                let gke_config = self.gke.as_ref()
+                    .ok_or("Missing [cluster.gke] configuration")?;
+                Ok(ClusterType::GKE {
+                    project: gke_config.project.clone(),
+                    zone: gke_config.zone.clone(),
+                    cluster_name: self.name.clone(),
+                    node_count: gke_config.node_count,
+                    machine_type: gke_config.machine_type.clone(),
+                })
+            }
+            "existing" => {
+                let existing_config = self.existing.as_ref()
+                    .ok_or("Missing [cluster.existing] configuration")?;
+                Ok(ClusterType::Existing {
+                    kubeconfig_path: existing_config.kubeconfig_path.clone(),
+                    context: existing_config.context.clone(),
+                })
+            }
+            _ => Err(format!("Unknown cluster type: {}", self.cluster_type)),
+        }
+    }
 }
 
 impl TestConfig {

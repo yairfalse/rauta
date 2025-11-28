@@ -1,6 +1,8 @@
 //! Test framework core infrastructure
 
 pub mod cluster;
+pub mod cluster_provider;
+pub mod providers;
 pub mod k8s;
 pub mod fixtures;
 pub mod assertions;
@@ -42,6 +44,9 @@ impl TestContext {
         if !config.cluster.reuse {
             cluster::create(&cluster_name).await?;
         }
+
+        // Deploy RAUTA controller
+        cluster::deploy_rauta(&cluster_name).await?;
 
         // Create K8s client
         let client = k8s::create_client().await?;
