@@ -836,7 +836,7 @@ fn parse_rate_limit_annotation(annotation: &str) -> Result<(f64, u64), String> {
             .parse()
             .map_err(|_| format!("Invalid burst number: {}", burst_str))?
     } else {
-        rate as u64 // Default burst to rate
+        rate.ceil() as u64 // Default burst to rate, rounding up fractional rates
     };
 
     Ok((rate, burst))

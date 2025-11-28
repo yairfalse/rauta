@@ -404,10 +404,14 @@ impl ListenerManager {
         }
 
         // Check circuit breaker for backend
-        let backend_id = format!("{}:{}",
-            backend.as_ipv4().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string()),
-            backend.port
-        );
+        // Generate backend ID supporting both IPv4 and IPv6
+        let backend_id = if let Some(ipv4) = backend.as_ipv4() {
+            format!("{}:{}", ipv4, backend.port)
+        } else if let Some(ipv6) = backend.as_ipv6() {
+            format!("[{}]:{}", ipv6, backend.port)
+        } else {
+            format!("unknown:{}", backend.port)
+        };
 
         if !circuit_breaker.allow_request(&backend_id) {
             debug!("Circuit breaker open for backend {}", backend_id);
@@ -497,6 +501,8 @@ impl ListenerManager {
             Ok(r) => r,
             Err(e) => {
                 error!("Failed to send request to backend {}: {}", backend_addr, e);
+                // Record failure for circuit breaker
+                circuit_breaker.record_failure(&backend_id);
                 // Response builder with static values should never fail
                 #[allow(clippy::expect_used)]
                 return Ok(Response::builder()
@@ -509,6 +515,16 @@ impl ListenerManager {
                     .expect("Building 502 response should never fail"));
             }
         };
+
+        // Record success or failure based on status code
+        let status = backend_response.status();
+        if status.is_server_error() {
+            // 5xx errors indicate backend failure
+            circuit_breaker.record_failure(&backend_id);
+        } else {
+            // 2xx, 3xx, 4xx are considered successful (backend is responsive)
+            circuit_breaker.record_success(&backend_id);
+        }
 
         // Return backend response
         Ok(backend_response.map(|body| body.map_err(std::io::Error::other).boxed()))
