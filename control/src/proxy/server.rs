@@ -85,6 +85,8 @@ lazy_static! {
 }
 
 use crate::proxy::backend_pool::{gather_pool_metrics, BackendConnectionPools, PoolError};
+use crate::proxy::circuit_breaker::CircuitBreakerManager;
+use crate::proxy::rate_limiter::RateLimiter;
 use crate::proxy::worker::Worker;
 
 /// Production-grade HTTP/2 backend connection pools
@@ -135,6 +137,8 @@ pub struct ProxyServer {
     workers: Option<Workers>, // None = legacy mode, Some = per-core workers (lock-free!)
     #[allow(dead_code)] // Used when workers are enabled
     worker_selector: Option<Arc<WorkerSelector>>, // Round-robin worker selection
+    rate_limiter: Arc<RateLimiter>, // Per-route rate limiting
+    circuit_breaker: Arc<CircuitBreakerManager>, // Per-backend circuit breaking
 }
 
 impl ProxyServer {
@@ -150,6 +154,13 @@ impl ProxyServer {
         // Create protocol detection cache
         let protocol_cache = Arc::new(Mutex::new(HashMap::new()));
 
+        // Create rate limiter and circuit breaker
+        let rate_limiter = Arc::new(RateLimiter::new());
+        let circuit_breaker = Arc::new(CircuitBreakerManager::new(
+            5,                                  // 5 consecutive failures to open circuit
+            std::time::Duration::from_secs(30), // 30s timeout before Half-Open
+        ));
+
         Ok(Self {
             bind_addr,
             router,
@@ -158,6 +169,8 @@ impl ProxyServer {
             protocol_cache,
             workers: None, // Legacy mode (Arc<Mutex> pools)
             worker_selector: None,
+            rate_limiter,
+            circuit_breaker,
         })
     }
 
@@ -183,6 +196,13 @@ impl ProxyServer {
         // Create protocol detection cache (still shared across workers)
         let protocol_cache = Arc::new(Mutex::new(HashMap::new()));
 
+        // Create rate limiter and circuit breaker (shared across workers)
+        let rate_limiter = Arc::new(RateLimiter::new());
+        let circuit_breaker = Arc::new(CircuitBreakerManager::new(
+            5,                                  // 5 consecutive failures to open circuit
+            std::time::Duration::from_secs(30), // 30s timeout before Half-Open
+        ));
+
         Ok(Self {
             bind_addr,
             router,
@@ -191,6 +211,8 @@ impl ProxyServer {
             protocol_cache,
             workers: Some(Arc::new(workers)), // Immutable Vec - lock-free selection!
             worker_selector: Some(Arc::new(WorkerSelector::new(num_workers))),
+            rate_limiter,
+            circuit_breaker,
         })
     }
 
@@ -226,6 +248,8 @@ impl ProxyServer {
             let protocol_cache = self.protocol_cache.clone();
             let workers = self.workers.clone();
             let worker_selector = self.worker_selector.clone();
+            let rate_limiter = self.rate_limiter.clone();
+            let circuit_breaker = self.circuit_breaker.clone();
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
@@ -237,6 +261,8 @@ impl ProxyServer {
                     let protocol_cache = protocol_cache.clone();
                     let workers = workers.clone();
                     let worker_selector = worker_selector.clone();
+                    let rate_limiter = rate_limiter.clone();
+                    let circuit_breaker = circuit_breaker.clone();
                     async move {
                         handle_request(
                             req,
@@ -246,6 +272,8 @@ impl ProxyServer {
                             protocol_cache,
                             workers,
                             worker_selector,
+                            rate_limiter,
+                            circuit_breaker,
                         )
                         .await
                     }
@@ -324,6 +352,8 @@ impl ProxyServer {
                             let protocol_cache = self.protocol_cache.clone();
                             let workers = self.workers.clone();
                             let worker_selector = self.worker_selector.clone();
+                            let rate_limiter = self.rate_limiter.clone();
+                            let circuit_breaker = self.circuit_breaker.clone();
                             let active_connections_clone = active_connections.clone();
 
                             tokio::spawn(async move {
@@ -336,6 +366,8 @@ impl ProxyServer {
                                     let protocol_cache = protocol_cache.clone();
                                     let workers = workers.clone();
                                     let worker_selector = worker_selector.clone();
+                                    let rate_limiter = rate_limiter.clone();
+                                    let circuit_breaker = circuit_breaker.clone();
                                     async move {
                                         handle_request(
                                             req,
@@ -345,6 +377,8 @@ impl ProxyServer {
                                             protocol_cache,
                                             workers,
                                             worker_selector,
+                                            rate_limiter,
+                                            circuit_breaker,
                                         )
                                         .await
                                     }
@@ -411,6 +445,8 @@ impl ProxyServer {
             let protocol_cache = self.protocol_cache.clone();
             let workers = self.workers.clone();
             let worker_selector = self.worker_selector.clone();
+            let rate_limiter = self.rate_limiter.clone();
+            let circuit_breaker = self.circuit_breaker.clone();
             let acceptor_clone = acceptor.clone();
 
             tokio::spawn(async move {
@@ -433,6 +469,8 @@ impl ProxyServer {
                     let protocol_cache = protocol_cache.clone();
                     let workers = workers.clone();
                     let worker_selector = worker_selector.clone();
+                    let rate_limiter = rate_limiter.clone();
+                    let circuit_breaker = circuit_breaker.clone();
                     async move {
                         handle_request(
                             req,
@@ -442,6 +480,8 @@ impl ProxyServer {
                             protocol_cache,
                             workers,
                             worker_selector,
+                            rate_limiter,
+                            circuit_breaker,
                         )
                         .await
                     }
@@ -478,6 +518,8 @@ impl ProxyServer {
             let protocol_cache = self.protocol_cache.clone();
             let workers = self.workers.clone();
             let worker_selector = self.worker_selector.clone();
+            let rate_limiter = self.rate_limiter.clone();
+            let circuit_breaker = self.circuit_breaker.clone();
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
@@ -489,6 +531,8 @@ impl ProxyServer {
                     let protocol_cache = protocol_cache.clone();
                     let workers = workers.clone();
                     let worker_selector = worker_selector.clone();
+                    let rate_limiter = rate_limiter.clone();
+                    let circuit_breaker = circuit_breaker.clone();
                     async move {
                         handle_request(
                             req,
@@ -498,6 +542,8 @@ impl ProxyServer {
                             protocol_cache,
                             workers,
                             worker_selector,
+                            rate_limiter,
+                            circuit_breaker,
                         )
                         .await
                     }
@@ -1043,6 +1089,7 @@ fn status_to_str(status: u16) -> &'static str {
 
 /// Handle incoming HTTP request
 /// Returns BoxBody to support zero-copy streaming for HTTP/2 responses
+#[allow(clippy::too_many_arguments)]
 async fn handle_request(
     mut req: Request<hyper::body::Incoming>,
     router: Arc<Router>,
@@ -1051,6 +1098,8 @@ async fn handle_request(
     protocol_cache: ProtocolCache,
     workers: Option<Workers>,
     worker_selector: Option<Arc<WorkerSelector>>,
+    rate_limiter: Arc<RateLimiter>,
+    circuit_breaker: Arc<CircuitBreakerManager>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, String> {
     // Generate or extract request ID
     let request_id = req
@@ -1080,12 +1129,21 @@ async fn handle_request(
         let mut buffer = vec![];
         let encoder = TextEncoder::new();
 
-        // Gather metrics from all registries (proxy + controller + HTTP/2 pool)
+        // Gather metrics from all registries (proxy + controller + rate limiter + circuit breaker + HTTP/2 pool)
         let mut metric_families = METRICS_REGISTRY.gather();
         let controller_metrics = CONTROLLER_METRICS_REGISTRY.gather();
         metric_families.extend(controller_metrics);
 
-        // Encode proxy + controller metrics
+        // Add rate limiter metrics
+        let rate_limiter_metrics = crate::proxy::rate_limiter::rate_limiter_registry().gather();
+        metric_families.extend(rate_limiter_metrics);
+
+        // Add circuit breaker metrics
+        let circuit_breaker_metrics =
+            crate::proxy::circuit_breaker::circuit_breaker_registry().gather();
+        metric_families.extend(circuit_breaker_metrics);
+
+        // Encode all metrics
         if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
             error!("Failed to encode metrics: {}", e);
             let error_response = Response::builder()
@@ -1175,6 +1233,26 @@ async fn handle_request(
                 }
             }
 
+            // Check rate limit for this route (per-route rate limiting)
+            if !rate_limiter.check_rate_limit(&route_match.pattern) {
+                warn!(
+                    request_id = %request_id,
+                    route.pattern = %route_match.pattern,
+                    "Rate limit exceeded"
+                );
+                #[allow(clippy::unwrap_used)]
+                return Ok(Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("Content-Type", "text/plain")
+                    .header("Retry-After", "1") // Retry after 1 second
+                    .body(
+                        Full::new(Bytes::from("Rate limit exceeded"))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .unwrap());
+            }
+
             // Apply request header filters if configured (Gateway API HTTPRouteBackendRequestHeaderModification)
             if let Some(filters) = &route_match.request_filters {
                 if let Err(e) = apply_request_filters(&mut req, filters) {
@@ -1194,6 +1272,29 @@ async fn handle_request(
                         )
                         .unwrap());
                 }
+            }
+
+            // Check circuit breaker for backend (fail-fast if circuit is Open)
+            let backend_id = route_match.backend.to_string();
+            if !circuit_breaker.allow_request(&backend_id) {
+                warn!(
+                    request_id = %request_id,
+                    backend = %backend_id,
+                    "Circuit breaker is OPEN - backend unavailable"
+                );
+                #[allow(clippy::unwrap_used)]
+                return Ok(Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("Content-Type", "text/plain")
+                    .header("Retry-After", "30") // Circuit breaker timeout
+                    .body(
+                        Full::new(Bytes::from(
+                            "Backend temporarily unavailable (circuit breaker open)",
+                        ))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                    )
+                    .unwrap());
             }
 
             info!(
@@ -1238,6 +1339,15 @@ async fn handle_request(
 
                     // Record backend health for passive health checking (supports IPv4 and IPv6)
                     router.record_backend_response(route_match.backend, status_code);
+
+                    // Record circuit breaker success/failure based on status code
+                    if status_code >= 500 {
+                        // 5xx = backend failure
+                        circuit_breaker.record_failure(&backend_id);
+                    } else {
+                        // 2xx, 3xx, 4xx = backend healthy (even if client error)
+                        circuit_breaker.record_success(&backend_id);
+                    }
                 }
                 Err(e) => {
                     HTTP_REQUESTS_TOTAL
@@ -1249,6 +1359,9 @@ async fn handle_request(
 
                     // Record backend health (treat connection errors as 500, supports IPv4 and IPv6)
                     router.record_backend_response(route_match.backend, 500);
+
+                    // Record circuit breaker failure (connection error = backend failure)
+                    circuit_breaker.record_failure(&backend_id);
 
                     error!(
                         request_id = %request_id,

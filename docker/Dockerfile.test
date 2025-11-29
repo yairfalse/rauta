@@ -1,0 +1,32 @@
+# Fast build for testing - control plane only
+FROM rust:bookworm as builder
+
+WORKDIR /rauta
+
+# Copy workspace files
+COPY common ./common
+COPY control ./control
+
+# Build control plane for Linux
+RUN cd control && cargo build --release
+
+# Runtime stage - use matching Debian version
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash rauta
+
+# Copy binary (it's in control/target not rauta/target)
+COPY --from=builder /rauta/control/target/release/control /usr/local/bin/control
+RUN chmod +x /usr/local/bin/control
+
+USER rauta
+WORKDIR /home/rauta
+
+EXPOSE 80 443 9090
+
+ENTRYPOINT ["/usr/local/bin/control"]
