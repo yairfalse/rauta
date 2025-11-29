@@ -50,10 +50,7 @@ pub enum ClusterType {
     },
 
     /// Local K3s cluster
-    K3s {
-        name: String,
-        nodes: u32,
-    },
+    K3s { name: String, nodes: u32 },
 
     /// AWS EKS cluster
     EKS {
@@ -91,9 +88,9 @@ impl ClusterType {
     /// Create the appropriate provider for this cluster type
     pub fn provider(&self) -> Box<dyn ClusterProvider> {
         match self {
-            ClusterType::Kind { name, nodes } => {
-                Box::new(super::providers::kind::KindProvider::new(name.clone(), *nodes))
-            }
+            ClusterType::Kind { name, nodes } => Box::new(
+                super::providers::kind::KindProvider::new(name.clone(), *nodes),
+            ),
             ClusterType::K3s { .. } => {
                 unimplemented!("K3s provider not yet implemented (extraction TODO)")
             }
@@ -129,7 +126,10 @@ impl fmt::Display for ClusterType {
                 ..
             } => write!(f, "AKS({}, {})", resource_group, cluster_name),
             ClusterType::GKE {
-                project, zone, cluster_name, ..
+                project,
+                zone,
+                cluster_name,
+                ..
             } => write!(f, "GKE({}, {}, {})", project, zone, cluster_name),
             ClusterType::Existing { context, .. } => write!(f, "Existing({})", context),
         }

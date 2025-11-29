@@ -1,8 +1,8 @@
 //! Network packet capture using tcpdump for deep inspection
 
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Network sniffer wrapper around tcpdump
 pub struct Sniffer {
@@ -27,13 +27,7 @@ impl Sniffer {
 
         // Start tcpdump process
         let process = Command::new("tcpdump")
-            .args(&[
-                "-i",
-                &config.interface,
-                "-w",
-                &output_file,
-                &config.filter,
-            ])
+            .args(&["-i", &config.interface, "-w", &output_file, &config.filter])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
@@ -78,11 +72,9 @@ impl Sniffer {
             .output()?;
 
         if !output.status.success() {
-            return Err(format!(
-                "tshark failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .into());
+            return Err(
+                format!("tshark failed: {}", String::from_utf8_lossy(&output.stderr)).into(),
+            );
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);

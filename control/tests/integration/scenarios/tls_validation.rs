@@ -2,8 +2,8 @@
 //!
 //! Tests Gateway API TLS certificateRef validation according to spec.
 
-use super::super::framework::{TestContext, TestResult};
 use super::super::framework::{assertions, fixtures, k8s};
+use super::super::framework::{TestContext, TestResult};
 use super::super::{TestConfig, TestScenario};
 
 pub struct TlsValidationScenario;
@@ -46,7 +46,8 @@ async fn test_valid_tls_secret(ctx: &TestContext) -> TestResult {
     k8s::create_tls_secret(&ctx.client, &ctx.namespace, "valid-cert", &cert, &key).await?;
 
     // Create Gateway referencing valid Secret
-    let gateway_yaml = fixtures::gateway_with_https("test-gateway-valid", &ctx.namespace, "valid-cert");
+    let gateway_yaml =
+        fixtures::gateway_with_https("test-gateway-valid", &ctx.namespace, "valid-cert");
     k8s::apply_yaml(&ctx.client, &gateway_yaml).await?;
 
     // Wait for Gateway to be accepted
@@ -78,8 +79,11 @@ async fn test_nonexistent_secret(ctx: &TestContext) -> TestResult {
     println!("  📝 Test: Nonexistent TLS Secret");
 
     // Create Gateway referencing nonexistent Secret
-    let gateway_yaml =
-        fixtures::gateway_with_https("test-gateway-notfound", &ctx.namespace, "nonexistent-secret");
+    let gateway_yaml = fixtures::gateway_with_https(
+        "test-gateway-notfound",
+        &ctx.namespace,
+        "nonexistent-secret",
+    );
     k8s::apply_yaml(&ctx.client, &gateway_yaml).await?;
 
     // Wait for Gateway to be processed

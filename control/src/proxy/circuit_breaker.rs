@@ -385,6 +385,7 @@ impl CircuitBreaker {
 
     /// Reset circuit to Closed state (for testing)
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn reset(&self) {
         *safe_write(&self.state) = CircuitState::Closed;
         *safe_write(&self.failure_count) = 0;
@@ -469,11 +470,7 @@ impl CircuitBreakerManager {
         // Record state transition if changed
         if old_state != new_state {
             CIRCUIT_BREAKER_TRANSITIONS_TOTAL
-                .with_label_values(&[
-                    backend_id,
-                    state_to_str(old_state),
-                    state_to_str(new_state),
-                ])
+                .with_label_values(&[backend_id, state_to_str(old_state), state_to_str(new_state)])
                 .inc();
         }
 
@@ -500,11 +497,7 @@ impl CircuitBreakerManager {
         // Record state transition if changed
         if old_state != new_state {
             CIRCUIT_BREAKER_TRANSITIONS_TOTAL
-                .with_label_values(&[
-                    backend_id,
-                    state_to_str(old_state),
-                    state_to_str(new_state),
-                ])
+                .with_label_values(&[backend_id, state_to_str(old_state), state_to_str(new_state)])
                 .inc();
         }
     }
@@ -534,11 +527,7 @@ impl CircuitBreakerManager {
         // Record state transition if changed
         if old_state != new_state {
             CIRCUIT_BREAKER_TRANSITIONS_TOTAL
-                .with_label_values(&[
-                    backend_id,
-                    state_to_str(old_state),
-                    state_to_str(new_state),
-                ])
+                .with_label_values(&[backend_id, state_to_str(old_state), state_to_str(new_state)])
                 .inc();
         }
     }
@@ -602,7 +591,10 @@ mod tests {
         }
 
         // Requests should be blocked
-        assert!(!breaker.allow_request(), "Requests should be blocked in Open state");
+        assert!(
+            !breaker.allow_request(),
+            "Requests should be blocked in Open state"
+        );
     }
 
     #[test]
@@ -781,7 +773,11 @@ mod tests {
         // get_breaker creates a fresh breaker
         let new_breaker = manager.get_breaker("backend-1");
         assert_eq!(new_breaker.state(), CircuitState::Closed);
-        assert_eq!(new_breaker.failure_count(), 0, "New breaker should have zero failures");
+        assert_eq!(
+            new_breaker.failure_count(),
+            0,
+            "New breaker should have zero failures"
+        );
     }
 
     #[test]
@@ -833,36 +829,36 @@ mod tests {
         let metrics = crate::proxy::circuit_breaker::circuit_breaker_registry().gather();
 
         // Should have rauta_circuit_breaker_state metric
-        let has_state_metric = metrics.iter().any(|family| {
-            family.get_name() == "rauta_circuit_breaker_state"
-        });
+        let has_state_metric = metrics
+            .iter()
+            .any(|family| family.name() == "rauta_circuit_breaker_state");
         assert!(
             has_state_metric,
             "Should have rauta_circuit_breaker_state metric"
         );
 
         // Should have rauta_circuit_breaker_requests_total metric
-        let has_requests_metric = metrics.iter().any(|family| {
-            family.get_name() == "rauta_circuit_breaker_requests_total"
-        });
+        let has_requests_metric = metrics
+            .iter()
+            .any(|family| family.name() == "rauta_circuit_breaker_requests_total");
         assert!(
             has_requests_metric,
             "Should have rauta_circuit_breaker_requests_total metric"
         );
 
         // Should have rauta_circuit_breaker_failures_total metric
-        let has_failures_metric = metrics.iter().any(|family| {
-            family.get_name() == "rauta_circuit_breaker_failures_total"
-        });
+        let has_failures_metric = metrics
+            .iter()
+            .any(|family| family.name() == "rauta_circuit_breaker_failures_total");
         assert!(
             has_failures_metric,
             "Should have rauta_circuit_breaker_failures_total metric"
         );
 
         // Should have rauta_circuit_breaker_transitions_total metric
-        let has_transitions_metric = metrics.iter().any(|family| {
-            family.get_name() == "rauta_circuit_breaker_transitions_total"
-        });
+        let has_transitions_metric = metrics
+            .iter()
+            .any(|family| family.name() == "rauta_circuit_breaker_transitions_total");
         assert!(
             has_transitions_metric,
             "Should have rauta_circuit_breaker_transitions_total metric"

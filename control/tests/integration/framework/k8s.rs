@@ -39,9 +39,7 @@ pub async fn delete_namespace(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let namespaces: Api<Namespace> = Api::all(client.clone());
 
-    namespaces
-        .delete(name, &DeleteParams::default())
-        .await?;
+    namespaces.delete(name, &DeleteParams::default()).await?;
 
     println!("✅ Deleted namespace: {}", name);
     Ok(())
@@ -58,7 +56,10 @@ pub async fn create_tls_secret(
     let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
 
     let mut data = BTreeMap::new();
-    data.insert("tls.crt".to_string(), k8s_openapi::ByteString(cert.to_vec()));
+    data.insert(
+        "tls.crt".to_string(),
+        k8s_openapi::ByteString(cert.to_vec()),
+    );
     data.insert("tls.key".to_string(), k8s_openapi::ByteString(key.to_vec()));
 
     let secret = Secret {
@@ -110,10 +111,7 @@ pub async fn create_malformed_secret(
 }
 
 /// Apply a YAML manifest
-pub async fn apply_yaml(
-    _client: &Client,
-    yaml: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn apply_yaml(_client: &Client, yaml: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Write to temp file
     let temp_file = format!("/tmp/rauta-test-{}.yaml", uuid::Uuid::new_v4());
     std::fs::write(&temp_file, yaml)?;

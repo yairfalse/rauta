@@ -1,12 +1,12 @@
 //! Test framework core infrastructure
 
+pub mod assertions;
 pub mod cluster;
 pub mod cluster_provider;
-pub mod providers;
-pub mod k8s;
 pub mod fixtures;
-pub mod assertions;
+pub mod k8s;
 pub mod metrics;
+pub mod providers;
 pub mod sniffer;
 
 use std::time::Duration;
@@ -52,7 +52,10 @@ impl TestContext {
         let client = k8s::create_client().await?;
 
         // Create test namespace
-        let namespace = format!("rauta-test-{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
+        let namespace = format!(
+            "rauta-test-{}",
+            uuid::Uuid::new_v4().to_string()[..8].to_string()
+        );
         k8s::create_namespace(&client, &namespace).await?;
 
         // Initialize sniffer if enabled

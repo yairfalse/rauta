@@ -15,10 +15,7 @@ pub async fn assert_listener_resolved_refs(
     let gateways: Api<Gateway> = Api::namespaced(client.clone(), namespace);
     let gateway = gateways.get(gateway_name).await?;
 
-    let status = gateway
-        .status
-        .as_ref()
-        .ok_or("Gateway has no status")?;
+    let status = gateway.status.as_ref().ok_or("Gateway has no status")?;
 
     let listeners = status
         .listeners
@@ -83,10 +80,7 @@ pub async fn assert_listener_message_contains(
     let gateways: Api<Gateway> = Api::namespaced(client.clone(), namespace);
     let gateway = gateways.get(gateway_name).await?;
 
-    let status = gateway
-        .status
-        .as_ref()
-        .ok_or("Gateway has no status")?;
+    let status = gateway.status.as_ref().ok_or("Gateway has no status")?;
 
     let listeners = status
         .listeners

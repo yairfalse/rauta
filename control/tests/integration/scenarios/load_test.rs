@@ -2,8 +2,8 @@
 //!
 //! Runs load tests using wrk and validates performance metrics.
 
-use super::super::framework::{TestContext, TestResult};
 use super::super::framework::{assertions, fixtures, k8s};
+use super::super::framework::{TestContext, TestResult};
 use super::super::{TestConfig, TestScenario};
 use std::process::Command;
 use std::time::Duration;
@@ -88,8 +88,14 @@ async fn test_baseline_performance(ctx: &TestContext) -> TestResult {
     // Analyze results
     if let Some(delta) = ctx.metrics.get_delta() {
         println!("  📈 Baseline results:");
-        println!("      Requests: {:?}", delta.requests_delta.values().sum::<u64>());
-        println!("      p99 latency delta: {:.3}ms", delta.duration_p99_delta * 1000.0);
+        println!(
+            "      Requests: {:?}",
+            delta.requests_delta.values().sum::<u64>()
+        );
+        println!(
+            "      p99 latency delta: {:.3}ms",
+            delta.duration_p99_delta * 1000.0
+        );
     }
 
     println!("  ✅ Baseline performance captured");
@@ -170,11 +176,7 @@ fn run_wrk(
         .output()?;
 
     if !output.status.success() {
-        return Err(format!(
-            "wrk failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
+        return Err(format!("wrk failed: {}", String::from_utf8_lossy(&output.stderr)).into());
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -230,11 +232,7 @@ async fn get_rauta_endpoint(_ctx: &TestContext) -> Result<String, Box<dyn std::e
 }
 
 /// Helper: Wait for pods to be ready
-async fn wait_for_ready_pods(
-    ctx: &TestContext,
-    app_label: &str,
-    count: usize,
-) -> TestResult {
+async fn wait_for_ready_pods(ctx: &TestContext, app_label: &str, count: usize) -> TestResult {
     use k8s_openapi::api::core::v1::Pod;
     use kube::api::{Api, ListParams};
 
@@ -252,7 +250,10 @@ async fn wait_for_ready_pods(
                 pod.status
                     .as_ref()
                     .and_then(|s| s.conditions.as_ref())
-                    .map(|c| c.iter().any(|cond| cond.type_ == "Ready" && cond.status == "True"))
+                    .map(|c| {
+                        c.iter()
+                            .any(|cond| cond.type_ == "Ready" && cond.status == "True")
+                    })
                     .unwrap_or(false)
             })
             .count();

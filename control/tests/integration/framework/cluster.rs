@@ -7,9 +7,7 @@ pub async fn create(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("🔧 Creating kind cluster: {}", name);
 
     // Check if cluster already exists
-    let output = Command::new("kind")
-        .args(&["get", "clusters"])
-        .output()?;
+    let output = Command::new("kind").args(&["get", "clusters"]).output()?;
 
     let clusters = String::from_utf8_lossy(&output.stdout);
     if clusters.lines().any(|line| line == name) {

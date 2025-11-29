@@ -50,7 +50,10 @@ impl KindProvider {
 
     /// Load a Docker image into the Kind cluster
     async fn load_image(&self, image: &str) -> Result<(), Box<dyn std::error::Error>> {
-        println!("  📦 Loading image {} into cluster {}...", image, self.cluster_name);
+        println!(
+            "  📦 Loading image {} into cluster {}...",
+            image, self.cluster_name
+        );
 
         let output = Command::new("kind")
             .args(&["load", "docker-image", image, "--name", &self.cluster_name])
@@ -105,7 +108,10 @@ nodes:
         std::fs::write(&config_path, config)?;
 
         // Create cluster
-        println!("  🏗️  Creating cluster with {} worker nodes...", self.worker_nodes);
+        println!(
+            "  🏗️  Creating cluster with {} worker nodes...",
+            self.worker_nodes
+        );
         let output = Command::new("kind")
             .args(&[
                 "create",

@@ -32,6 +32,19 @@
 //! - Configure performance testing
 //! - Enable network sniffing
 
+// Allow clippy warnings for test code
+#![allow(
+    dead_code,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::needless_borrows_for_generic_args,
+    clippy::useless_format,
+    clippy::to_string_in_format_args,
+    clippy::map_clone,
+    clippy::unwrap_used,
+    clippy::upper_case_acronyms
+)]
+
 pub mod framework;
 pub mod scenarios;
 
@@ -145,7 +158,9 @@ impl ClusterConfig {
 
         match self.cluster_type.as_str() {
             "kind" => {
-                let kind_config = self.kind.as_ref()
+                let kind_config = self
+                    .kind
+                    .as_ref()
                     .ok_or("Missing [cluster.kind] configuration")?;
                 Ok(ClusterType::Kind {
                     name: self.name.clone(),
@@ -153,7 +168,9 @@ impl ClusterConfig {
                 })
             }
             "k3s" => {
-                let k3s_config = self.k3s.as_ref()
+                let k3s_config = self
+                    .k3s
+                    .as_ref()
                     .ok_or("Missing [cluster.k3s] configuration")?;
                 Ok(ClusterType::K3s {
                     name: self.name.clone(),
@@ -161,7 +178,9 @@ impl ClusterConfig {
                 })
             }
             "eks" => {
-                let eks_config = self.eks.as_ref()
+                let eks_config = self
+                    .eks
+                    .as_ref()
                     .ok_or("Missing [cluster.eks] configuration")?;
                 Ok(ClusterType::EKS {
                     region: eks_config.region.clone(),
@@ -171,7 +190,9 @@ impl ClusterConfig {
                 })
             }
             "aks" => {
-                let aks_config = self.aks.as_ref()
+                let aks_config = self
+                    .aks
+                    .as_ref()
                     .ok_or("Missing [cluster.aks] configuration")?;
                 Ok(ClusterType::AKS {
                     resource_group: aks_config.resource_group.clone(),
@@ -181,7 +202,9 @@ impl ClusterConfig {
                 })
             }
             "gke" => {
-                let gke_config = self.gke.as_ref()
+                let gke_config = self
+                    .gke
+                    .as_ref()
                     .ok_or("Missing [cluster.gke] configuration")?;
                 Ok(ClusterType::GKE {
                     project: gke_config.project.clone(),
@@ -192,7 +215,9 @@ impl ClusterConfig {
                 })
             }
             "existing" => {
-                let existing_config = self.existing.as_ref()
+                let existing_config = self
+                    .existing
+                    .as_ref()
                     .ok_or("Missing [cluster.existing] configuration")?;
                 Ok(ClusterType::Existing {
                     kubeconfig_path: existing_config.kubeconfig_path.clone(),

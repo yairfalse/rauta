@@ -137,8 +137,8 @@ pub struct ProxyServer {
     workers: Option<Workers>, // None = legacy mode, Some = per-core workers (lock-free!)
     #[allow(dead_code)] // Used when workers are enabled
     worker_selector: Option<Arc<WorkerSelector>>, // Round-robin worker selection
-    rate_limiter: Arc<RateLimiter>,               // Per-route rate limiting
-    circuit_breaker: Arc<CircuitBreakerManager>,  // Per-backend circuit breaking
+    rate_limiter: Arc<RateLimiter>, // Per-route rate limiting
+    circuit_breaker: Arc<CircuitBreakerManager>, // Per-backend circuit breaking
 }
 
 impl ProxyServer {
@@ -157,7 +157,7 @@ impl ProxyServer {
         // Create rate limiter and circuit breaker
         let rate_limiter = Arc::new(RateLimiter::new());
         let circuit_breaker = Arc::new(CircuitBreakerManager::new(
-            5,                              // 5 consecutive failures to open circuit
+            5,                                  // 5 consecutive failures to open circuit
             std::time::Duration::from_secs(30), // 30s timeout before Half-Open
         ));
 
@@ -199,7 +199,7 @@ impl ProxyServer {
         // Create rate limiter and circuit breaker (shared across workers)
         let rate_limiter = Arc::new(RateLimiter::new());
         let circuit_breaker = Arc::new(CircuitBreakerManager::new(
-            5,                              // 5 consecutive failures to open circuit
+            5,                                  // 5 consecutive failures to open circuit
             std::time::Duration::from_secs(30), // 30s timeout before Half-Open
         ));
 
@@ -1089,6 +1089,7 @@ fn status_to_str(status: u16) -> &'static str {
 
 /// Handle incoming HTTP request
 /// Returns BoxBody to support zero-copy streaming for HTTP/2 responses
+#[allow(clippy::too_many_arguments)]
 async fn handle_request(
     mut req: Request<hyper::body::Incoming>,
     router: Arc<Router>,
@@ -1138,7 +1139,8 @@ async fn handle_request(
         metric_families.extend(rate_limiter_metrics);
 
         // Add circuit breaker metrics
-        let circuit_breaker_metrics = crate::proxy::circuit_breaker::circuit_breaker_registry().gather();
+        let circuit_breaker_metrics =
+            crate::proxy::circuit_breaker::circuit_breaker_registry().gather();
         metric_families.extend(circuit_breaker_metrics);
 
         // Encode all metrics
@@ -1286,9 +1288,11 @@ async fn handle_request(
                     .header("Content-Type", "text/plain")
                     .header("Retry-After", "30") // Circuit breaker timeout
                     .body(
-                        Full::new(Bytes::from("Backend temporarily unavailable (circuit breaker open)"))
-                            .map_err(|never| match never {})
-                            .boxed(),
+                        Full::new(Bytes::from(
+                            "Backend temporarily unavailable (circuit breaker open)",
+                        ))
+                        .map_err(|never| match never {})
+                        .boxed(),
                     )
                     .unwrap());
             }

@@ -2,8 +2,8 @@
 //!
 //! Validates that HTTP traffic flows from client → RAUTA → backend.
 
-use super::super::framework::{TestContext, TestResult};
 use super::super::framework::{assertions, fixtures, k8s};
+use super::super::framework::{TestContext, TestResult};
 use super::super::{TestConfig, TestScenario};
 use std::time::Duration;
 
@@ -84,15 +84,14 @@ async fn test_single_backend_routing(ctx: &TestContext) -> TestResult {
 
     // Assert response
     if !response.status().is_success() {
-        return Err(format!(
-            "Expected 200 OK, got {}",
-            response.status()
-        )
-        .into());
+        return Err(format!("Expected 200 OK, got {}", response.status()).into());
     }
 
     let body = response.text().await?;
-    println!("  ✅ Backend responded: {}", body.lines().next().unwrap_or(""));
+    println!(
+        "  ✅ Backend responded: {}",
+        body.lines().next().unwrap_or("")
+    );
 
     Ok(())
 }
@@ -160,7 +159,10 @@ async fn test_multiple_backend_routing(ctx: &TestContext) -> TestResult {
         .into());
     }
 
-    println!("  ✅ Maglev load balancing working ({}/30 successful)", success_count);
+    println!(
+        "  ✅ Maglev load balancing working ({}/30 successful)",
+        success_count
+    );
 
     Ok(())
 }
@@ -210,11 +212,7 @@ async fn test_header_preservation(ctx: &TestContext) -> TestResult {
         .await?;
 
     if !response.status().is_success() {
-        return Err(format!(
-            "Expected 200 OK, got {}",
-            response.status()
-        )
-        .into());
+        return Err(format!("Expected 200 OK, got {}", response.status()).into());
     }
 
     println!("  ✅ Headers preserved through RAUTA");
@@ -247,9 +245,9 @@ async fn wait_for_pods_ready(
                     .as_ref()
                     .and_then(|s| s.conditions.as_ref())
                     .map(|conditions| {
-                        conditions.iter().any(|c| {
-                            c.type_ == "Ready" && c.status == "True"
-                        })
+                        conditions
+                            .iter()
+                            .any(|c| c.type_ == "Ready" && c.status == "True")
                     })
                     .unwrap_or(false)
             })
@@ -271,7 +269,10 @@ async fn wait_for_pods_ready(
 }
 
 /// Helper: Get Gateway load balancer address
-async fn get_gateway_address(ctx: &TestContext, gateway_name: &str) -> Result<String, Box<dyn std::error::Error>> {
+async fn get_gateway_address(
+    ctx: &TestContext,
+    gateway_name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     use gateway_api::apis::standard::gateways::Gateway;
     use kube::api::Api;
 

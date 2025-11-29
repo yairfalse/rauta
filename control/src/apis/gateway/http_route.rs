@@ -510,7 +510,10 @@ impl HTTPRouteReconciler {
                     if !backends.is_empty() {
                         let backend_count = backends.len();
                         // Add route to router (using GET as default method)
-                        match ctx.router.add_route(HttpMethod::GET, path, backends.clone()) {
+                        match ctx
+                            .router
+                            .add_route(HttpMethod::GET, path, backends.clone())
+                        {
                             Ok(_) => {
                                 info!(
                                     "  - Added route: {} -> {} total backends",
@@ -520,7 +523,9 @@ impl HTTPRouteReconciler {
 
                                 // Configure rate limiting from annotations
                                 if let Some(annotations) = &route.metadata.annotations {
-                                    if let Some(rate_limit_config) = annotations.get("rauta.io/rate-limit") {
+                                    if let Some(rate_limit_config) =
+                                        annotations.get("rauta.io/rate-limit")
+                                    {
                                         match parse_rate_limit_annotation(rate_limit_config) {
                                             Ok((rate, burst)) => {
                                                 ctx.rate_limiter.configure_route(path, rate, burst);

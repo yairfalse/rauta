@@ -1,11 +1,7 @@
 //! Reusable K8s resource fixtures
 
 /// Generate a Gateway YAML with HTTPS listener
-pub fn gateway_with_https(
-    name: &str,
-    namespace: &str,
-    cert_name: &str,
-) -> String {
+pub fn gateway_with_https(name: &str, namespace: &str, cert_name: &str) -> String {
     format!(
         r#"
 apiVersion: gateway.networking.k8s.io/v1
@@ -146,10 +142,9 @@ pub fn generate_test_cert() -> (Vec<u8>, Vec<u8>) {
     let key_pair = KeyPair::generate().expect("Failed to generate key pair");
 
     // Configure certificate parameters
-    let mut params = CertificateParams::new(vec![
-        "example.com".to_string(),
-        "*.example.com".to_string(),
-    ]).expect("Failed to create certificate params");
+    let mut params =
+        CertificateParams::new(vec!["example.com".to_string(), "*.example.com".to_string()])
+            .expect("Failed to create certificate params");
 
     // Set distinguished name
     let mut dn = DistinguishedName::new();

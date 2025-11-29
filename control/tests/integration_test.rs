@@ -2,13 +2,15 @@
 //!
 //! Run with: cargo test --test integration_test
 
+#![allow(clippy::expect_used, clippy::panic)]
+
 mod integration;
 
-use integration::{TestConfig, TestContext, TestScenario};
-use integration::scenarios::tls_validation::TlsValidationScenario;
 use integration::scenarios::basic_routing::BasicRoutingScenario;
 use integration::scenarios::endpointslice::EndpointSliceScenario;
 use integration::scenarios::load_test::LoadTestScenario;
+use integration::scenarios::tls_validation::TlsValidationScenario;
+use integration::{TestConfig, TestContext, TestScenario};
 
 #[tokio::test]
 async fn run_integration_tests() {

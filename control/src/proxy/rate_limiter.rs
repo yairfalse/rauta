@@ -212,6 +212,7 @@ impl TokenBucket {
 
     /// Reset bucket to full capacity (for testing)
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn reset(&self) {
         let mut tokens = safe_write(&self.tokens);
         *tokens = self.capacity;
@@ -397,7 +398,7 @@ mod tests {
 
         // Should have allowed 4-6 requests (accounting for timing variance)
         assert!(
-            allowed >= 4 && allowed <= 6,
+            (4..=6).contains(&allowed),
             "Should allow 4-6 requests after 5ms, got {}",
             allowed
         );
@@ -420,7 +421,10 @@ mod tests {
         );
 
         // Should still be able to acquire 2
-        assert!(bucket.try_acquire_n(2.0), "Should acquire remaining 2 tokens");
+        assert!(
+            bucket.try_acquire_n(2.0),
+            "Should acquire remaining 2 tokens"
+        );
     }
 
     #[test]
@@ -555,18 +559,18 @@ mod tests {
         let metrics = crate::proxy::rate_limiter::rate_limiter_registry().gather();
 
         // Should have metrics for rauta_rate_limit_requests_total
-        let has_request_metric = metrics.iter().any(|family| {
-            family.get_name() == "rauta_rate_limit_requests_total"
-        });
+        let has_request_metric = metrics
+            .iter()
+            .any(|family| family.name() == "rauta_rate_limit_requests_total");
         assert!(
             has_request_metric,
             "Should have rauta_rate_limit_requests_total metric"
         );
 
         // Should have metrics for rauta_rate_limit_tokens_available
-        let has_tokens_metric = metrics.iter().any(|family| {
-            family.get_name() == "rauta_rate_limit_tokens_available"
-        });
+        let has_tokens_metric = metrics
+            .iter()
+            .any(|family| family.name() == "rauta_rate_limit_tokens_available");
         assert!(
             has_tokens_metric,
             "Should have rauta_rate_limit_tokens_available metric"

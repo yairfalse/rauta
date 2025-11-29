@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
     // Create rate limiter and circuit breaker (shared across all components)
     let rate_limiter = Arc::new(proxy::rate_limiter::RateLimiter::new());
     let circuit_breaker = Arc::new(proxy::circuit_breaker::CircuitBreakerManager::new(
-        5,                                   // 5 consecutive failures to open circuit
+        5,                                  // 5 consecutive failures to open circuit
         std::time::Duration::from_secs(30), // 30s timeout before Half-Open
     ));
 

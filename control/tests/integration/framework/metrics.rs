@@ -27,24 +27,30 @@ impl MetricsCollector {
     }
 
     /// Scrape metrics from RAUTA /metrics endpoint
-    pub async fn scrape(
-        &self,
-        endpoint: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn scrape(&self, endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
         let response = reqwest::get(endpoint).await?;
         let body = response.text().await?;
 
         let metrics = Self::parse_prometheus(&body)?;
 
-        *self.current.lock().map_err(|e| format!("Lock poisoned: {}", e))? = Some(metrics);
+        *self
+            .current
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {}", e))? = Some(metrics);
 
         Ok(())
     }
 
     /// Set baseline metrics (before load test)
     pub fn set_baseline(&self) -> Result<(), String> {
-        let current = self.current.lock().map_err(|e| format!("Lock poisoned: {}", e))?;
-        *self.baseline.lock().map_err(|e| format!("Lock poisoned: {}", e))? = current.clone();
+        let current = self
+            .current
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {}", e))?;
+        *self
+            .baseline
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {}", e))? = current.clone();
         Ok(())
     }
 
@@ -91,7 +97,8 @@ impl MetricsCollector {
                 }
             }
 
-            if line.starts_with("rauta_request_duration_seconds") && line.contains("quantile=\"0.99\"")
+            if line.starts_with("rauta_request_duration_seconds")
+                && line.contains("quantile=\"0.99\"")
             {
                 if let Some(value_str) = line.split_whitespace().nth(1) {
                     if let Ok(value) = value_str.parse::<f64>() {

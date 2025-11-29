@@ -362,14 +362,17 @@ impl ListenerManager {
             http_method,
             path,
             vec![("host", host_header)],
-            None,  // src_ip - TODO: extract from connection
-            None,  // src_port
+            None, // src_ip - TODO: extract from connection
+            None, // src_port
         );
 
         let route_match = match route_match {
             Some(m) => m,
             None => {
-                debug!("No route found for {} {} (host: {})", method, path, host_header);
+                debug!(
+                    "No route found for {} {} (host: {})",
+                    method, path, host_header
+                );
                 // Response builder with static values should never fail
                 #[allow(clippy::expect_used)]
                 return Ok(Response::builder()
@@ -444,10 +447,7 @@ impl ListenerManager {
                 .expect("Building 500 response should never fail"));
         };
 
-        debug!(
-            "Proxying {} {} to {}",
-            method, path, backend_addr
-        );
+        debug!("Proxying {} {} to {}", method, path, backend_addr);
 
         // Connect to backend
         let stream = match tokio::net::TcpStream::connect(backend_addr).await {
