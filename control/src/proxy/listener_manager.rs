@@ -328,11 +328,24 @@ impl ListenerManager {
 
         debug!("Request: {} {}", method, path);
 
-        // Extract Host header for routing
-        let host_header = headers
-            .get("host")
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
+        // Extract Host header for routing (required for HTTP/1.1)
+        let host_header = match headers.get("host").and_then(|h| h.to_str().ok()) {
+            Some(h) => h,
+            None => {
+                // HTTP/1.1 requires Host header (RFC 7230 Section 5.4)
+                debug!("Missing required Host header for {} {}", method, path);
+                // Response builder with static values should never fail
+                #[allow(clippy::expect_used)]
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(
+                        Full::new(Bytes::from("Bad Request: Missing Host header"))
+                            .map_err(std::io::Error::other)
+                            .boxed(),
+                    )
+                    .expect("Building 400 response should never fail"));
+            }
+        };
 
         // Convert hyper Method to router HttpMethod
         let http_method = match *req.method() {
@@ -469,7 +482,10 @@ impl ListenerManager {
 
         let io = TokioIo::new(stream);
 
-        // Create HTTP/1 connection to backend
+        // Create HTTP/1.1 connection to backend
+        // NOTE: Using HTTP/1.1 for simplicity in ListenerManager (TLS validation use case)
+        // For production HTTP/2 support, see ProxyServer in server.rs which has full
+        // protocol detection, connection pooling, and HTTP/2 multiplexing
         let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
             Ok(c) => c,
             Err(e) => {
