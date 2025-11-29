@@ -282,8 +282,8 @@ async fn get_gateway_address(
     // In kind cluster, we'll use port-forward
     // In production, use gateway.status.addresses
 
-    // For now, panic to prevent use of placeholder
+    // For now, return an error to prevent use of placeholder
     // TODO: Implement port-forwarding or use Gateway status addresses
 
-    panic!("get_gateway_address is not yet implemented. Please implement endpoint discovery logic before running tests.");
+    Err("get_gateway_address is not yet implemented. Please implement endpoint discovery logic before running tests.".into())
 }
