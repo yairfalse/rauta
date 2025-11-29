@@ -1,6 +1,6 @@
 # Multi-stage build for RAUTA control plane
 # Using nightly for Edition 2024 support (required by gateway-api v0.16+)
-FROM rustlang/rust:nightly AS builder
+FROM rust:nightly AS builder
 
 WORKDIR /app
 
@@ -19,7 +19,7 @@ COPY control ./control
 RUN cargo build --release --package control
 
 # Runtime image
-FROM debian:bookworm-slim
+FROM rust:nightly AS builder
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
