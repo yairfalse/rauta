@@ -1,7 +1,9 @@
 pub mod backend_pool;
+pub mod circuit_breaker;
 pub mod filters;
 pub mod health_checker;
 pub mod listener_manager;
+pub mod rate_limiter;
 pub mod router;
 pub mod server;
 pub mod tls;

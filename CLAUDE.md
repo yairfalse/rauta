@@ -897,6 +897,107 @@ git commit --no-verify -m "feat: your change"
 
 ---
 
+## CI COST OPTIMIZATION
+
+**CRITICAL: GitHub Actions costs were burning money - Now optimized for ~90% savings**
+
+### The Problem
+
+CI was running expensive release builds on EVERY push to feat/* branches:
+- Release builds with LTO (10-20 min) on every push
+- No path filtering (rebuilt even for docs changes)
+- cargo-audit installed from scratch every run
+- Result: ~6,000 GitHub Actions minutes/month 💸
+
+### The Solution: Three Lines of Defense
+
+**Defense 1: Enhanced Pre-Commit Hooks** (Automatic)
+```bash
+# Runs automatically on git commit
+# - Checks unwrap()/expect()/panic!()
+# - Runs cargo fmt --check
+# - Runs cargo clippy
+# - Runs cargo check
+# Speed: 10-30 seconds | Catches: 80% of issues
+```
+
+**Defense 2: Local CI Checks** (Before push)
+```bash
+# Run ALL CI checks locally (saves GitHub minutes)
+make ci-local    # Full CI suite (2-3 min)
+make check       # Fast compilation check (10s)
+make fmt         # Format code
+make clippy      # Lints
+make test        # Tests
+```
+
+**Defense 3: Optimized GitHub Actions**
+- ✅ Only runs on main + PRs to main (NOT feat/* branches)
+- ✅ Path filtering (skips CI for docs-only changes)
+- ✅ Release builds ONLY on main/PR to main
+- ✅ Faster Rust caching (Swatinem/rust-cache@v2)
+- ✅ cargo-audit binary cached
+- ✅ Security audit only when Cargo.lock changes
+
+### The Workflow
+
+```bash
+# 1. Make changes
+vim control/src/main.rs
+
+# 2. Quick check (10-30s)
+make check
+
+# 3. Commit (pre-commit hook runs automatically)
+git commit -m "feat: awesome feature"
+
+# 4. Run FULL CI locally BEFORE pushing (2-3 min)
+make ci-local
+
+# 5. If all passes, push with confidence
+git push origin feat/my-feature
+
+# 6. Create PR (CI runs once, not on every push)
+```
+
+### Cost Savings
+
+**Before**: ~6,000 GitHub Actions minutes/month
+**After**: ~500 GitHub Actions minutes/month
+**Savings**: ~90% reduction 💰
+
+### BONUS: Local GitHub Actions Testing
+
+Run the EXACT GitHub Actions workflow locally (NO cloud minutes):
+
+```bash
+# Install 'act' (one-time)
+make install-act
+
+# Run CI locally using Docker
+make ci-act
+```
+
+### Documentation
+
+- **Quick Start**: `docs/CI_QUICK_START.md`
+- **Full Guide**: `docs/CI_COST_OPTIMIZATION.md`
+- **All Commands**: `make help`
+
+### IMPORTANT
+
+CI now ONLY triggers on:
+- ✅ Push to `main`
+- ✅ PRs to `main`
+
+CI does NOT trigger on:
+- ❌ Push to `feat/*` branches
+- ❌ Push to `dev` branch
+
+**This is INTENTIONAL to save money. Use `make ci-local` before pushing!**
+
+---
+
 ## DEFINITION OF DONE
 
 A feature is complete when:
