@@ -1,22 +1,36 @@
-# RAUTA Gateway Controller - Local Binary
-# Fast build: just copies pre-built binary
+# Multi-stage build for RAUTA control plane
+# Using nightly for Edition 2024 support (required by gateway-api v0.16+)
+FROM rust:nightly AS builder
 
-FROM ubuntu:22.04
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy workspace
+COPY Cargo.toml Cargo.lock ./
+COPY common ./common
+COPY control ./control
+
+# Build release binary with Edition 2024 support
+RUN cargo build --release --package control
+
+# Runtime image
+FROM rust:nightly AS builder
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy pre-built binary from local build
-COPY target/release/control /usr/local/bin/control
+# Copy binary from builder
+COPY --from=builder /app/target/release/control /usr/local/bin/rauta
 
-# Set permissions
-RUN chmod +x /usr/local/bin/control
+# Run as non-root
+RUN useradd -m -u 1000 rauta
+USER rauta
 
-# Expose ports
-EXPOSE 80 443 9090
-
-# Run control plane
-ENTRYPOINT ["/usr/local/bin/control"]
+ENTRYPOINT ["/usr/local/bin/rauta"]
