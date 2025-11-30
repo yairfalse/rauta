@@ -59,8 +59,22 @@ impl Sniffer {
         &self.output_file
     }
 
+    /// Check if tshark is installed
+    fn check_tshark_installed() -> Result<(), Box<dyn std::error::Error>> {
+        match Command::new("tshark").arg("--version").output() {
+            Ok(_) => Ok(()),
+            Err(_) => Err(
+                "tshark not installed. Install with: brew install wireshark (macOS) or apt-get install tshark (Linux)"
+                    .into(),
+            ),
+        }
+    }
+
     /// Analyze capture with tshark (Wireshark CLI)
     pub fn analyze(&self) -> Result<CaptureAnalysis, Box<dyn std::error::Error>> {
+        // Check if tshark is installed before running
+        Self::check_tshark_installed()?;
+
         let output = Command::new("tshark")
             .args(&[
                 "-r",

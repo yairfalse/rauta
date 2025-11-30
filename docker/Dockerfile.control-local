@@ -1,6 +1,6 @@
 # Multi-stage build for RAUTA control plane
 # Using nightly for Edition 2024 support (required by gateway-api v0.16+)
-FROM rust:nightly AS builder
+FROM rust:nightly-slim AS builder
 
 WORKDIR /app
 
