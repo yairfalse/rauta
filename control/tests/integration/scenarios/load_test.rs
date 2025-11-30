@@ -152,6 +152,17 @@ async fn test_sustained_load(ctx: &TestContext) -> TestResult {
     Ok(())
 }
 
+/// Check if wrk is installed
+fn check_wrk_installed() -> Result<(), Box<dyn std::error::Error>> {
+    match Command::new("wrk").arg("--version").output() {
+        Ok(_) => Ok(()),
+        Err(_) => Err(
+            "wrk not installed. Install with: brew install wrk (macOS) or apt-get install wrk (Linux)"
+                .into(),
+        ),
+    }
+}
+
 /// Helper: Run wrk load test
 fn run_wrk(
     endpoint: &str,
@@ -160,6 +171,9 @@ fn run_wrk(
     connections: usize,
     threads: usize,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    // Check if wrk is installed before running
+    check_wrk_installed()?;
+
     let url = format!("http://{}{}", endpoint, path);
 
     let output = Command::new("wrk")
