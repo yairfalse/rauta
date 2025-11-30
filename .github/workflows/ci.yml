@@ -33,7 +33,7 @@ jobs:
               - '**/Cargo.lock'
               - '.github/workflows/ci.yml'
 
-  # Standard Rust CI - uses shared tooling
+  # Standard Rust CI
   format:
     name: Format
     runs-on: ubuntu-latest
@@ -41,7 +41,12 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     steps:
       - uses: actions/checkout@v4
-      - uses: yairfalse/.github/.github/actions/setup-rust@main
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "format"
       - run: cargo fmt --all -- --check
 
   clippy:
@@ -51,7 +56,12 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     steps:
       - uses: actions/checkout@v4
-      - uses: yairfalse/.github/.github/actions/setup-rust@main
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "clippy"
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
@@ -61,8 +71,11 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     steps:
       - uses: actions/checkout@v4
-      - uses: yairfalse/.github/.github/actions/setup-rust@main
-      - run: cargo test --all-features --verbose
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "test"
+      - run: cargo test --lib --bins --all-features
 
   # Integration tests with Kind + Gateway API
   integration:
@@ -73,12 +86,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: yairfalse/.github/.github/actions/setup-rust@main
+      - uses: dtolnay/rust-toolchain@stable
 
-      - uses: yairfalse/.github/.github/actions/setup-kind@main
+      - uses: Swatinem/rust-cache@v2
         with:
-          cluster-name: rauta-test
-          install-gateway-api: 'true'
+          shared-key: "integration"
+
+      - name: Install Kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Create Kind cluster
+        run: |
+          kind create cluster --name rauta-test
+          kubectl cluster-info --context kind-rauta-test
+
+      - name: Install Gateway API CRDs
+        run: |
+          kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.1.0/standard-install.yaml
+          kubectl wait --for condition=established --timeout=60s crd/gatewayclasses.gateway.networking.k8s.io
+          kubectl wait --for condition=established --timeout=60s crd/gateways.gateway.networking.k8s.io
+          kubectl wait --for condition=established --timeout=60s crd/httproutes.gateway.networking.k8s.io
 
       - name: Run integration tests
         run: cargo test --all-features -- --ignored
@@ -94,9 +124,22 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     steps:
       - uses: actions/checkout@v4
-      - uses: yairfalse/.github/.github/actions/setup-rust@main
-      - run: cargo install cargo-audit
-      - run: cargo audit
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo-audit
+        id: cache-cargo-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-cargo-audit-0.18.3
+
+      - name: Install cargo-audit
+        if: steps.cache-cargo-audit.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --version 0.18.3 --locked
+
+      - name: Run security audit
+        run: cargo audit
 
   build:
     name: Build
@@ -105,8 +148,15 @@ jobs:
     if: needs.test.result == 'success'
     steps:
       - uses: actions/checkout@v4
-      - uses: yairfalse/.github/.github/actions/setup-rust@main
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "build"
+
       - run: cargo build --release --all-features
+
       - uses: actions/upload-artifact@v4
         with:
           name: binaries
