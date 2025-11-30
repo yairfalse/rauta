@@ -113,6 +113,23 @@ ship MESSAGE: ci
   git commit -m "{{MESSAGE}}"
   git push
 
+# === Setup ===
+
+# Install git hooks (pre-commit + pre-push)
+install-hooks:
+  @echo "🔗 Installing git hooks..."
+  @if [ ! -f .git/hooks/pre-commit ]; then \
+    echo "⚠️  Pre-commit hook not found (expected in .git/hooks/pre-commit)"; \
+  else \
+    chmod +x .git/hooks/pre-commit && echo "✅ Pre-commit hook installed"; \
+  fi
+  @if [ ! -f .git/hooks/pre-push ]; then \
+    echo "⚠️  Pre-push hook not found (expected in .git/hooks/pre-push)"; \
+  else \
+    chmod +x .git/hooks/pre-push && echo "✅ Pre-push hook installed"; \
+  fi
+  @echo "✅ Hooks ready!"
+
 # === Meta ===
 
 # Show tool versions

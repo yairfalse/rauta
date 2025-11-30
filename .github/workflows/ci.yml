@@ -75,6 +75,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "test"
+      # Only run unit tests (no integration tests - they need Kind cluster)
+      # Integration tests panicked: tests/integration_test.rs expects running cluster
       - run: cargo test --lib --bins --all-features
 
   # Integration tests with Kind + Gateway API (disabled - run manually with scripts/setup-conformance.sh)
