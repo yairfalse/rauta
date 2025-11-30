@@ -88,7 +88,7 @@ jobs:
         run: cd common && cargo test --all-features
 
       - name: Run unit tests (control)
-        run: cd control && cargo test --all-features
+        run: cd control && cargo test --lib --bins --all-features
 
   # Release build - ONLY on main or PR to main
   build-release:
