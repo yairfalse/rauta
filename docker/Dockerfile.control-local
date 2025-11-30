@@ -19,7 +19,7 @@ COPY control ./control
 RUN cargo build --release --package control
 
 # Runtime image
-FROM debian:bookworm-slim
+FROM rust:nightly AS builder
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \

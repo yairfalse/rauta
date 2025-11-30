@@ -1,0 +1,131 @@
+apiVersion: skaffold/v4beta11
+kind: Config
+
+metadata:
+  name: rauta
+
+# Build configuration
+build:
+  artifacts:
+    # RAUTA control plane (Gateway API controller)
+    - image: rauta-control
+      docker:
+        dockerfile: docker/Dockerfile.control-local
+        buildArgs:
+          # Use cached layers for faster rebuilds
+          CARGO_INCREMENTAL: "1"
+      # Only rebuild when control plane code changes
+      sync:
+        manual:
+          - src: "control/**/*.rs"
+            dest: /app/control
+          - src: "common/**/*.rs"
+            dest: /app/common
+          - src: "control/Cargo.toml"
+            dest: /app/control/Cargo.toml
+
+  # Use local Docker for Kind clusters
+  local:
+    push: false
+    useBuildkit: true
+    concurrency: 1
+
+# Deployment manifests
+manifests:
+  rawYaml:
+    # Core Gateway API resources
+    - deploy/gateway-api.yaml
+    # RAUTA controller DaemonSet
+    - deploy/rauta-daemonset.yaml
+    # Demo backend for testing
+    - deploy/demo-backend.yaml
+
+# Deploy configuration
+deploy:
+  kubectl: {}
+  # Status check - wait for RAUTA to be ready
+  statusCheckDeadlineSeconds: 300
+  kubeContext: kind-rauta-dev
+
+# Port forwarding for local testing
+portForward:
+  # RAUTA metrics endpoint
+  - resourceType: daemonset
+    resourceName: rauta-control
+    namespace: rauta-system
+    port: 9090
+    localPort: 9090
+
+  # Gateway HTTP endpoint
+  - resourceType: service
+    resourceName: rauta-gateway
+    namespace: demo
+    port: 80
+    localPort: 8080
+
+# Development profiles
+profiles:
+  # Default development profile
+  - name: dev
+    activation:
+      - command: dev
+    patches:
+      - op: add
+        path: /build/artifacts/0/docker/buildArgs/RUST_BACKTRACE
+        value: "1"
+      - op: add
+        path: /build/artifacts/0/docker/buildArgs/CARGO_PROFILE
+        value: "dev"
+    deploy:
+      logs:
+        prefix: pod
+      statusCheck: true
+
+  # Production-like testing profile
+  - name: prod
+    patches:
+      - op: replace
+        path: /build/artifacts/0/docker/dockerfile
+        value: docker/Dockerfile.prod
+      - op: add
+        path: /build/artifacts/0/docker/buildArgs/CARGO_PROFILE
+        value: "release"
+
+  # Integration testing profile (minimal manifests)
+  - name: test
+    manifests:
+      rawYaml:
+        - deploy/gateway-api.yaml
+        - deploy/rauta-daemonset-test.yaml
+    deploy:
+      kubectl: {}
+      statusCheckDeadlineSeconds: 120
+
+  # Observability stack (Prometheus + Grafana)
+  - name: observability
+    activation:
+      - env: RAUTA_OBSERVABILITY=true
+    patches:
+      - op: add
+        path: /manifests/rawYaml/-
+        value: docker/observability-stack.yaml
+
+# Custom test phase (optional)
+test:
+  - image: rauta-control
+    custom:
+      - command: cargo test --workspace
+      - command: cargo clippy --workspace -- -D warnings
+
+# Resource requirements (adjust for your machine)
+resourceSelector:
+  allow:
+    # Only deploy to rauta-system and demo namespaces
+    - groupKind: Deployment.*
+      image: ["rauta-control"]
+    - groupKind: DaemonSet.*
+      image: ["rauta-control"]
+    - groupKind: Service.*
+    - groupKind: Gateway.*
+    - groupKind: HTTPRoute.*
+    - groupKind: GatewayClass.*
