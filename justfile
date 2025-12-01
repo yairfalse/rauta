@@ -33,10 +33,10 @@ lint:
   @echo "🔍 Running clippy..."
   cargo clippy --all-targets --all-features -- -D warnings
 
-# Run all tests (including integration)
+# Run all tests (unit + doc tests, excludes integration tests)
 test-all:
   @echo "🧪 Running all tests..."
-  cargo test --workspace --all-features
+  cargo test --workspace --all-features --lib --bins
 
 # Security audit
 audit:
