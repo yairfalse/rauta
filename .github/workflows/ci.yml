@@ -8,169 +8,50 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  CARGO_INCREMENTAL: 0  # Faster CI builds
 
 jobs:
-  # Path filtering - skip if only docs changed
-  changes:
+  # Main CI job - just calls `just ci`
+  ci:
+    name: CI (just ci)
     runs-on: ubuntu-latest
-    outputs:
-      rust: ${{ steps.filter.outputs.rust }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: |
-            rust:
-              - '**/*.rs'
-              - '**/Cargo.toml'
-              - '**/Cargo.lock'
-              - '.github/workflows/ci.yml'
-
-  # Standard Rust CI
-  format:
-    name: Format
-    runs-on: ubuntu-latest
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "format"
-      - run: cargo fmt --all -- --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "clippy"
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "test"
-      # Only run unit tests (no integration tests - they need Kind cluster)
-      # Integration tests panicked: tests/integration_test.rs expects running cluster
-      - run: cargo test --lib --bins --all-features
-
-  # Integration tests with Kind + Gateway API (disabled - run manually with scripts/setup-conformance.sh)
-  # integration:
-  #   name: Integration Tests
-  #   runs-on: ubuntu-latest
-  #   needs: [changes, format, clippy, test]
-  #   if: needs.changes.outputs.rust == 'true'
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #
-  #     - uses: dtolnay/rust-toolchain@stable
-  #
-  #     - uses: Swatinem/rust-cache@v2
-  #       with:
-  #         shared-key: "integration"
-  #
-  #     - name: Install Kind
-  #       run: |
-  #         curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
-  #         chmod +x ./kind
-  #         sudo mv ./kind /usr/local/bin/kind
-  #
-  #     - name: Create Kind cluster
-  #       run: |
-  #         kind create cluster --name rauta-test
-  #         kubectl cluster-info --context kind-rauta-test
-  #
-  #     - name: Install Gateway API CRDs
-  #       run: |
-  #         kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.1.0/standard-install.yaml
-  #         kubectl wait --for condition=established --timeout=60s crd/gatewayclasses.gateway.networking.k8s.io
-  #         kubectl wait --for condition=established --timeout=60s crd/gateways.gateway.networking.k8s.io
-  #         kubectl wait --for condition=established --timeout=60s crd/httproutes.gateway.networking.k8s.io
-  #
-  #     - name: Run integration tests
-  #       run: cargo test --all-features -- --ignored
-  #
-  #     - name: Cleanup
-  #       if: always()
-  #       run: kind delete cluster --name rauta-test
-
-  # Security audit disabled - cargo-audit v0.18.3 has compilation issues with Rust 1.91+
-  # Run manually with: cargo install cargo-audit && cargo audit
-  # security:
-  #   name: Security Audit
-  #   runs-on: ubuntu-latest
-  #   needs: changes
-  #   if: needs.changes.outputs.rust == 'true'
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #
-  #     - uses: dtolnay/rust-toolchain@stable
-  #
-  #     - name: Install cargo-audit
-  #       run: cargo install cargo-audit --locked
-  #
-  #     - name: Run security audit
-  #       run: cargo audit
-
-  build:
-    name: Build
-    runs-on: ubuntu-latest
-    needs: [format, clippy, test]
-    if: needs.test.result == 'success'
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "build"
+          shared-key: "rauta-ci"
 
-      - run: cargo build --release --all-features
+      # Install Just
+      - name: Install Just
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: binaries
-          path: target/release/rauta
-          retention-days: 7
+      # Install cargo-audit (for security checks)
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
 
+      # Run full CI (format, lint, test, audit, build)
+      - name: Run CI
+        run: just ci
+
+  # Status check for branch protection
   status:
     name: CI Status
     runs-on: ubuntu-latest
-    needs: [format, clippy, test, build]
+    needs: [ci]
     if: always()
     steps:
       - name: Check results
         run: |
-          if [ "${{ needs.format.result }}" == "failure" ] || \
-             [ "${{ needs.clippy.result }}" == "failure" ] || \
-             [ "${{ needs.test.result }}" == "failure" ] || \
-             [ "${{ needs.build.result }}" == "failure" ]; then
+          if [ "${{ needs.ci.result }}" == "failure" ] || [ "${{ needs.ci.result }}" == "cancelled" ]; then
             echo "❌ CI failed"
             exit 1
           fi
