@@ -2050,6 +2050,277 @@ mod tests {
             "/api/products should match general /api backend"
         );
     }
+
+    // Feature 5: HTTPHeaderFilter (Gateway API Request Header Modification)
+
+    #[tokio::test]
+    async fn test_httproute_request_header_filter_set() {
+        // GREEN: Test that HTTPRoute can set request headers
+        use crate::proxy::filters::RequestHeaderModifier;
+        use crate::proxy::router::Router;
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        let backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 10, 1)),
+            8080,
+            100,
+        )];
+
+        // Create filter that sets X-API-Version header
+        let filter =
+            RequestHeaderModifier::new().set("X-API-Version".to_string(), "v2".to_string());
+
+        router
+            .add_route_with_filters(HttpMethod::GET, "/api/v2/users", backend.clone(), filter)
+            .expect("Should add route with request header filter");
+
+        // Verify filter is attached to route
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/api/v2/users", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.request_filters.is_some(),
+            "Request filters should be attached to route"
+        );
+
+        let filters = route_match.request_filters.unwrap();
+        assert_eq!(
+            filters.operations.len(),
+            1,
+            "Should have 1 header filter operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_httproute_request_header_filter_add() {
+        // GREEN: Test that HTTPRoute can add request headers
+        use crate::proxy::filters::RequestHeaderModifier;
+        use crate::proxy::router::Router;
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        let backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 11, 1)),
+            8080,
+            100,
+        )];
+
+        // Create filter that adds multiple X-Trace-Id headers
+        let filter = RequestHeaderModifier::new()
+            .add("X-Trace-Id".to_string(), "trace-1".to_string())
+            .add("X-Correlation-Id".to_string(), "corr-123".to_string());
+
+        router
+            .add_route_with_filters(HttpMethod::POST, "/api/events", backend.clone(), filter)
+            .expect("Should add route with request header filter");
+
+        // Verify filters are attached
+        let route_match = router
+            .select_backend(HttpMethod::POST, "/api/events", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.request_filters.is_some(),
+            "Request filters should be attached"
+        );
+
+        let filters = route_match.request_filters.unwrap();
+        assert_eq!(filters.operations.len(), 2, "Should have 2 add operations");
+    }
+
+    #[tokio::test]
+    async fn test_httproute_request_header_filter_remove() {
+        // GREEN: Test that HTTPRoute can remove request headers
+        use crate::proxy::filters::RequestHeaderModifier;
+        use crate::proxy::router::Router;
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        let backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 12, 1)),
+            8080,
+            100,
+        )];
+
+        // Create filter that removes sensitive headers before proxying
+        let filter = RequestHeaderModifier::new()
+            .remove("Authorization".to_string())
+            .remove("Cookie".to_string());
+
+        router
+            .add_route_with_filters(HttpMethod::DELETE, "/api/public", backend.clone(), filter)
+            .expect("Should add route with remove filters");
+
+        // Verify filters are attached
+        let route_match = router
+            .select_backend(HttpMethod::DELETE, "/api/public", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.request_filters.is_some(),
+            "Request filters should be attached"
+        );
+
+        let filters = route_match.request_filters.unwrap();
+        assert_eq!(
+            filters.operations.len(),
+            2,
+            "Should have 2 remove operations"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_httproute_response_header_filter_set() {
+        // GREEN: Test that HTTPRoute can set response headers
+        use crate::proxy::filters::ResponseHeaderModifier;
+        use crate::proxy::router::Router;
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        let backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 13, 1)),
+            8080,
+            100,
+        )];
+
+        // Create filter that sets Server header
+        let filter =
+            ResponseHeaderModifier::new().set("Server".to_string(), "RAUTA/1.0".to_string());
+
+        router
+            .add_route_with_response_filters(HttpMethod::GET, "/api/info", backend.clone(), filter)
+            .expect("Should add route with response header filter");
+
+        // Verify filter is attached
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/api/info", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.response_filters.is_some(),
+            "Response filters should be attached"
+        );
+
+        let filters = route_match.response_filters.unwrap();
+        assert_eq!(
+            filters.operations.len(),
+            1,
+            "Should have 1 response filter operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_httproute_response_header_filter_add_cors() {
+        // GREEN: Test that HTTPRoute can add CORS response headers
+        use crate::proxy::filters::ResponseHeaderModifier;
+        use crate::proxy::router::Router;
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        let backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 14, 1)),
+            8080,
+            100,
+        )];
+
+        // Create filter that adds CORS headers
+        let filter = ResponseHeaderModifier::new()
+            .add("Access-Control-Allow-Origin".to_string(), "*".to_string())
+            .add(
+                "Access-Control-Allow-Methods".to_string(),
+                "GET, POST, PUT, DELETE".to_string(),
+            )
+            .add(
+                "Access-Control-Allow-Headers".to_string(),
+                "Content-Type, Authorization".to_string(),
+            );
+
+        router
+            .add_route_with_response_filters(
+                HttpMethod::GET,
+                "/api/public",
+                backend.clone(),
+                filter,
+            )
+            .expect("Should add route with CORS filters");
+
+        // Verify filters are attached
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/api/public", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.response_filters.is_some(),
+            "Response filters should be attached"
+        );
+
+        let filters = route_match.response_filters.unwrap();
+        assert_eq!(
+            filters.operations.len(),
+            3,
+            "Should have 3 CORS header operations"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_httproute_response_header_filter_remove() {
+        // GREEN: Test that HTTPRoute can remove response headers
+        use crate::proxy::filters::ResponseHeaderModifier;
+        use crate::proxy::router::Router;
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        let backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 15, 1)),
+            8080,
+            100,
+        )];
+
+        // Create filter that removes server identification headers
+        let filter = ResponseHeaderModifier::new()
+            .remove("Server".to_string())
+            .remove("X-Powered-By".to_string());
+
+        router
+            .add_route_with_response_filters(
+                HttpMethod::GET,
+                "/api/secure",
+                backend.clone(),
+                filter,
+            )
+            .expect("Should add route with remove filters");
+
+        // Verify filters are attached
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/api/secure", None, None)
+            .expect("Should find backend");
+
+        assert!(
+            route_match.response_filters.is_some(),
+            "Response filters should be attached"
+        );
+
+        let filters = route_match.response_filters.unwrap();
+        assert_eq!(
+            filters.operations.len(),
+            2,
+            "Should have 2 remove operations"
+        );
+    }
 }
 
 // Note: HTTPRoute watcher implementation is planned for Phase 1
