@@ -1937,6 +1937,119 @@ mod tests {
             "Request with required param + extra params should match"
         );
     }
+
+    #[tokio::test]
+    async fn test_httproute_path_match_prefix() {
+        // GREEN: Verify that PathMatchPrefix works (default behavior)
+        use crate::proxy::router::Router;
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        let backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 8, 1)),
+            8080,
+            100,
+        )];
+
+        // Add route with PathPrefix: /api/users
+        router
+            .add_route(HttpMethod::GET, "/api/users", backend.clone())
+            .expect("Should add route");
+
+        // Exact path should match
+        let exact_match = router
+            .select_backend(HttpMethod::GET, "/api/users", None, None)
+            .expect("Exact path should match");
+
+        assert_eq!(
+            exact_match.backend.as_ipv4().unwrap(),
+            Ipv4Addr::new(10, 0, 8, 1),
+            "Exact path /api/users should match"
+        );
+
+        // Prefix paths should also match
+        let prefix_match = router
+            .select_backend(HttpMethod::GET, "/api/users/123", None, None)
+            .expect("Prefix path should match");
+
+        assert_eq!(
+            prefix_match.backend.as_ipv4().unwrap(),
+            Ipv4Addr::new(10, 0, 8, 1),
+            "Prefix path /api/users/123 should match /api/users"
+        );
+
+        // Deeper prefix paths should match
+        let deep_match = router
+            .select_backend(HttpMethod::GET, "/api/users/123/orders/456", None, None)
+            .expect("Deep prefix path should match");
+
+        assert_eq!(
+            deep_match.backend.as_ipv4().unwrap(),
+            Ipv4Addr::new(10, 0, 8, 1),
+            "Deep prefix path should match"
+        );
+
+        // Non-matching path should NOT match
+        let no_match = router.select_backend(HttpMethod::GET, "/api/products", None, None);
+
+        assert!(no_match.is_none(), "Non-matching path should not match");
+    }
+
+    #[tokio::test]
+    async fn test_httproute_path_specificity() {
+        // GREEN: Test that more specific paths take precedence
+        use crate::proxy::router::Router;
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        let general_backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 9, 1)),
+            8080,
+            100,
+        )];
+
+        let specific_backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 9, 2)),
+            8080,
+            100,
+        )];
+
+        // Add general route: /api
+        router
+            .add_route(HttpMethod::GET, "/api", general_backend.clone())
+            .expect("Should add general route");
+
+        // Add more specific route: /api/users
+        router
+            .add_route(HttpMethod::GET, "/api/users", specific_backend.clone())
+            .expect("Should add specific route");
+
+        // Request to /api/users should match the more specific route
+        let specific_match = router
+            .select_backend(HttpMethod::GET, "/api/users", None, None)
+            .expect("Should match specific route");
+
+        assert_eq!(
+            specific_match.backend.as_ipv4().unwrap(),
+            Ipv4Addr::new(10, 0, 9, 2),
+            "/api/users should match specific backend"
+        );
+
+        // Request to /api/products should match the general route
+        let general_match = router
+            .select_backend(HttpMethod::GET, "/api/products", None, None)
+            .expect("Should match general route");
+
+        assert_eq!(
+            general_match.backend.as_ipv4().unwrap(),
+            Ipv4Addr::new(10, 0, 9, 1),
+            "/api/products should match general /api backend"
+        );
+    }
 }
 
 // Note: HTTPRoute watcher implementation is planned for Phase 1
