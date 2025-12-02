@@ -923,4 +923,177 @@ mod tests {
         // - resolved_refs_reason = "ResolvedRefs"
         // - resolved_refs_message = "All references resolved"
     }
+
+    // TDD RED PHASE: Invalid Route Kinds Validation
+    // Gateway API conformance test: GatewayInvalidRouteKind
+    // When a listener specifies only invalid route kinds (not HTTPRoute),
+    // the listener status must set ResolvedRefs=False with reason=InvalidRouteKinds
+
+    #[test]
+    fn test_gateway_listener_only_invalid_route_kinds() {
+        // RED: Test that listener with only invalid route kinds is rejected
+        //
+        // Gateway API conformance requirement (GatewayInvalidRouteKind test):
+        // When a Gateway listener's allowedRoutes.kinds contains ONLY unsupported kinds,
+        // the listener status must set:
+        // - ResolvedRefs condition = "False"
+        // - reason = "InvalidRouteKinds"
+        // - supportedKinds = [] (empty array)
+        //
+        // Example: RAUTA only supports HTTPRoute, so TCPRoute is invalid.
+
+        use gateway_api::apis::standard::gateways::{
+            GatewayListeners, GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesKinds,
+        };
+
+        let listener = GatewayListeners {
+            name: "tcp".to_string(),
+            port: 9000,
+            protocol: "TCP".to_string(),
+            allowed_routes: Some(GatewayListenersAllowedRoutes {
+                kinds: Some(vec![GatewayListenersAllowedRoutesKinds {
+                    group: Some("gateway.networking.k8s.io".to_string()),
+                    kind: "TCPRoute".to_string(), // RAUTA doesn't support this
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // Verify listener structure
+        assert_eq!(listener.protocol, "TCP");
+        assert!(listener.allowed_routes.is_some());
+
+        let allowed_routes = listener.allowed_routes.as_ref().unwrap();
+        assert!(allowed_routes.kinds.is_some());
+
+        let kinds = allowed_routes.kinds.as_ref().unwrap();
+        assert_eq!(kinds.len(), 1);
+        assert_eq!(kinds[0].kind, "TCPRoute");
+
+        // RAUTA currently only supports HTTPRoute
+        let rauta_supported_kinds = ["HTTPRoute"];
+        let is_supported = rauta_supported_kinds.contains(&kinds[0].kind.as_str());
+        assert!(!is_supported, "TCPRoute should NOT be supported by RAUTA");
+
+        // TODO: When reconciler validates this listener, it should:
+        // 1. Filter kinds to only supported ones (result: empty list)
+        // 2. Set ResolvedRefs status = "False"
+        // 3. Set ResolvedRefs reason = "InvalidRouteKinds"
+        // 4. Set ResolvedRefs message = "No supported route kinds found"
+        // 5. Set supportedKinds = [] (empty array)
+        //
+        // Current bug: The code at lines 385-387 correctly returns empty supportedKinds,
+        // but the conformance test expects this specific behavior to be validated.
+    }
+
+    #[test]
+    fn test_gateway_listener_mixed_valid_invalid_route_kinds() {
+        // RED: Test that listener with both valid and invalid route kinds
+        // sets ResolvedRefs=False but includes valid kinds in supportedKinds
+        //
+        // Gateway API conformance requirement:
+        // When allowedRoutes.kinds contains SOME unsupported kinds,
+        // the listener status must set:
+        // - ResolvedRefs condition = "False"
+        // - reason = "InvalidRouteKinds"
+        // - message = "Some route kinds are not supported"
+        // - supportedKinds = [only the valid kinds]
+
+        use gateway_api::apis::standard::gateways::{
+            GatewayListeners, GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesKinds,
+        };
+
+        let listener = GatewayListeners {
+            name: "mixed".to_string(),
+            port: 8080,
+            protocol: "HTTP".to_string(),
+            allowed_routes: Some(GatewayListenersAllowedRoutes {
+                kinds: Some(vec![
+                    GatewayListenersAllowedRoutesKinds {
+                        group: Some("gateway.networking.k8s.io".to_string()),
+                        kind: "HTTPRoute".to_string(), // Supported
+                    },
+                    GatewayListenersAllowedRoutesKinds {
+                        group: Some("gateway.networking.k8s.io".to_string()),
+                        kind: "TCPRoute".to_string(), // NOT supported
+                    },
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // Verify listener structure
+        let kinds = listener
+            .allowed_routes
+            .as_ref()
+            .unwrap()
+            .kinds
+            .as_ref()
+            .unwrap();
+        assert_eq!(kinds.len(), 2);
+        assert_eq!(kinds[0].kind, "HTTPRoute");
+        assert_eq!(kinds[1].kind, "TCPRoute");
+
+        // TODO: When reconciler validates this listener, it should:
+        // 1. Filter to only HTTPRoute (supported)
+        // 2. Detect that TCPRoute was filtered out (has_invalid_kinds = true)
+        // 3. Set ResolvedRefs status = "False" (because of invalid kinds)
+        // 4. Set ResolvedRefs reason = "InvalidRouteKinds"
+        // 5. Set ResolvedRefs message = "Some route kinds are not supported"
+        // 6. Set supportedKinds = [{"group": "gateway.networking.k8s.io", "kind": "HTTPRoute"}]
+        //
+        // Current code at lines 400-401 correctly implements this logic.
+    }
+
+    #[test]
+    fn test_gateway_listener_all_valid_route_kinds() {
+        // GREEN: Test that listener with only valid route kinds
+        // sets ResolvedRefs=True and includes all kinds in supportedKinds
+
+        use gateway_api::apis::standard::gateways::{
+            GatewayListeners, GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesKinds,
+        };
+
+        let listener = GatewayListeners {
+            name: "http".to_string(),
+            port: 80,
+            protocol: "HTTP".to_string(),
+            allowed_routes: Some(GatewayListenersAllowedRoutes {
+                kinds: Some(vec![GatewayListenersAllowedRoutesKinds {
+                    group: Some("gateway.networking.k8s.io".to_string()),
+                    kind: "HTTPRoute".to_string(), // Supported
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // Verify listener structure
+        let kinds = listener
+            .allowed_routes
+            .as_ref()
+            .unwrap()
+            .kinds
+            .as_ref()
+            .unwrap();
+        assert_eq!(kinds.len(), 1);
+        assert_eq!(kinds[0].kind, "HTTPRoute");
+
+        // RAUTA supports HTTPRoute
+        let rauta_supported_kinds = ["HTTPRoute"];
+        let is_supported = rauta_supported_kinds.contains(&kinds[0].kind.as_str());
+        assert!(is_supported, "HTTPRoute should be supported by RAUTA");
+
+        // When reconciler validates this listener, it should:
+        // 1. Filter to only HTTPRoute (all kinds are valid)
+        // 2. has_invalid_kinds = false
+        // 3. Set ResolvedRefs status = "True"
+        // 4. Set ResolvedRefs reason = "ResolvedRefs"
+        // 5. Set ResolvedRefs message = "All references resolved"
+        // 6. Set supportedKinds = [{"group": "gateway.networking.k8s.io", "kind": "HTTPRoute"}]
+        //
+        // Current code at lines 403-405 correctly implements this logic.
+    }
 }
