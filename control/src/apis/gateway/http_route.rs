@@ -2321,6 +2321,178 @@ mod tests {
             "Should have 2 remove operations"
         );
     }
+
+    // Feature 6: HTTPRequestRedirectFilter (Gateway API Core Feature)
+
+    #[tokio::test]
+    async fn test_httproute_redirect_https_upgrade() {
+        // GREEN: Test HTTPRoute with HTTPS upgrade redirect (301)
+        use crate::proxy::filters::{RedirectStatusCode, RequestRedirect};
+        use crate::proxy::router::Router;
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        let backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 16, 1)),
+            8080,
+            100,
+        )];
+
+        // Create redirect filter: HTTP → HTTPS (301 Moved Permanently)
+        let redirect = RequestRedirect::new()
+            .scheme("https".to_string())
+            .status_code(RedirectStatusCode::MovedPermanently);
+
+        router
+            .add_route_with_redirect(
+                HttpMethod::GET,
+                "/secure",
+                backend.clone(),
+                redirect.clone(),
+            )
+            .expect("Should add route with redirect filter");
+
+        // Verify redirect filter is attached
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/secure", None, None)
+            .expect("Should find route");
+
+        assert!(
+            route_match.redirect.is_some(),
+            "Redirect filter should be attached"
+        );
+
+        let redirect_filter = route_match.redirect.unwrap();
+        assert_eq!(
+            redirect_filter.scheme,
+            Some("https".to_string()),
+            "Should redirect to HTTPS"
+        );
+        assert_eq!(
+            redirect_filter.status_code,
+            RedirectStatusCode::MovedPermanently,
+            "Should use 301 status code"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_httproute_redirect_hostname_change() {
+        // GREEN: Test HTTPRoute with hostname redirect (302)
+        use crate::proxy::filters::{RedirectStatusCode, RequestRedirect};
+        use crate::proxy::router::Router;
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        let backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 17, 1)),
+            8080,
+            100,
+        )];
+
+        // Create redirect filter: hostname change (302 Found - default)
+        let redirect = RequestRedirect::new().hostname("new.example.com".to_string());
+
+        router
+            .add_route_with_redirect(HttpMethod::GET, "/moved", backend.clone(), redirect.clone())
+            .expect("Should add route with redirect filter");
+
+        // Verify redirect filter is attached
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/moved", None, None)
+            .expect("Should find route");
+
+        assert!(
+            route_match.redirect.is_some(),
+            "Redirect filter should be attached"
+        );
+
+        let redirect_filter = route_match.redirect.unwrap();
+        assert_eq!(
+            redirect_filter.hostname,
+            Some("new.example.com".to_string()),
+            "Should redirect to new.example.com"
+        );
+        assert_eq!(
+            redirect_filter.status_code,
+            RedirectStatusCode::Found,
+            "Should use 302 status code (default)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_httproute_redirect_full_url() {
+        // GREEN: Test HTTPRoute with complete URL redirect
+        use crate::proxy::filters::{RedirectStatusCode, RequestRedirect};
+        use crate::proxy::router::Router;
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        let backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 18, 1)),
+            8080,
+            100,
+        )];
+
+        // Create redirect filter: complete URL (scheme + hostname + port + path)
+        let redirect = RequestRedirect::new()
+            .scheme("https".to_string())
+            .hostname("api.example.com".to_string())
+            .port(8443)
+            .path("/v2/api".to_string())
+            .status_code(RedirectStatusCode::MovedPermanently);
+
+        router
+            .add_route_with_redirect(
+                HttpMethod::GET,
+                "/api/v1",
+                backend.clone(),
+                redirect.clone(),
+            )
+            .expect("Should add route with redirect filter");
+
+        // Verify redirect filter is attached with all components
+        let route_match = router
+            .select_backend(HttpMethod::GET, "/api/v1", None, None)
+            .expect("Should find route");
+
+        assert!(
+            route_match.redirect.is_some(),
+            "Redirect filter should be attached"
+        );
+
+        let redirect_filter = route_match.redirect.unwrap();
+        assert_eq!(
+            redirect_filter.scheme,
+            Some("https".to_string()),
+            "Should redirect to HTTPS"
+        );
+        assert_eq!(
+            redirect_filter.hostname,
+            Some("api.example.com".to_string()),
+            "Should redirect to api.example.com"
+        );
+        assert_eq!(
+            redirect_filter.port,
+            Some(8443),
+            "Should redirect to port 8443"
+        );
+        assert_eq!(
+            redirect_filter.path,
+            Some("/v2/api".to_string()),
+            "Should redirect to /v2/api"
+        );
+        assert_eq!(
+            redirect_filter.status_code,
+            RedirectStatusCode::MovedPermanently,
+            "Should use 301 status code"
+        );
+    }
 }
 
 // Note: HTTPRoute watcher implementation is planned for Phase 1
