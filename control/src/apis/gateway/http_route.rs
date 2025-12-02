@@ -1528,6 +1528,216 @@ mod tests {
 
         assert!(post_result.is_some(), "POST request should succeed");
     }
+
+    #[tokio::test]
+    async fn test_httproute_header_matching_exact() {
+        // RED: Test that requests with specific headers route correctly
+        use crate::proxy::router::{HeaderMatch, HeaderMatchType, Router};
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        // Backend for route with header constraint
+        let v2_backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 2, 1)),
+            8080,
+            100,
+        )];
+
+        // Add route with X-API-Version: v2 header constraint
+        let v2_headers = vec![HeaderMatch {
+            name: "X-API-Version".to_string(),
+            value: "v2".to_string(),
+            match_type: HeaderMatchType::Exact,
+        }];
+        router
+            .add_route_with_headers(
+                HttpMethod::GET,
+                "/api/v2/users",
+                v2_backend.clone(),
+                v2_headers,
+            )
+            .expect("Should add v2 route");
+
+        // Test request with matching header
+        let v2_req_headers = vec![("X-API-Version", "v2")];
+        let v2_match = router
+            .select_backend_with_headers(
+                HttpMethod::GET,
+                "/api/v2/users",
+                v2_req_headers,
+                None,
+                None,
+            )
+            .expect("Should find v2 backend");
+
+        assert_eq!(
+            v2_match.backend.as_ipv4().unwrap(),
+            Ipv4Addr::new(10, 0, 2, 1),
+            "Request with X-API-Version: v2 should route to v2 backend"
+        );
+
+        // Test request with non-matching header (should fail)
+        let wrong_headers = vec![("X-API-Version", "v1")];
+        let no_match = router.select_backend_with_headers(
+            HttpMethod::GET,
+            "/api/v2/users",
+            wrong_headers,
+            None,
+            None,
+        );
+
+        assert!(
+            no_match.is_none(),
+            "Request with wrong header value should not match"
+        );
+
+        // Test request with no headers (should fail)
+        let empty_headers = vec![];
+        let no_headers_match = router.select_backend_with_headers(
+            HttpMethod::GET,
+            "/api/v2/users",
+            empty_headers,
+            None,
+            None,
+        );
+
+        assert!(
+            no_headers_match.is_none(),
+            "Request with no headers should not match route with header constraints"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_httproute_header_matching_multiple_headers() {
+        // RED: Test matching multiple headers
+        use crate::proxy::router::{HeaderMatch, HeaderMatchType, Router};
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        let backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 3, 1)),
+            8080,
+            100,
+        )];
+
+        // Add route requiring both X-API-Version: v2 AND X-Client-Type: mobile
+        let required_headers = vec![
+            HeaderMatch {
+                name: "X-API-Version".to_string(),
+                value: "v2".to_string(),
+                match_type: HeaderMatchType::Exact,
+            },
+            HeaderMatch {
+                name: "X-Client-Type".to_string(),
+                value: "mobile".to_string(),
+                match_type: HeaderMatchType::Exact,
+            },
+        ];
+
+        router
+            .add_route_with_headers(
+                HttpMethod::GET,
+                "/api/mobile",
+                backend.clone(),
+                required_headers,
+            )
+            .expect("Should add route");
+
+        // Request with both headers should match
+        let matching_headers = vec![("X-API-Version", "v2"), ("X-Client-Type", "mobile")];
+
+        let match_result = router.select_backend_with_headers(
+            HttpMethod::GET,
+            "/api/mobile",
+            matching_headers,
+            None,
+            None,
+        );
+
+        assert!(
+            match_result.is_some(),
+            "Request with all required headers should match"
+        );
+
+        // Request with only one header should NOT match
+        let partial_headers = vec![("X-API-Version", "v2")];
+
+        let no_match = router.select_backend_with_headers(
+            HttpMethod::GET,
+            "/api/mobile",
+            partial_headers,
+            None,
+            None,
+        );
+
+        assert!(
+            no_match.is_none(),
+            "Request missing required headers should not match"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_httproute_header_case_insensitive() {
+        // RED: Test that header names are case-insensitive (per HTTP spec)
+        use crate::proxy::router::{HeaderMatch, HeaderMatchType, Router};
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        let backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 4, 1)),
+            8080,
+            100,
+        )];
+
+        // Add route with lowercase header name
+        let route_headers = vec![HeaderMatch {
+            name: "x-api-version".to_string(),
+            value: "v3".to_string(),
+            match_type: HeaderMatchType::Exact,
+        }];
+
+        router
+            .add_route_with_headers(HttpMethod::GET, "/api/test", backend.clone(), route_headers)
+            .expect("Should add route");
+
+        // Request with uppercase header name should match
+        let req_headers = vec![("X-API-VERSION", "v3")];
+
+        let match_result = router.select_backend_with_headers(
+            HttpMethod::GET,
+            "/api/test",
+            req_headers,
+            None,
+            None,
+        );
+
+        assert!(
+            match_result.is_some(),
+            "Header names should be case-insensitive"
+        );
+
+        // Mixed case should also match
+        let mixed_headers = vec![("X-Api-Version", "v3")];
+
+        let mixed_match = router.select_backend_with_headers(
+            HttpMethod::GET,
+            "/api/test",
+            mixed_headers,
+            None,
+            None,
+        );
+
+        assert!(
+            mixed_match.is_some(),
+            "Header names with mixed case should match"
+        );
+    }
 }
 
 // Note: HTTPRoute watcher implementation is planned for Phase 1
