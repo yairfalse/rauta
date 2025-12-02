@@ -1738,6 +1738,205 @@ mod tests {
             "Header names with mixed case should match"
         );
     }
+
+    #[tokio::test]
+    async fn test_httproute_query_param_matching_exact() {
+        // RED: Test that requests with specific query parameters route correctly
+        use crate::proxy::router::{QueryParamMatch, QueryParamMatchType, Router};
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        // Backend for route with query param constraint
+        let versioned_backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 5, 1)),
+            8080,
+            100,
+        )];
+
+        // Add route with version=2 query param constraint
+        let query_params = vec![QueryParamMatch {
+            name: "version".to_string(),
+            value: "2".to_string(),
+            match_type: QueryParamMatchType::Exact,
+        }];
+        router
+            .add_route_with_query_params(
+                HttpMethod::GET,
+                "/api/search",
+                versioned_backend.clone(),
+                query_params,
+            )
+            .expect("Should add route with query params");
+
+        // Test request with matching query param
+        let matching_params = vec![("version", "2")];
+        let match_result = router
+            .select_backend_with_query_params(
+                HttpMethod::GET,
+                "/api/search",
+                matching_params,
+                None,
+                None,
+            )
+            .expect("Should find backend");
+
+        assert_eq!(
+            match_result.backend.as_ipv4().unwrap(),
+            Ipv4Addr::new(10, 0, 5, 1),
+            "Request with version=2 should route to versioned backend"
+        );
+
+        // Test request with non-matching query param value (should fail)
+        let wrong_params = vec![("version", "1")];
+        let no_match = router.select_backend_with_query_params(
+            HttpMethod::GET,
+            "/api/search",
+            wrong_params,
+            None,
+            None,
+        );
+
+        assert!(
+            no_match.is_none(),
+            "Request with wrong query param value should not match"
+        );
+
+        // Test request with no query params (should fail)
+        let empty_params = vec![];
+        let no_params_match = router.select_backend_with_query_params(
+            HttpMethod::GET,
+            "/api/search",
+            empty_params,
+            None,
+            None,
+        );
+
+        assert!(
+            no_params_match.is_none(),
+            "Request with no query params should not match route with query param constraints"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_httproute_query_param_matching_multiple() {
+        // RED: Test matching multiple query parameters (AND logic)
+        use crate::proxy::router::{QueryParamMatch, QueryParamMatchType, Router};
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        let backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 6, 1)),
+            8080,
+            100,
+        )];
+
+        // Add route requiring both version=2 AND format=json
+        let required_params = vec![
+            QueryParamMatch {
+                name: "version".to_string(),
+                value: "2".to_string(),
+                match_type: QueryParamMatchType::Exact,
+            },
+            QueryParamMatch {
+                name: "format".to_string(),
+                value: "json".to_string(),
+                match_type: QueryParamMatchType::Exact,
+            },
+        ];
+
+        router
+            .add_route_with_query_params(
+                HttpMethod::GET,
+                "/api/data",
+                backend.clone(),
+                required_params,
+            )
+            .expect("Should add route");
+
+        // Request with both params should match
+        let matching_params = vec![("version", "2"), ("format", "json")];
+
+        let match_result = router.select_backend_with_query_params(
+            HttpMethod::GET,
+            "/api/data",
+            matching_params,
+            None,
+            None,
+        );
+
+        assert!(
+            match_result.is_some(),
+            "Request with all required query params should match"
+        );
+
+        // Request with only one param should NOT match
+        let partial_params = vec![("version", "2")];
+
+        let no_match = router.select_backend_with_query_params(
+            HttpMethod::GET,
+            "/api/data",
+            partial_params,
+            None,
+            None,
+        );
+
+        assert!(
+            no_match.is_none(),
+            "Request missing required query params should not match"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_httproute_query_param_extra_params_allowed() {
+        // RED: Test that extra query params don't prevent matching
+        use crate::proxy::router::{QueryParamMatch, QueryParamMatchType, Router};
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        let backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 7, 1)),
+            8080,
+            100,
+        )];
+
+        // Add route requiring only version=2
+        let required_params = vec![QueryParamMatch {
+            name: "version".to_string(),
+            value: "2".to_string(),
+            match_type: QueryParamMatchType::Exact,
+        }];
+
+        router
+            .add_route_with_query_params(
+                HttpMethod::GET,
+                "/api/items",
+                backend.clone(),
+                required_params,
+            )
+            .expect("Should add route");
+
+        // Request with version=2 PLUS extra params should still match
+        let params_with_extra = vec![("version", "2"), ("limit", "10"), ("offset", "0")];
+
+        let match_result = router.select_backend_with_query_params(
+            HttpMethod::GET,
+            "/api/items",
+            params_with_extra,
+            None,
+            None,
+        );
+
+        assert!(
+            match_result.is_some(),
+            "Request with required param + extra params should match"
+        );
+    }
 }
 
 // Note: HTTPRoute watcher implementation is planned for Phase 1
