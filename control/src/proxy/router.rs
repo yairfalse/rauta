@@ -363,16 +363,39 @@ impl Router {
             for (route_key, route) in routes.iter() {
                 let path_str = route.pattern.as_ref();
 
+                // Make path unique per HTTP method by prepending method
+                // This allows POST /api and GET /api to coexist
+                let method_prefix = match route_key.method {
+                    HttpMethod::GET => "GET:",
+                    HttpMethod::POST => "POST:",
+                    HttpMethod::PUT => "PUT:",
+                    HttpMethod::DELETE => "DELETE:",
+                    HttpMethod::PATCH => "PATCH:",
+                    HttpMethod::HEAD => "HEAD:",
+                    HttpMethod::OPTIONS => "OPTIONS:",
+                    HttpMethod::ALL => "",
+                };
+
+                let method_prefixed_path = if method_prefix.is_empty() {
+                    path_str.to_string()
+                } else {
+                    format!("{}{}", method_prefix, path_str)
+                };
+
                 // Add exact path
                 new_prefix_router
-                    .insert(path_str.to_string(), *route_key)
+                    .insert(method_prefixed_path.clone(), *route_key)
                     .map_err(|e| format!("Failed to add exact route {}: {}", path_str, e))?;
 
                 // Add prefix wildcard (matchit syntax: {*rest})
                 let prefix_pattern = if path_str == "/" {
-                    "/{*rest}".to_string()
+                    format!("{}{{*rest}}", method_prefix)
                 } else {
-                    format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
+                    format!(
+                        "{}{}/{{*rest}}",
+                        method_prefix,
+                        path_str.trim_end_matches('/')
+                    )
                 };
 
                 new_prefix_router
@@ -471,8 +494,37 @@ impl Router {
                 Some(key)
             } else {
                 // Prefix match via matchit
+                // Prepend method to path for method-aware routing
+                let method_prefix = match method {
+                    HttpMethod::GET => "GET:",
+                    HttpMethod::POST => "POST:",
+                    HttpMethod::PUT => "PUT:",
+                    HttpMethod::DELETE => "DELETE:",
+                    HttpMethod::PATCH => "PATCH:",
+                    HttpMethod::HEAD => "HEAD:",
+                    HttpMethod::OPTIONS => "OPTIONS:",
+                    HttpMethod::ALL => "",
+                };
+
+                let method_prefixed_path = if method_prefix.is_empty() {
+                    path.to_string()
+                } else {
+                    format!("{}{}", method_prefix, path)
+                };
+
                 let prefix_router = safe_read(&self.prefix_router);
-                prefix_router.at(path).ok().map(|m| *m.value)
+                let found_key = prefix_router
+                    .at(&method_prefixed_path)
+                    .ok()
+                    .map(|m| *m.value);
+
+                // If no match with specific method, try HttpMethod::ALL (wildcard)
+                // This implements Gateway API behavior: routes without method constraints match all methods
+                if found_key.is_none() && method != HttpMethod::ALL {
+                    prefix_router.at(path).ok().map(|m| *m.value)
+                } else {
+                    found_key
+                }
             }
         }?;
 
