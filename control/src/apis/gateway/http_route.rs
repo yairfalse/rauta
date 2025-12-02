@@ -1373,6 +1373,161 @@ mod tests {
             "Header with newline should be rejected"
         );
     }
+
+    // TDD RED PHASE: HTTP Method Matching Tests
+    //
+    // These tests document the expected behavior for HTTP method matching
+    // according to Gateway API v1 spec. Currently RAUTA hardcodes all routes
+    // to HttpMethod::GET, which is incorrect.
+    //
+    // Gateway API spec requirement:
+    // HTTPRoute.spec.rules[].matches[].method allows filtering by HTTP method.
+    // When omitted, all methods match. When specified, only requests with that
+    // method should be routed to the backends.
+
+    #[tokio::test]
+    async fn test_httproute_method_matching_post() {
+        // RED: Test that POST requests route to POST-only backend
+        //
+        // Create HTTPRoute that routes POST /api/users to backend-post
+        // and GET /api/users to backend-get. Verify router correctly
+        // handles method-based routing.
+
+        use crate::proxy::router::Router;
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        // Backend for POST requests
+        let post_backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+
+        // Backend for GET requests
+        let get_backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 2)),
+            8080,
+            100,
+        )];
+
+        // Add routes with method-specific backends
+        router
+            .add_route(HttpMethod::POST, "/api/users", post_backend.clone())
+            .expect("Should add POST route");
+
+        router
+            .add_route(HttpMethod::GET, "/api/users", get_backend.clone())
+            .expect("Should add GET route");
+
+        // Test POST request routes to POST backend
+        let post_match = router
+            .select_backend(HttpMethod::POST, "/api/users", None, None)
+            .expect("Should find POST backend");
+
+        assert_eq!(
+            post_match.backend.as_ipv4().unwrap(),
+            Ipv4Addr::new(10, 0, 1, 1),
+            "POST request should route to POST backend (10.0.1.1)"
+        );
+
+        // Test GET request routes to GET backend
+        let get_match = router
+            .select_backend(HttpMethod::GET, "/api/users", None, None)
+            .expect("Should find GET backend");
+
+        assert_eq!(
+            get_match.backend.as_ipv4().unwrap(),
+            Ipv4Addr::new(10, 0, 1, 2),
+            "GET request should route to GET backend (10.0.1.2)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_httproute_method_matching_all_methods() {
+        // RED: Test support for all HTTP methods
+        //
+        // Gateway API spec supports: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS
+        // Verify router can handle all of them
+
+        use crate::proxy::router::Router;
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        // Create backends for each method (using different IPs)
+        let methods_and_ips = vec![
+            (HttpMethod::GET, Ipv4Addr::new(10, 0, 1, 1)),
+            (HttpMethod::POST, Ipv4Addr::new(10, 0, 1, 2)),
+            (HttpMethod::PUT, Ipv4Addr::new(10, 0, 1, 3)),
+            (HttpMethod::DELETE, Ipv4Addr::new(10, 0, 1, 4)),
+            (HttpMethod::PATCH, Ipv4Addr::new(10, 0, 1, 5)),
+            (HttpMethod::HEAD, Ipv4Addr::new(10, 0, 1, 6)),
+            (HttpMethod::OPTIONS, Ipv4Addr::new(10, 0, 1, 7)),
+        ];
+
+        // Add route for each method
+        for (method, ip) in &methods_and_ips {
+            let backend = vec![Backend::new(u32::from(*ip), 8080, 100)];
+            router
+                .add_route(*method, "/api/resource", backend)
+                .unwrap_or_else(|_| panic!("Should add {:?} route", method));
+        }
+
+        // Verify each method routes to correct backend
+        for (method, expected_ip) in &methods_and_ips {
+            let route_match = router
+                .select_backend(*method, "/api/resource", None, None)
+                .unwrap_or_else(|| panic!("Should find {:?} backend", method));
+
+            assert_eq!(
+                route_match.backend.as_ipv4().unwrap(),
+                *expected_ip,
+                "{:?} request should route to correct backend",
+                method
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_httproute_method_mismatch_returns_404() {
+        // RED: Test that method mismatch returns None (404)
+        //
+        // If HTTPRoute only configures POST /api/users, then
+        // GET /api/users should return None (resulting in 404)
+
+        use crate::proxy::router::Router;
+        use common::{Backend, HttpMethod};
+        use std::net::Ipv4Addr;
+
+        let router = Router::new();
+
+        // Only add POST route
+        let backend = vec![Backend::new(
+            u32::from(Ipv4Addr::new(10, 0, 1, 1)),
+            8080,
+            100,
+        )];
+        router
+            .add_route(HttpMethod::POST, "/api/users", backend)
+            .expect("Should add POST route");
+
+        // GET request should return None (no matching route)
+        let get_result = router.select_backend(HttpMethod::GET, "/api/users", None, None);
+
+        assert!(
+            get_result.is_none(),
+            "GET request should fail (no GET route configured)"
+        );
+
+        // POST request should succeed
+        let post_result = router.select_backend(HttpMethod::POST, "/api/users", None, None);
+
+        assert!(post_result.is_some(), "POST request should succeed");
+    }
 }
 
 // Note: HTTPRoute watcher implementation is planned for Phase 1
