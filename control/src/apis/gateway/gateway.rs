@@ -358,6 +358,16 @@ impl GatewayReconciler {
                     // RAUTA currently only supports HTTPRoute
                     let rauta_supported_kinds = ["HTTPRoute"];
 
+                    // Debug logging for troubleshooting conformance tests
+                    debug!(
+                        "Gateway {}/{} listener '{}': allowed_routes present={}, kinds={:?}",
+                        namespace,
+                        name,
+                        listener.name,
+                        listener.allowed_routes.is_some(),
+                        listener.allowed_routes.as_ref().and_then(|ar| ar.kinds.as_ref().map(|k| k.len()))
+                    );
+
                     // If TLS validation failed, skip route kinds validation
                     let (resolved_refs_status, resolved_refs_reason, resolved_refs_message, supported_kinds) =
                         if tls_validation.0 == "False" {
@@ -1095,5 +1105,73 @@ mod tests {
         // 6. Set supportedKinds = [{"group": "gateway.networking.k8s.io", "kind": "HTTPRoute"}]
         //
         // Current code at lines 403-405 correctly implements this logic.
+    }
+
+    #[test]
+    fn test_parse_gateway_with_invalid_route_kind() {
+        // DEBUG: Test if gateway-api crate can parse allowedRoutes.kinds
+        // NOTE: Conformance test YAML has NO GROUP field (relies on default)
+        let yaml = r#"
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: test-invalid-kinds
+  namespace: default
+spec:
+  gatewayClassName: rauta
+  listeners:
+  - allowedRoutes:
+      kinds:
+      - kind: InvalidRoute
+    name: http
+    port: 80
+    protocol: HTTP
+"#;
+
+        let gateway: Result<Gateway, _> = serde_yaml::from_str(yaml);
+        match gateway {
+            Ok(g) => {
+                println!("✅ Parsed successfully!");
+                if let Some(listener) = g.spec.listeners.first() {
+                    println!("Listener: {}", listener.name);
+                    println!(
+                        "  allowed_routes present: {}",
+                        listener.allowed_routes.is_some()
+                    );
+                    if let Some(ar) = &listener.allowed_routes {
+                        println!("  kinds present: {}", ar.kinds.is_some());
+                        if let Some(kinds) = &ar.kinds {
+                            println!("  kinds count: {}", kinds.len());
+                            for k in kinds {
+                                println!("    - group: {:?}, kind: {}", k.group, k.kind);
+                            }
+
+                            // Test the validation logic
+                            let rauta_supported_kinds = ["HTTPRoute"];
+                            let valid_kinds: Vec<_> = kinds
+                                .iter()
+                                .filter(|k| rauta_supported_kinds.contains(&k.kind.as_str()))
+                                .collect();
+                            println!("  valid_kinds count: {}", valid_kinds.len());
+                            println!("  Should return: ResolvedRefs=False, supportedKinds=[]");
+
+                            assert_eq!(
+                                valid_kinds.len(),
+                                0,
+                                "Should have 0 valid kinds for InvalidRoute"
+                            );
+                        } else {
+                            println!("  ❌ kinds is None!");
+                        }
+                    } else {
+                        println!("  ❌ allowed_routes is None!");
+                    }
+                }
+            }
+            Err(e) => {
+                println!("❌ Parse error: {}", e);
+                panic!("Failed to parse Gateway YAML");
+            }
+        }
     }
 }
