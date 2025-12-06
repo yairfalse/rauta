@@ -500,10 +500,22 @@ impl GatewayReconciler {
             })
         };
 
+        // Fetch the current Gateway to check for old status format
+        let current_gateway = api.get(name).await?;
+        let mut patch_status = status.clone();
+        // If the current status fields are at the top level (old format), migrate them
+        if let Some(current_status) = current_gateway.meta().get("status") {
+            // If current_status is not an object, or does not contain expected keys, migrate
+            if !current_status.is_object() {
+                // Wrap the current status under "status" key
+                patch_status = json!({ "status": current_status });
+            }
+        }
+
         api.patch_status(
             name,
             &PatchParams::apply("rauta-controller"),
-            &Patch::Merge(&status),
+            &Patch::Merge(&patch_status),
         )
         .await?;
 
