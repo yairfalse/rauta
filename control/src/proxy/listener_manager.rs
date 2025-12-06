@@ -486,7 +486,9 @@ impl ListenerManager {
         let backend_path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
         let backend_uri = format!("http://{}{}", backend_addr, backend_path);
 
-        // Collect incoming body (required for pooled client)
+        // Collect incoming body into memory for the pooled client.
+        // NOTE: This buffers the entire request body, which is fine for typical API
+        // requests but may need streaming support for large file uploads in the future.
         let (parts, body) = req.into_parts();
         let body_bytes = match body.collect().await {
             Ok(collected) => collected.to_bytes(),
@@ -519,11 +521,16 @@ impl ListenerManager {
                 || name_str == "trailer"
                 || name_str == "transfer-encoding"
                 || name_str == "upgrade"
+                || name_str == "host"
+            // Host is set separately for the backend
             {
                 continue;
             }
             backend_req = backend_req.header(name, value);
         }
+
+        // Set Host header to backend address for proper routing
+        backend_req = backend_req.header("host", backend_addr.to_string());
 
         // Build request with body
         #[allow(clippy::expect_used)]

@@ -9,7 +9,9 @@
 //! - Idle connection cleanup
 //! - Configurable pool size
 
-// Allow dead_code during TDD development - will be used by listener_manager
+// Allow dead_code - this module provides a generic connection pool implementation
+// for testing and future use. The listener_manager currently uses hyper_util's
+// built-in Client pooling, but this can be used for custom pooling scenarios.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
