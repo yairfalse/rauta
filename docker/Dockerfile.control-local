@@ -22,7 +22,7 @@ COPY control ./control
 RUN cargo build --release --package control
 
 # Runtime image (must match builder's glibc version)
-FROM debian:trixie-slim
+FROM debian:bookworm-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
