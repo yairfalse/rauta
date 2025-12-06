@@ -811,4 +811,125 @@ mod tests {
         assert_eq!(listeners.len(), 1);
         assert_eq!(listeners[0].2, 1, "Should still have only 1 Gateway");
     }
+
+    #[tokio::test]
+    async fn test_http2_backend_connection_reuse() {
+        // RED: Test HTTP/2 connection multiplexing to backends
+        //
+        // This test verifies:
+        // 1. ListenerManager uses HTTP/2 to connect to backends that support it
+        // 2. Multiple requests reuse the same connection (multiplexing)
+        // 3. Connection count stays at 1 even with 5 concurrent requests
+
+        use hyper::server::conn::http2;
+        use hyper::service::service_fn;
+        use std::net::Ipv4Addr;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        // Track number of connections accepted by backend
+        let connection_count = StdArc::new(AtomicUsize::new(0));
+        let connection_count_clone = connection_count.clone();
+
+        // Start HTTP/2 backend server
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = backend_listener.accept().await.unwrap();
+                connection_count_clone.fetch_add(1, Ordering::SeqCst);
+
+                let io = TokioIo::new(stream);
+                let service = service_fn(|_req: Request<hyper::body::Incoming>| async move {
+                    Ok::<_, hyper::Error>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::from("Hello from HTTP/2 backend")))
+                            .unwrap(),
+                    )
+                });
+
+                tokio::spawn(async move {
+                    let _ = http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(io, service)
+                        .await;
+                });
+            }
+        });
+
+        // Give backend time to start
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Create router with route to HTTP/2 backend
+        let router = Arc::new(Router::new());
+        let backends = vec![common::Backend::from_ipv4(
+            Ipv4Addr::new(127, 0, 0, 1),
+            backend_addr.port(),
+            100,
+        )];
+        router
+            .add_route(common::HttpMethod::GET, "/api", backends)
+            .unwrap();
+
+        let manager = create_test_manager(router);
+
+        // Mark backend as HTTP/2 (this method should exist after implementation)
+        manager
+            .set_backend_protocol_http2("127.0.0.1", backend_addr.port())
+            .await;
+
+        let config = ListenerConfig {
+            port: 0,
+            protocol: Protocol::HTTP,
+        };
+
+        let gateway = GatewayRef {
+            namespace: "default".to_string(),
+            name: "test-gateway".to_string(),
+            listener_name: "http".to_string(),
+            hostname: None,
+        };
+
+        manager
+            .register_gateway(config, gateway)
+            .await
+            .expect("Should register gateway");
+
+        let listeners = manager.list_listeners().await;
+        let proxy_port = listeners[0].0;
+
+        // Create HTTP client to connect to proxy
+        let client = reqwest::Client::new();
+
+        // Send 5 concurrent requests through proxy
+        let mut handles = vec![];
+        for _ in 0..5 {
+            let client = client.clone();
+            let proxy_port = proxy_port;
+            handles.push(tokio::spawn(async move {
+                client
+                    .get(format!("http://127.0.0.1:{}/api/test", proxy_port))
+                    .header("Host", "localhost")
+                    .send()
+                    .await
+            }));
+        }
+
+        // Wait for all requests to complete
+        for handle in handles {
+            let response = handle.await.unwrap().expect("Request should succeed");
+            assert_eq!(response.status(), 200);
+            let body = response.text().await.unwrap();
+            assert_eq!(body, "Hello from HTTP/2 backend");
+        }
+
+        // HTTP/2 multiplexing should result in only 1 connection
+        let final_connection_count = connection_count.load(Ordering::SeqCst);
+        assert_eq!(
+            final_connection_count, 1,
+            "HTTP/2 should multiplex all requests on single connection, got {} connections",
+            final_connection_count
+        );
+    }
 }
