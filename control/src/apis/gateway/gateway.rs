@@ -1151,40 +1151,21 @@ spec:
         let gateway: Result<Gateway, _> = serde_yaml::from_str(yaml);
         match gateway {
             Ok(g) => {
-                println!("✅ Parsed successfully!");
                 if let Some(listener) = g.spec.listeners.first() {
-                    println!("Listener: {}", listener.name);
-                    println!(
-                        "  allowed_routes present: {}",
-                        listener.allowed_routes.is_some()
-                    );
                     if let Some(ar) = &listener.allowed_routes {
-                        println!("  kinds present: {}", ar.kinds.is_some());
                         if let Some(kinds) = &ar.kinds {
-                            println!("  kinds count: {}", kinds.len());
-                            for k in kinds {
-                                println!("    - group: {:?}, kind: {}", k.group, k.kind);
-                            }
-
                             // Test the validation logic
                             let rauta_supported_kinds = ["HTTPRoute"];
                             let valid_kinds: Vec<_> = kinds
                                 .iter()
                                 .filter(|k| rauta_supported_kinds.contains(&k.kind.as_str()))
                                 .collect();
-                            println!("  valid_kinds count: {}", valid_kinds.len());
-                            println!("  Should return: ResolvedRefs=False, supportedKinds=[]");
-
                             assert_eq!(
                                 valid_kinds.len(),
                                 0,
                                 "Should have 0 valid kinds for InvalidRoute"
                             );
-                        } else {
-                            println!("  ❌ kinds is None!");
                         }
-                    } else {
-                        println!("  ❌ allowed_routes is None!");
                     }
                 }
             }
