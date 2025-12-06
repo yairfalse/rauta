@@ -12,15 +12,23 @@
 //! - Reference counting: listener shutdown when last Gateway removed
 
 use crate::proxy::router::Router;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
+
+/// HTTP client type with connection pooling
+type PooledClient = Client<HttpConnector, Full<Bytes>>;
 
 /// Listener protocol
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -78,6 +86,8 @@ pub struct ListenerManager {
     rate_limiter: Arc<crate::proxy::rate_limiter::RateLimiter>,
     /// Circuit breaker for backend health management
     circuit_breaker: Arc<crate::proxy::circuit_breaker::CircuitBreakerManager>,
+    /// HTTP/1.1 client with connection pooling
+    http_client: PooledClient,
 }
 
 #[allow(dead_code)] // Methods used in Gateway reconciliation and tests
@@ -88,11 +98,20 @@ impl ListenerManager {
         rate_limiter: Arc<crate::proxy::rate_limiter::RateLimiter>,
         circuit_breaker: Arc<crate::proxy::circuit_breaker::CircuitBreakerManager>,
     ) -> Self {
+        // Create HTTP client with connection pooling
+        // - pool_max_idle_per_host: Max idle connections per backend (16 is hyper default)
+        // - pool_idle_timeout: How long idle connections stay in pool
+        let http_client = Client::builder(TokioExecutor::new())
+            .pool_max_idle_per_host(16)
+            .pool_idle_timeout(Duration::from_secs(60))
+            .build_http();
+
         Self {
             listeners: Arc::new(RwLock::new(HashMap::new())),
             router,
             rate_limiter,
             circuit_breaker,
+            http_client,
         }
     }
 
@@ -228,6 +247,7 @@ impl ListenerManager {
         let router = self.router.clone();
         let rate_limiter = self.rate_limiter.clone();
         let circuit_breaker = self.circuit_breaker.clone();
+        let http_client = self.http_client.clone();
         let bind_addr = config.bind_addr();
         let protocol = config.protocol.clone();
 
@@ -249,6 +269,7 @@ impl ListenerManager {
                                 let router = router.clone();
                                 let rate_limiter = rate_limiter.clone();
                                 let circuit_breaker = circuit_breaker.clone();
+                                let http_client = http_client.clone();
                                 let protocol = protocol.clone();
 
                                 // Spawn connection handler
@@ -260,8 +281,9 @@ impl ListenerManager {
                                         let router = router.clone();
                                         let rate_limiter = rate_limiter.clone();
                                         let circuit_breaker = circuit_breaker.clone();
+                                        let http_client = http_client.clone();
                                         async move {
-                                            Self::handle_request(req, router, rate_limiter, circuit_breaker).await
+                                            Self::handle_request(req, router, rate_limiter, circuit_breaker, http_client).await
                                         }
                                     });
 
@@ -314,13 +336,11 @@ impl ListenerManager {
         router: Arc<Router>,
         rate_limiter: Arc<crate::proxy::rate_limiter::RateLimiter>,
         circuit_breaker: Arc<crate::proxy::circuit_breaker::CircuitBreakerManager>,
+        http_client: PooledClient,
     ) -> Result<
         Response<http_body_util::combinators::BoxBody<hyper::body::Bytes, std::io::Error>>,
         hyper::Error,
     > {
-        use http_body_util::{BodyExt, Full};
-        use hyper::body::Bytes;
-
         let method = req.method().clone();
         let uri = req.uri().clone();
         let path = uri.path();
@@ -462,62 +482,69 @@ impl ListenerManager {
 
         debug!("Proxying {} {} to {}", method, path, backend_addr);
 
-        // Connect to backend
-        let stream = match tokio::net::TcpStream::connect(backend_addr).await {
-            Ok(s) => s,
+        // Build backend URI
+        let backend_path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+        let backend_uri = format!("http://{}{}", backend_addr, backend_path);
+
+        // Collect incoming body into memory for the pooled client.
+        // NOTE: This buffers the entire request body, which is fine for typical API
+        // requests but may need streaming support for large file uploads in the future.
+        let (parts, body) = req.into_parts();
+        let body_bytes = match body.collect().await {
+            Ok(collected) => collected.to_bytes(),
             Err(e) => {
-                error!("Failed to connect to backend {}: {}", backend_addr, e);
-                // Response builder with static values should never fail
+                error!("Failed to read request body: {}", e);
                 #[allow(clippy::expect_used)]
                 return Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
+                    .status(StatusCode::BAD_REQUEST)
                     .body(
-                        Full::new(Bytes::from("Bad Gateway"))
+                        Full::new(Bytes::from("Bad Request: Failed to read body"))
                             .map_err(std::io::Error::other)
                             .boxed(),
                     )
-                    .expect("Building 502 response should never fail"));
+                    .expect("Building 400 response should never fail"));
             }
         };
 
-        let io = TokioIo::new(stream);
+        // Build backend request with original headers and method
+        let mut backend_req = Request::builder().method(parts.method).uri(&backend_uri);
 
-        // Create HTTP/1.1 connection to backend
-        // NOTE: Using HTTP/1.1 for simplicity in ListenerManager (TLS validation use case)
-        // For production HTTP/2 support, see ProxyServer in server.rs which has full
-        // protocol detection, connection pooling, and HTTP/2 multiplexing
-        let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Failed to handshake with backend {}: {}", backend_addr, e);
-                // Response builder with static values should never fail
-                #[allow(clippy::expect_used)]
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(
-                        Full::new(Bytes::from("Bad Gateway"))
-                            .map_err(std::io::Error::other)
-                            .boxed(),
-                    )
-                    .expect("Building 502 response should never fail"));
+        // Copy headers (excluding hop-by-hop headers)
+        for (name, value) in parts.headers.iter() {
+            // Skip hop-by-hop headers that shouldn't be forwarded
+            let name_str = name.as_str();
+            if name_str == "connection"
+                || name_str == "keep-alive"
+                || name_str == "proxy-authenticate"
+                || name_str == "proxy-authorization"
+                || name_str == "te"
+                || name_str == "trailer"
+                || name_str == "transfer-encoding"
+                || name_str == "upgrade"
+                || name_str == "host"
+            // Host is set separately for the backend
+            {
+                continue;
             }
-        };
+            backend_req = backend_req.header(name, value);
+        }
 
-        // Spawn connection driver
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                debug!("Backend connection error: {}", e);
-            }
-        });
+        // Set Host header to backend address for proper routing
+        backend_req = backend_req.header("host", backend_addr.to_string());
 
-        // Forward request to backend
-        let backend_response = match sender.send_request(req).await {
+        // Build request with body
+        #[allow(clippy::expect_used)]
+        let backend_req = backend_req
+            .body(Full::new(body_bytes))
+            .expect("Building backend request should not fail");
+
+        // Send request using pooled client (connection reuse happens here!)
+        let backend_response = match http_client.request(backend_req).await {
             Ok(r) => r,
             Err(e) => {
                 error!("Failed to send request to backend {}: {}", backend_addr, e);
                 // Record failure for circuit breaker
                 circuit_breaker.record_failure(&backend_id);
-                // Response builder with static values should never fail
                 #[allow(clippy::expect_used)]
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
