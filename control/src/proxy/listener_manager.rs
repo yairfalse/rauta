@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
 /// HTTP client type with connection pooling
@@ -38,6 +38,14 @@ type PooledClient = Client<HttpConnector, Full<Bytes>>;
 pub enum Protocol {
     HTTP,
     HTTPS,
+}
+
+/// Backend HTTP protocol version
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Http1 reserved for explicit HTTP/1.1 configuration
+pub enum HttpProtocol {
+    Http1,
+    Http2,
 }
 
 /// Gateway reference for tracking which Gateways use a listener
@@ -91,8 +99,8 @@ pub struct ListenerManager {
     /// HTTP/1.1 client with connection pooling
     http_client: PooledClient,
     /// Protocol cache: tracks which backends support HTTP/2
-    /// Key: "host:port", Value: true = HTTP/2, false = HTTP/1.1
-    protocol_cache: Arc<Mutex<HashMap<String, bool>>>,
+    /// Key: "ip:port", Value: HttpProtocol enum
+    protocol_cache: Arc<tokio::sync::RwLock<HashMap<String, HttpProtocol>>>,
 }
 
 #[allow(dead_code)] // Methods used in Gateway reconciliation and tests
@@ -117,7 +125,7 @@ impl ListenerManager {
             rate_limiter,
             circuit_breaker,
             http_client,
-            protocol_cache: Arc::new(Mutex::new(HashMap::new())),
+            protocol_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -125,8 +133,8 @@ impl ListenerManager {
     #[allow(dead_code)] // Used in tests and for explicit HTTP/2 backend configuration
     pub async fn set_backend_protocol_http2(&self, backend_host: &str, backend_port: u16) {
         let backend_key = format!("{}:{}", backend_host, backend_port);
-        let mut cache = self.protocol_cache.lock().await;
-        cache.insert(backend_key, true);
+        let mut cache = self.protocol_cache.write().await;
+        cache.insert(backend_key, HttpProtocol::Http2);
     }
 
     /// Register a Gateway with a listener port
@@ -347,6 +355,20 @@ impl ListenerManager {
         })
     }
 
+    /// Build a 502 Bad Gateway response
+    fn build_bad_gateway_response(
+    ) -> Response<http_body_util::combinators::BoxBody<hyper::body::Bytes, std::io::Error>> {
+        #[allow(clippy::expect_used)]
+        Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(
+                Full::new(Bytes::from("Bad Gateway"))
+                    .map_err(std::io::Error::other)
+                    .boxed(),
+            )
+            .expect("Building 502 response should never fail")
+    }
+
     /// Handle HTTP request using router with rate limiting and circuit breaking
     async fn handle_request(
         req: Request<hyper::body::Incoming>,
@@ -354,7 +376,7 @@ impl ListenerManager {
         rate_limiter: Arc<crate::proxy::rate_limiter::RateLimiter>,
         circuit_breaker: Arc<crate::proxy::circuit_breaker::CircuitBreakerManager>,
         http_client: PooledClient,
-        protocol_cache: Arc<Mutex<HashMap<String, bool>>>,
+        protocol_cache: Arc<tokio::sync::RwLock<HashMap<String, HttpProtocol>>>,
     ) -> Result<
         Response<http_body_util::combinators::BoxBody<hyper::body::Bytes, std::io::Error>>,
         hyper::Error,
@@ -550,23 +572,23 @@ impl ListenerManager {
         // Set Host header to backend address for proper routing
         backend_req = backend_req.header("host", backend_addr.to_string());
 
-        // Check if backend is marked as HTTP/2
+        // Check if backend is marked as HTTP/2 (RwLock allows concurrent reads)
         let backend_key = format!("{}:{}", backend_addr.ip(), backend_addr.port());
         let use_http2 = {
-            let cache = protocol_cache.lock().await;
-            cache.get(&backend_key).copied().unwrap_or(false)
+            let cache = protocol_cache.read().await;
+            cache.get(&backend_key).copied() == Some(HttpProtocol::Http2)
         };
-
-        // Build request with body
-        #[allow(clippy::expect_used)]
-        let backend_req = backend_req
-            .body(Full::new(body_bytes.clone()))
-            .expect("Building backend request should not fail");
 
         // Send request using appropriate protocol
         let backend_response = if use_http2 {
             // Use HTTP/2 for backends that support it
             debug!("Using HTTP/2 for backend {}", backend_key);
+
+            // Build request with body (only for HTTP/2 path - no clone needed)
+            #[allow(clippy::expect_used)]
+            let backend_req = backend_req
+                .body(Full::new(body_bytes))
+                .expect("Building backend request should not fail");
 
             // Open TCP connection to backend
             let tcp_stream = match TcpStream::connect(backend_addr).await {
@@ -577,15 +599,7 @@ impl ListenerManager {
                         backend_addr, e
                     );
                     circuit_breaker.record_failure(&backend_id);
-                    #[allow(clippy::expect_used)]
-                    return Ok(Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
-                        .body(
-                            Full::new(Bytes::from("Bad Gateway"))
-                                .map_err(std::io::Error::other)
-                                .boxed(),
-                        )
-                        .expect("Building 502 response should never fail"));
+                    return Ok(Self::build_bad_gateway_response());
                 }
             };
 
@@ -596,19 +610,13 @@ impl ListenerManager {
                 Err(e) => {
                     error!("HTTP/2 handshake failed for {}: {}", backend_addr, e);
                     circuit_breaker.record_failure(&backend_id);
-                    #[allow(clippy::expect_used)]
-                    return Ok(Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
-                        .body(
-                            Full::new(Bytes::from("Bad Gateway"))
-                                .map_err(std::io::Error::other)
-                                .boxed(),
-                        )
-                        .expect("Building 502 response should never fail"));
+                    return Ok(Self::build_bad_gateway_response());
                 }
             };
 
             // Spawn connection driver
+            // NOTE: Currently each request creates a new connection. HTTP/2 connection
+            // pooling for multiplexing will be added in a follow-up PR.
             tokio::spawn(async move {
                 if let Err(e) = conn.await {
                     debug!("HTTP/2 connection ended: {}", e);
@@ -621,33 +629,23 @@ impl ListenerManager {
                 Err(e) => {
                     error!("Failed to send HTTP/2 request to {}: {}", backend_addr, e);
                     circuit_breaker.record_failure(&backend_id);
-                    #[allow(clippy::expect_used)]
-                    return Ok(Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
-                        .body(
-                            Full::new(Bytes::from("Bad Gateway"))
-                                .map_err(std::io::Error::other)
-                                .boxed(),
-                        )
-                        .expect("Building 502 response should never fail"));
+                    return Ok(Self::build_bad_gateway_response());
                 }
             }
         } else {
+            // Build request with body (HTTP/1.1 path)
+            #[allow(clippy::expect_used)]
+            let backend_req = backend_req
+                .body(Full::new(body_bytes))
+                .expect("Building backend request should not fail");
+
             // Use HTTP/1.1 pooled client
             match http_client.request(backend_req).await {
                 Ok(r) => r,
                 Err(e) => {
                     error!("Failed to send request to backend {}: {}", backend_addr, e);
                     circuit_breaker.record_failure(&backend_id);
-                    #[allow(clippy::expect_used)]
-                    return Ok(Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
-                        .body(
-                            Full::new(Bytes::from("Bad Gateway"))
-                                .map_err(std::io::Error::other)
-                                .boxed(),
-                        )
-                        .expect("Building 502 response should never fail"));
+                    return Ok(Self::build_bad_gateway_response());
                 }
             }
         };
