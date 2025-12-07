@@ -1,15 +1,8 @@
-# Rust
-target/
+# Rust (all nested target dirs)
+**/target/
 Cargo.lock
 **/*.rs.bk
 *.pdb
-
-# eBPF
-*.o
-*.ll
-*.bc
-vmlinux.h
-.output/
 
 # Build artifacts
 *.so
@@ -62,13 +55,6 @@ temp/
 *.tmp
 *.pid
 *.py  # Temporary Python scripts (use Rust examples instead)
-
-# BPF CO-RE (BTF)
-.btf/
-
-# Aya build artifacts
-rauta-bpf/target/
-rauta-bpf/.output/
 
 # macOS
 .DS_Store
