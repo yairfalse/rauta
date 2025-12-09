@@ -5,7 +5,7 @@
 //! and connection draining (graceful removal).
 
 use crate::proxy::filters::{
-    RequestHeaderModifier, RequestRedirect, ResponseHeaderModifier, Timeout,
+    RequestHeaderModifier, RequestRedirect, ResponseHeaderModifier, RetryConfig, Timeout,
 };
 use crate::proxy::health_checker::{HealthCheckConfig, HealthChecker};
 use common::{fnv1a_hash, maglev_build_compact_table, maglev_lookup_compact, Backend, HttpMethod};
@@ -194,6 +194,8 @@ struct Route {
     redirect: Option<RequestRedirect>, // Gateway API redirect filter (Core feature)
     #[allow(dead_code)] // Used in GREEN phase for Feature 7
     timeout: Option<Timeout>, // Gateway API timeout configuration (Extended feature)
+    #[allow(dead_code)] // Used in GREEN phase for Feature 8
+    retry: Option<RetryConfig>, // Gateway API retry configuration (Extended feature)
 }
 
 /// Route match result (backend + pattern for metrics)
@@ -208,6 +210,8 @@ pub struct RouteMatch {
     pub redirect: Option<RequestRedirect>,
     #[allow(dead_code)] // Used in server.rs to enforce request/backend timeouts
     pub timeout: Option<Timeout>,
+    #[allow(dead_code)] // Used in server.rs for retry logic
+    pub retry: Option<RetryConfig>,
 }
 
 /// Header match type for Gateway API conformance
@@ -346,6 +350,7 @@ impl Router {
             response_filters: None,     // No response header filters
             redirect: None,             // No redirect filter
             timeout: None,              // No timeout configuration
+            retry: None,                // No retry configuration
         };
 
         // Update routes HashMap (minimize write lock duration)
@@ -588,6 +593,7 @@ impl Router {
                 response_filters: route.response_filters.clone(),
                 redirect: route.redirect.clone(),
                 timeout: route.timeout.clone(),
+                retry: route.retry.clone(),
             });
         }
 
@@ -667,6 +673,7 @@ impl Router {
             response_filters: None,          // No response header filters
             redirect: None,                  // No redirect filter
             timeout: None,                   // No timeout configuration
+            retry: None,                     // No retry configuration
         };
 
         // Update routes HashMap
@@ -733,6 +740,7 @@ impl Router {
             response_filters: None,               // No response header filters
             redirect: None,                       // No redirect filter
             timeout: None,                        // No timeout configuration
+            retry: None,                          // No retry configuration
         };
 
         // Update routes HashMap
@@ -799,6 +807,7 @@ impl Router {
             response_filters: None,     // No response header filters
             redirect: None,             // No redirect filter
             timeout: None,              // No timeout configuration
+            retry: None,                // No retry configuration
         };
 
         // Update routes HashMap
@@ -865,6 +874,7 @@ impl Router {
             response_filters: None,          // No response header filters
             redirect: None,                  // No redirect filter
             timeout: None,                   // No timeout configuration
+            retry: None,                     // No retry configuration
         };
 
         // Update routes HashMap
@@ -932,6 +942,7 @@ impl Router {
             response_filters: Some(filters), // Store filters for server.rs to apply after backend response
             redirect: None,                  // No redirect filter
             timeout: None,                   // No timeout configuration
+            retry: None,                     // No retry configuration
         };
 
         // Update routes HashMap
@@ -999,6 +1010,7 @@ impl Router {
             response_filters: None,          // No response header filters
             redirect: Some(redirect_filter), // Store redirect filter for server.rs to apply
             timeout: None,                   // No timeout configuration
+            retry: None,                     // No retry configuration
         };
 
         // Update routes HashMap
@@ -1068,6 +1080,7 @@ impl Router {
             response_filters: None,          // No response header filters
             redirect: None,                  // No redirect filter
             timeout: Some(timeout_config),   // Store timeout config for server.rs to enforce
+            retry: None,                     // No retry configuration
         };
 
         // Update routes HashMap
@@ -1089,6 +1102,74 @@ impl Router {
                 .map_err(|e| format!("Failed to add route {}: {}", path_str, e))?;
 
             // Add prefix match route (/{*rest} pattern)
+            let prefix_pattern = if path_str == "/" {
+                "/{*rest}".to_string()
+            } else {
+                format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
+            };
+
+            new_prefix_router
+                .insert(prefix_pattern, *route_key)
+                .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
+        }
+
+        {
+            let mut prefix_router = safe_write(&self.prefix_router);
+            *prefix_router = new_prefix_router;
+        }
+
+        Ok(())
+    }
+
+    /// Add route with retry configuration (Gateway API HTTPRouteRetry - Extended feature)
+    ///
+    /// Routes with retry config will automatically retry on 5xx responses or connection errors.
+    /// Uses exponential backoff with configurable delays.
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn add_route_with_retry(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        backends: Vec<Backend>,
+        retry_config: RetryConfig,
+    ) -> Result<(), String> {
+        let path_hash = fnv1a_hash(path.as_bytes());
+        let key = RouteKey { method, path_hash };
+
+        // Build Maglev table
+        let maglev_table = maglev_build_compact_table(&backends);
+
+        let route = Route {
+            pattern: Arc::from(path),
+            backends,
+            maglev_table,
+            header_matches: Vec::new(),
+            method_matches: None,
+            query_param_matches: Vec::new(),
+            request_filters: None,
+            response_filters: None,
+            redirect: None,
+            timeout: None,
+            retry: Some(retry_config), // Store retry config for server.rs to use
+        };
+
+        // Update routes HashMap
+        {
+            let mut routes = safe_write(&self.routes);
+            routes.insert(key, route);
+        }
+
+        // Rebuild matchit router from scratch
+        let routes = safe_read(&self.routes);
+        let mut new_prefix_router = matchit::Router::new();
+
+        for (route_key, route) in routes.iter() {
+            let path_str = route.pattern.as_ref();
+
+            new_prefix_router
+                .insert(path_str.to_string(), *route_key)
+                .map_err(|e| format!("Failed to add route {}: {}", path_str, e))?;
+
             let prefix_pattern = if path_str == "/" {
                 "/{*rest}".to_string()
             } else {
@@ -1184,6 +1265,7 @@ impl Router {
                 response_filters: route.response_filters.clone(),
                 redirect: route.redirect.clone(),
                 timeout: route.timeout.clone(),
+                retry: route.retry.clone(),
             });
         }
 
@@ -1265,6 +1347,7 @@ impl Router {
                 response_filters: route.response_filters.clone(),
                 redirect: route.redirect.clone(),
                 timeout: route.timeout.clone(),
+                retry: route.retry.clone(),
             });
         }
 

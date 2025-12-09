@@ -2,7 +2,7 @@
 
 use crate::apis::metrics::CONTROLLER_METRICS_REGISTRY;
 use crate::proxy::filters::{
-    HeaderModifierOp, RequestHeaderModifier, RequestRedirect, ResponseHeaderModifier,
+    HeaderModifierOp, RequestHeaderModifier, RequestRedirect, ResponseHeaderModifier, Timeout,
 };
 use crate::proxy::router::Router;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
@@ -719,6 +719,11 @@ fn build_redirect_response(
 
 /// Forward request to backend server
 /// Returns BoxBody to support zero-copy streaming for HTTP/2 (hot path)
+///
+/// # Timeout Enforcement
+/// If `timeout_config` is provided with a `backend_request` timeout, the HTTP request
+/// to the backend will be wrapped in `tokio::time::timeout`. If the backend doesn't
+/// respond within the timeout, returns an error that the caller should map to 504.
 #[allow(clippy::too_many_arguments)] // Workers integration requires additional parameters
 async fn forward_to_backend(
     req: Request<hyper::body::Incoming>,
@@ -729,6 +734,7 @@ async fn forward_to_backend(
     protocol_cache: ProtocolCache,
     workers: Option<Workers>,
     worker_index: Option<usize>,
+    timeout_config: Option<&Timeout>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, String> {
     let request_start = Instant::now();
 
@@ -880,131 +886,162 @@ async fn forward_to_backend(
     );
 
     let backend_connect_start = Instant::now();
-    let backend_resp = match use_http2 {
-        true => {
-            // Backend is known to support HTTP/2, use production connection pool
-            debug!(request_id = %request_id, "Using HTTP/2 connection pool for backend {}", backend_key);
 
-            let mut sender = if let (Some(workers_arc), Some(idx)) = (workers, worker_index) {
-                // Worker path: Lock-free worker selection + per-worker pool lock
-                debug!(
-                    request_id = %request_id,
-                    worker_index = idx,
-                    "Using per-core worker connection pool (lock-free selection)"
-                );
+    // Extract backend_request timeout for enforcement
+    let backend_timeout = timeout_config.and_then(|t| t.backend_request);
 
-                // Lock-free worker selection - just array indexing!
-                let worker = &workers_arc[idx];
+    // Backend request logic - will be wrapped with timeout if configured
+    // Returns Result<Response<Incoming>, String> to support ? operator inside
+    let backend_request_future = async {
+        let resp = match use_http2 {
+            true => {
+                // Backend is known to support HTTP/2, use production connection pool
+                debug!(request_id = %request_id, "Using HTTP/2 connection pool for backend {}", backend_key);
 
-                // Per-worker lock (only contends with requests to same worker)
-                worker
-                    .get_backend_connection(backend)
-                    .await
-                    .map_err(|e| match e {
+                let mut sender = if let (Some(workers_arc), Some(idx)) = (workers, worker_index) {
+                    // Worker path: Lock-free worker selection + per-worker pool lock
+                    debug!(
+                        request_id = %request_id,
+                        worker_index = idx,
+                        "Using per-core worker connection pool (lock-free selection)"
+                    );
+
+                    // Lock-free worker selection - just array indexing!
+                    let worker = &workers_arc[idx];
+
+                    // Per-worker lock (only contends with requests to same worker)
+                    worker
+                        .get_backend_connection(backend)
+                        .await
+                        .map_err(|e| match e {
+                            PoolError::CircuitBreakerOpen => {
+                                error!(
+                                    request_id = %request_id,
+                                    backend = %backend_key,
+                                    worker_index = idx,
+                                    "Circuit breaker open for backend"
+                                );
+                                "Circuit breaker open".to_string()
+                            }
+                            _ => format!("Failed to get HTTP/2 connection from worker: {}", e),
+                        })?
+                } else {
+                    // Legacy path: Shared pools with Arc<Mutex> (slower)
+                    debug!(
+                        request_id = %request_id,
+                        "Using legacy shared connection pool"
+                    );
+
+                    let mut pools = backend_pools.lock().await;
+                    let pool = pools.get_or_create_pool(backend);
+                    pool.get_connection().await.map_err(|e| match e {
                         PoolError::CircuitBreakerOpen => {
                             error!(
                                 request_id = %request_id,
                                 backend = %backend_key,
-                                worker_index = idx,
                                 "Circuit breaker open for backend"
                             );
                             "Circuit breaker open".to_string()
                         }
-                        _ => format!("Failed to get HTTP/2 connection from worker: {}", e),
+                        _ => format!("Failed to get HTTP/2 connection: {}", e),
                     })?
-            } else {
-                // Legacy path: Shared pools with Arc<Mutex> (slower)
-                debug!(
-                    request_id = %request_id,
-                    "Using legacy shared connection pool"
-                );
+                };
 
-                let mut pools = backend_pools.lock().await;
-                let pool = pools.get_or_create_pool(backend);
-                pool.get_connection().await.map_err(|e| match e {
-                    PoolError::CircuitBreakerOpen => {
-                        error!(
-                            request_id = %request_id,
-                            backend = %backend_key,
-                            "Circuit breaker open for backend"
-                        );
-                        "Circuit breaker open".to_string()
-                    }
-                    _ => format!("Failed to get HTTP/2 connection: {}", e),
-                })?
-            };
+                match sender.send_request(backend_req).await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        // HTTP/2 failed - check if we can fallback
+                        if let Some(fallback_body) = body_for_fallback {
+                            // Protocol was unknown, we have body for retry
+                            warn!(
+                                request_id = %request_id,
+                                error.message = %e,
+                                backend = %backend_key,
+                                "HTTP/2 failed (unknown backend), falling back to HTTP/1.1"
+                            );
 
-            match sender.send_request(backend_req).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    // HTTP/2 failed - check if we can fallback
-                    if let Some(fallback_body) = body_for_fallback {
-                        // Protocol was unknown, we have body for retry
-                        warn!(
-                            request_id = %request_id,
-                            error.message = %e,
-                            backend = %backend_key,
-                            "HTTP/2 failed (unknown backend), falling back to HTTP/1.1"
-                        );
+                            // Cache as HTTP/1.1 for future requests
+                            {
+                                let mut cache = protocol_cache.lock().await;
+                                cache.insert(backend_key.clone(), false);
+                            }
 
-                        // Cache as HTTP/1.1 for future requests
-                        {
-                            let mut cache = protocol_cache.lock().await;
-                            cache.insert(backend_key.clone(), false);
-                        }
+                            // Retry with HTTP/1.1 using fallback body
+                            let method = hyper::Method::from_bytes(method_str.as_bytes())
+                                .map_err(|e| format!("Invalid method: {}", e))?;
 
-                        // Retry with HTTP/1.1 using fallback body
-                        let method = hyper::Method::from_bytes(method_str.as_bytes())
-                            .map_err(|e| format!("Invalid method: {}", e))?;
+                            let fallback_req = Request::builder()
+                                .method(method)
+                                .uri(&backend_uri)
+                                .header("Host", backend.to_string()) // Supports IPv4 and IPv6
+                                .body(Full::new(fallback_body))
+                                .map_err(|e| format!("Failed to build fallback request: {}", e))?;
 
-                        let fallback_req = Request::builder()
-                            .method(method)
-                            .uri(&backend_uri)
-                            .header("Host", backend.to_string()) // Supports IPv4 and IPv6
-                            .body(Full::new(fallback_body))
-                            .map_err(|e| format!("Failed to build fallback request: {}", e))?;
-
-                        client.request(fallback_req).await.map_err(|e| {
+                            client.request(fallback_req).await.map_err(|e| {
+                                error!(
+                                    request_id = %request_id,
+                                    error.message = %e,
+                                    error.type = "backend_connection",
+                                    "HTTP/1.1 fallback also failed"
+                                );
+                                format!("Backend connection failed: {}", e)
+                            })?
+                        } else {
+                            // Backend was cached as HTTP/2 but request failed
+                            // No fallback available (body was moved), return error
                             error!(
                                 request_id = %request_id,
                                 error.message = %e,
                                 error.type = "backend_connection",
-                                "HTTP/1.1 fallback also failed"
+                                backend = %backend_key,
+                                "HTTP/2 request failed for cached HTTP/2 backend (no fallback)"
                             );
-                            format!("Backend connection failed: {}", e)
-                        })?
-                    } else {
-                        // Backend was cached as HTTP/2 but request failed
-                        // No fallback available (body was moved), return error
-                        error!(
-                            request_id = %request_id,
-                            error.message = %e,
-                            error.type = "backend_connection",
-                            backend = %backend_key,
-                            "HTTP/2 request failed for cached HTTP/2 backend (no fallback)"
-                        );
-                        return Err(format!("HTTP/2 backend connection failed: {}", e));
+                            return Err(format!("HTTP/2 backend connection failed: {}", e));
+                        }
                     }
                 }
             }
-        }
-        false => {
-            // Backend uses HTTP/1.1 (explicitly cached as HTTP/1.1 only)
-            debug!(request_id = %request_id, "Using HTTP/1.1 for backend {} (cached)", backend_key);
+            false => {
+                // Backend uses HTTP/1.1 (explicitly cached as HTTP/1.1 only)
+                debug!(request_id = %request_id, "Using HTTP/1.1 for backend {} (cached)", backend_key);
 
-            client.request(backend_req).await.map_err(|e| {
-                error!(
+                client.request(backend_req).await.map_err(|e| {
+                    error!(
+                        request_id = %request_id,
+                        error.message = %e,
+                        error.type = "backend_connection",
+                        network.peer.address = %backend,
+                        network.peer.port = backend.port,
+                        elapsed_us = backend_connect_start.elapsed().as_micros() as u64,
+                        "Backend connection failed"
+                    );
+                    format!("Backend connection failed: {}", e)
+                })?
+            }
+        };
+        Ok(resp)
+    };
+
+    // Apply backend_request timeout if configured
+    let backend_resp = if let Some(timeout_duration) = backend_timeout {
+        match tokio::time::timeout(timeout_duration, backend_request_future).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                warn!(
                     request_id = %request_id,
-                    error.message = %e,
-                    error.type = "backend_connection",
+                    timeout_ms = timeout_duration.as_millis(),
                     network.peer.address = %backend,
-                    network.peer.port = backend.port,
-                    elapsed_us = backend_connect_start.elapsed().as_micros() as u64,
-                    "Backend connection failed"
+                    "Backend request timeout exceeded"
                 );
-                format!("Backend connection failed: {}", e)
-            })?
+                return Err(format!(
+                    "TIMEOUT: Backend request exceeded {}ms timeout",
+                    timeout_duration.as_millis()
+                ));
+            }
         }
+    } else {
+        // No timeout configured, execute directly
+        backend_request_future.await?
     };
 
     let backend_connect_duration = backend_connect_start.elapsed();
@@ -1306,17 +1343,187 @@ async fn handle_request(
                 "Route matched, forwarding to backend"
             );
 
-            let result = forward_to_backend(
-                req,
-                route_match.backend,
-                client,
-                &request_id,
-                backend_pools,
-                protocol_cache,
-                workers,
-                worker_index,
-            )
-            .await;
+            // Extract overall request timeout (wraps entire request including retries)
+            let overall_request_timeout = route_match.timeout.as_ref().and_then(|t| t.request);
+
+            // Check if retry is enabled for this route
+            let retry_config = route_match.retry.as_ref();
+
+            // For GET/HEAD requests with retry config, we can implement retries
+            // because there's no request body to preserve
+            let is_retryable_method =
+                method == common::HttpMethod::GET || method == common::HttpMethod::HEAD;
+
+            // Execute request with optional retry logic
+            let result = if let (true, Some(retry_cfg)) = (is_retryable_method, retry_config) {
+                // Retry-enabled path for GET/HEAD
+                let max_attempts = retry_cfg.max_retries + 1; // Initial + retries
+                let mut attempt: u32;
+                let mut last_result: Result<Response<BoxBody<Bytes, hyper::Error>>, String>;
+
+                // First attempt with original request
+                let first_result = if let Some(timeout_duration) = overall_request_timeout {
+                    match tokio::time::timeout(
+                        timeout_duration,
+                        forward_to_backend(
+                            req,
+                            route_match.backend,
+                            client.clone(),
+                            &request_id,
+                            backend_pools.clone(),
+                            protocol_cache.clone(),
+                            workers.clone(),
+                            worker_index,
+                            route_match.timeout.as_ref(),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_elapsed) => Err(format!(
+                            "TIMEOUT: Request exceeded {}ms overall timeout",
+                            timeout_duration.as_millis()
+                        )),
+                    }
+                } else {
+                    forward_to_backend(
+                        req,
+                        route_match.backend,
+                        client.clone(),
+                        &request_id,
+                        backend_pools.clone(),
+                        protocol_cache.clone(),
+                        workers.clone(),
+                        worker_index,
+                        route_match.timeout.as_ref(),
+                    )
+                    .await
+                };
+
+                // Check if we should retry
+                let should_retry_first = match &first_result {
+                    Ok(resp) => retry_cfg.should_retry_status(resp.status().as_u16()),
+                    Err(_) => retry_cfg.retry_on_connection_error,
+                };
+
+                if !should_retry_first || max_attempts <= 1 {
+                    first_result
+                } else {
+                    // Need to retry - enter retry loop
+                    last_result = first_result;
+                    attempt = 1;
+
+                    while attempt < max_attempts {
+                        // Apply exponential backoff
+                        let backoff_delay = retry_cfg.calculate_delay(attempt - 1);
+                        debug!(
+                            request_id = %request_id,
+                            attempt = attempt,
+                            backoff_ms = backoff_delay.as_millis(),
+                            "Retrying request after backoff"
+                        );
+                        tokio::time::sleep(backoff_delay).await;
+
+                        // Rebuild request for retry (GET/HEAD have no body)
+                        // Use direct HTTP/1.1 request for simplicity
+                        let backend_uri = format!(
+                            "http://{}/{}",
+                            route_match.backend, // Backend::Display includes ip:port
+                            path.trim_start_matches('/')
+                        );
+
+                        let retry_method = match method {
+                            common::HttpMethod::GET => hyper::Method::GET,
+                            common::HttpMethod::HEAD => hyper::Method::HEAD,
+                            _ => hyper::Method::GET, // Shouldn't happen
+                        };
+
+                        let retry_req = match Request::builder()
+                            .method(retry_method)
+                            .uri(&backend_uri)
+                            .header("Host", route_match.backend.to_string())
+                            .body(Full::new(Bytes::new()))
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                last_result = Err(format!("Failed to build retry request: {}", e));
+                                break;
+                            }
+                        };
+
+                        // Make retry attempt using HTTP/1.1 client directly
+                        let retry_result = match client.request(retry_req).await {
+                            Ok(resp) => {
+                                // Box the body for type consistency
+                                let (parts, body) = resp.into_parts();
+                                Ok(Response::from_parts(parts, body.map_err(|e| e).boxed()))
+                            }
+                            Err(e) => Err(format!("Retry request failed: {}", e)),
+                        };
+
+                        // Check if we should continue retrying
+                        let should_continue = match &retry_result {
+                            Ok(resp) => retry_cfg.should_retry_status(resp.status().as_u16()),
+                            Err(_) => retry_cfg.retry_on_connection_error,
+                        };
+
+                        last_result = retry_result;
+                        attempt += 1;
+
+                        if !should_continue {
+                            break; // Success or non-retryable error
+                        }
+                    }
+
+                    last_result
+                }
+            } else {
+                // Non-retry path (original behavior)
+                if let Some(timeout_duration) = overall_request_timeout {
+                    match tokio::time::timeout(
+                        timeout_duration,
+                        forward_to_backend(
+                            req,
+                            route_match.backend,
+                            client,
+                            &request_id,
+                            backend_pools,
+                            protocol_cache,
+                            workers,
+                            worker_index,
+                            route_match.timeout.as_ref(),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_elapsed) => {
+                            warn!(
+                                request_id = %request_id,
+                                timeout_ms = timeout_duration.as_millis(),
+                                "Overall request timeout exceeded"
+                            );
+                            Err(format!(
+                                "TIMEOUT: Request exceeded {}ms overall timeout",
+                                timeout_duration.as_millis()
+                            ))
+                        }
+                    }
+                } else {
+                    forward_to_backend(
+                        req,
+                        route_match.backend,
+                        client,
+                        &request_id,
+                        backend_pools,
+                        protocol_cache,
+                        workers,
+                        worker_index,
+                        route_match.timeout.as_ref(),
+                    )
+                    .await
+                }
+            };
             let duration = start.elapsed();
 
             // Record metrics (zero-allocation with static strings)
@@ -1350,15 +1557,22 @@ async fn handle_request(
                     }
                 }
                 Err(e) => {
+                    // Check if this is a timeout error (return 504) or other error (return 500)
+                    let (status_code, status_str) = if e.starts_with("TIMEOUT:") {
+                        (504_u16, "504")
+                    } else {
+                        (500_u16, "500")
+                    };
+
                     HTTP_REQUESTS_TOTAL
-                        .with_label_values(&[method_str, route_pattern, "500", &worker_label])
+                        .with_label_values(&[method_str, route_pattern, status_str, &worker_label])
                         .inc();
                     HTTP_REQUEST_DURATION
-                        .with_label_values(&[method_str, route_pattern, "500"])
+                        .with_label_values(&[method_str, route_pattern, status_str])
                         .observe(duration.as_secs_f64());
 
                     // Record backend health (treat connection errors as 500, supports IPv4 and IPv6)
-                    router.record_backend_response(route_match.backend, 500);
+                    router.record_backend_response(route_match.backend, status_code);
 
                     // Record circuit breaker failure (connection error = backend failure)
                     circuit_breaker.record_failure(&backend_id);
@@ -1405,10 +1619,50 @@ async fn handle_request(
                             Ok(resp)
                         }
                     }
-                    Err(e) => Err(e),
+                    Err(e) => {
+                        // Convert error to HTTP response (504 for timeout, 500 for other)
+                        let status = if e.starts_with("TIMEOUT:") {
+                            StatusCode::GATEWAY_TIMEOUT
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        };
+                        #[allow(clippy::unwrap_used)]
+                        Ok(Response::builder()
+                            .status(status)
+                            .header("Content-Type", "text/plain")
+                            .header("X-Request-ID", request_id.clone())
+                            .body(
+                                Full::new(Bytes::from(e))
+                                    .map_err(|never| match never {})
+                                    .boxed(),
+                            )
+                            .unwrap())
+                    }
                 }
             } else {
-                result
+                // No response filters - handle result directly
+                match result {
+                    Ok(resp) => Ok(resp),
+                    Err(e) => {
+                        // Convert error to HTTP response (504 for timeout, 500 for other)
+                        let status = if e.starts_with("TIMEOUT:") {
+                            StatusCode::GATEWAY_TIMEOUT
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        };
+                        #[allow(clippy::unwrap_used)]
+                        Ok(Response::builder()
+                            .status(status)
+                            .header("Content-Type", "text/plain")
+                            .header("X-Request-ID", request_id.clone())
+                            .body(
+                                Full::new(Bytes::from(e))
+                                    .map_err(|never| match never {})
+                                    .boxed(),
+                            )
+                            .unwrap())
+                    }
+                }
             }
         }
         None => {
@@ -3022,6 +3276,429 @@ mod tests {
             location_str.starts_with("http://"),
             "Location should preserve HTTP scheme, got: {}",
             location_str
+        );
+    }
+
+    // =============================================================================
+    // Timeout Enforcement Tests (TDD RED phase)
+    // =============================================================================
+
+    /// RED: Test that backend_request timeout is enforced
+    ///
+    /// When a route has a backend_request timeout configured, requests to slow
+    /// backends should timeout and return 504 Gateway Timeout.
+    #[tokio::test]
+    async fn test_backend_request_timeout_enforced() {
+        use crate::proxy::filters::Timeout;
+        use std::time::Duration;
+
+        // Start a SLOW backend that takes 500ms to respond
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = backend_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+
+            let service = service_fn(|_req: Request<hyper::body::Incoming>| async move {
+                // Sleep 500ms before responding (simulating slow backend)
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                Ok::<_, hyper::Error>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from("Slow response")))
+                        .unwrap(),
+                )
+            });
+
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Create router with 100ms backend_request timeout
+        let router = crate::proxy::router::Router::new();
+        let backend_ip = match backend_addr.ip() {
+            std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
+            _ => panic!("Expected IPv4"),
+        };
+        let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
+
+        // Configure 100ms backend timeout (backend sleeps 500ms, so this SHOULD timeout)
+        let timeout = Timeout::new().backend_request(Duration::from_millis(100));
+        router
+            .add_route_with_timeout(HttpMethod::GET, "/api/slow", backends, timeout)
+            .unwrap();
+
+        // Start proxy server
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Make request through proxy
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build_http::<Full<Bytes>>();
+
+        let uri = format!("http://{}/api/slow", proxy_addr).parse().unwrap();
+        let response = client.get(uri).await.expect("Request should complete");
+
+        // Should return 504 Gateway Timeout (because backend_request timeout was exceeded)
+        assert_eq!(
+            response.status(),
+            StatusCode::GATEWAY_TIMEOUT,
+            "Expected 504 Gateway Timeout for slow backend, got {}",
+            response.status()
+        );
+
+        // Body should indicate timeout
+        let body_bytes = response.collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert!(
+            body.to_lowercase().contains("timeout"),
+            "Response body should mention timeout, got: {}",
+            body
+        );
+    }
+
+    /// RED: Test that overall request timeout is enforced
+    ///
+    /// The request timeout is the total time allowed for the entire request,
+    /// including potential retries. This is different from backend_request timeout.
+    #[tokio::test]
+    async fn test_overall_request_timeout_enforced() {
+        use crate::proxy::filters::Timeout;
+        use std::time::Duration;
+
+        // Start a slow backend
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = backend_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+
+            let service = service_fn(|_req: Request<hyper::body::Incoming>| async move {
+                // Sleep 300ms before responding
+                tokio::time::sleep(Duration::from_millis(300)).await;
+
+                Ok::<_, hyper::Error>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from("Slow response")))
+                        .unwrap(),
+                )
+            });
+
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Create router with 100ms overall request timeout
+        let router = crate::proxy::router::Router::new();
+        let backend_ip = match backend_addr.ip() {
+            std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
+            _ => panic!("Expected IPv4"),
+        };
+        let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
+
+        // Configure 100ms overall request timeout (backend sleeps 300ms)
+        let timeout = Timeout::new().request(Duration::from_millis(100));
+        router
+            .add_route_with_timeout(HttpMethod::GET, "/api/slow", backends, timeout)
+            .unwrap();
+
+        // Start proxy server
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Make request through proxy
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build_http::<Full<Bytes>>();
+
+        let uri = format!("http://{}/api/slow", proxy_addr).parse().unwrap();
+        let response = client.get(uri).await.expect("Request should complete");
+
+        // Should return 504 Gateway Timeout
+        assert_eq!(
+            response.status(),
+            StatusCode::GATEWAY_TIMEOUT,
+            "Expected 504 Gateway Timeout for slow backend, got {}",
+            response.status()
+        );
+    }
+
+    /// RED: Test that fast backends within timeout succeed
+    ///
+    /// Sanity check: backends that respond within the timeout should succeed.
+    #[tokio::test]
+    async fn test_fast_backend_within_timeout_succeeds() {
+        use crate::proxy::filters::Timeout;
+        use std::time::Duration;
+
+        // Start a FAST backend that responds immediately
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = backend_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+
+            let service = service_fn(|_req: Request<hyper::body::Incoming>| async move {
+                // No sleep - respond immediately
+                Ok::<_, hyper::Error>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from("Fast response")))
+                        .unwrap(),
+                )
+            });
+
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Create router with generous timeout
+        let router = crate::proxy::router::Router::new();
+        let backend_ip = match backend_addr.ip() {
+            std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
+            _ => panic!("Expected IPv4"),
+        };
+        let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
+
+        // Configure 1s timeout (backend responds immediately)
+        let timeout = Timeout::new().backend_request(Duration::from_secs(1));
+        router
+            .add_route_with_timeout(HttpMethod::GET, "/api/fast", backends, timeout)
+            .unwrap();
+
+        // Start proxy server
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Make request through proxy
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build_http::<Full<Bytes>>();
+
+        let uri = format!("http://{}/api/fast", proxy_addr).parse().unwrap();
+        let response = client.get(uri).await.expect("Request should complete");
+
+        // Should return 200 OK (backend responded within timeout)
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "Expected 200 OK for fast backend, got {}",
+            response.status()
+        );
+
+        let body_bytes = response.collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert_eq!(body, "Fast response");
+    }
+
+    // =============================================================================
+    // Retry Tests (TDD RED phase)
+    // =============================================================================
+
+    /// RED: Test exponential backoff calculation
+    #[test]
+    fn test_retry_config_exponential_backoff() {
+        use crate::proxy::filters::RetryConfig;
+        use std::time::Duration;
+
+        let config = RetryConfig::new()
+            .base_delay(Duration::from_millis(100))
+            .max_delay(Duration::from_secs(5));
+
+        // Attempt 0: 100ms * 2^0 = 100ms
+        assert_eq!(config.calculate_delay(0), Duration::from_millis(100));
+
+        // Attempt 1: 100ms * 2^1 = 200ms
+        assert_eq!(config.calculate_delay(1), Duration::from_millis(200));
+
+        // Attempt 2: 100ms * 2^2 = 400ms
+        assert_eq!(config.calculate_delay(2), Duration::from_millis(400));
+
+        // Attempt 3: 100ms * 2^3 = 800ms
+        assert_eq!(config.calculate_delay(3), Duration::from_millis(800));
+
+        // Attempt 4: 100ms * 2^4 = 1600ms
+        assert_eq!(config.calculate_delay(4), Duration::from_millis(1600));
+
+        // Attempt 6: 100ms * 2^6 = 6400ms, but capped at 5000ms
+        assert_eq!(config.calculate_delay(6), Duration::from_secs(5));
+    }
+
+    /// RED: Test retry status code matching
+    #[test]
+    fn test_retry_config_should_retry_status() {
+        use crate::proxy::filters::RetryConfig;
+
+        let config = RetryConfig::new().retry_on_5xx(true);
+
+        // Should retry 5xx
+        assert!(config.should_retry_status(500));
+        assert!(config.should_retry_status(502));
+        assert!(config.should_retry_status(503));
+        assert!(config.should_retry_status(504));
+
+        // Should NOT retry 4xx
+        assert!(!config.should_retry_status(400));
+        assert!(!config.should_retry_status(404));
+        assert!(!config.should_retry_status(429));
+
+        // Should NOT retry 2xx/3xx
+        assert!(!config.should_retry_status(200));
+        assert!(!config.should_retry_status(301));
+
+        // With retry_on_5xx disabled
+        let config_disabled = RetryConfig::new().retry_on_5xx(false);
+        assert!(!config_disabled.should_retry_status(500));
+    }
+
+    /// RED: Test that proxy retries on 503 and eventually succeeds
+    ///
+    /// Backend returns 503 on first request, then 200 on retry.
+    /// This test will FAIL until retry logic is implemented.
+    #[tokio::test]
+    async fn test_proxy_retries_on_503_then_succeeds() {
+        use crate::proxy::filters::RetryConfig;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+
+        // Track request count
+        let request_count = Arc::new(AtomicU32::new(0));
+        let request_count_clone = request_count.clone();
+
+        // Start a flaky backend that fails first request, succeeds second
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match backend_listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(_) => break,
+                };
+                let io = TokioIo::new(stream);
+                let count = request_count_clone.clone();
+
+                tokio::spawn(async move {
+                    let service = service_fn(move |_req: Request<hyper::body::Incoming>| {
+                        let attempt = count.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            if attempt == 0 {
+                                // First request: return 503
+                                Ok::<_, hyper::Error>(
+                                    Response::builder()
+                                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                                        .body(Full::new(Bytes::from("Service Unavailable")))
+                                        .unwrap(),
+                                )
+                            } else {
+                                // Subsequent requests: return 200
+                                Ok::<_, hyper::Error>(
+                                    Response::builder()
+                                        .status(StatusCode::OK)
+                                        .body(Full::new(Bytes::from("Success after retry")))
+                                        .unwrap(),
+                                )
+                            }
+                        }
+                    });
+
+                    let _ = http1::Builder::new().serve_connection(io, service).await;
+                });
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Create router with retry config
+        let router = crate::proxy::router::Router::new();
+        let backend_ip = match backend_addr.ip() {
+            std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
+            _ => panic!("Expected IPv4"),
+        };
+        let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
+
+        // Configure retry with 3 max attempts
+        let retry_config = RetryConfig::new()
+            .max_retries(3)
+            .base_delay(Duration::from_millis(10));
+
+        // Use add_route_with_retry to enable retry logic
+        router
+            .add_route_with_retry(HttpMethod::GET, "/api/flaky", backends, retry_config)
+            .unwrap();
+
+        // Start proxy server
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Make request through proxy
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build_http::<Full<Bytes>>();
+
+        let uri = format!("http://{}/api/flaky", proxy_addr).parse().unwrap();
+        let response = client.get(uri).await.expect("Request should complete");
+
+        // Should return 200 OK after retry (backend succeeded on second attempt)
+        // This WILL FAIL until retry logic is implemented - currently returns 503
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "Expected 200 OK after retry, got {} (retry not implemented yet)",
+            response.status()
+        );
+
+        // Verify backend was called at least twice (initial + retry)
+        assert!(
+            request_count.load(Ordering::SeqCst) >= 2,
+            "Backend should have been called at least twice for retry"
         );
     }
 }

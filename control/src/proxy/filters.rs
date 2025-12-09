@@ -205,3 +205,96 @@ impl Timeout {
         self
     }
 }
+
+/// Retry configuration (Gateway API HTTPRouteRetry - Extended feature)
+///
+/// Specifies retry behavior for failed requests.
+/// Gateway API spec: https://gateway-api.sigs.k8s.io/reference/spec/
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Used in tests during TDD implementation
+pub struct RetryConfig {
+    /// Maximum number of retry attempts (default: 3)
+    pub max_retries: u32,
+
+    /// Base delay for exponential backoff (default: 25ms)
+    /// Actual delay = base_delay * 2^attempt (with jitter)
+    pub base_delay: Duration,
+
+    /// Maximum delay between retries (default: 1s)
+    pub max_delay: Duration,
+
+    /// Retry on 5xx status codes (default: true)
+    pub retry_on_5xx: bool,
+
+    /// Retry on connection errors (default: true)
+    pub retry_on_connection_error: bool,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            base_delay: Duration::from_millis(25),
+            max_delay: Duration::from_secs(1),
+            retry_on_5xx: true,
+            retry_on_connection_error: true,
+        }
+    }
+}
+
+impl RetryConfig {
+    /// Create a new retry configuration with defaults
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set maximum retry attempts
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn max_retries(mut self, count: u32) -> Self {
+        self.max_retries = count;
+        self
+    }
+
+    /// Set base delay for exponential backoff
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn base_delay(mut self, delay: Duration) -> Self {
+        self.base_delay = delay;
+        self
+    }
+
+    /// Set maximum delay between retries
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn max_delay(mut self, delay: Duration) -> Self {
+        self.max_delay = delay;
+        self
+    }
+
+    /// Enable/disable retry on 5xx status codes
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn retry_on_5xx(mut self, enabled: bool) -> Self {
+        self.retry_on_5xx = enabled;
+        self
+    }
+
+    /// Enable/disable retry on connection errors
+    #[allow(dead_code)] // Used in tests during TDD implementation
+    pub fn retry_on_connection_error(mut self, enabled: bool) -> Self {
+        self.retry_on_connection_error = enabled;
+        self
+    }
+
+    /// Calculate delay for a given attempt using exponential backoff
+    #[allow(dead_code)] // Used in retry implementation
+    pub fn calculate_delay(&self, attempt: u32) -> Duration {
+        // Exponential backoff: base_delay * 2^attempt
+        let delay_ms = self.base_delay.as_millis() as u64 * (1u64 << attempt.min(10));
+        Duration::from_millis(delay_ms).min(self.max_delay)
+    }
+
+    /// Check if a status code should trigger a retry
+    #[allow(dead_code)] // Used in retry implementation
+    pub fn should_retry_status(&self, status_code: u16) -> bool {
+        self.retry_on_5xx && (500..600).contains(&status_code)
+    }
+}
