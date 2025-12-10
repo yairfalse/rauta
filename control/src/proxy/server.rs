@@ -493,6 +493,111 @@ impl ProxyServer {
         }
     }
 
+    /// Start serving HTTPS requests with HTTP/2 support (ALPN negotiation)
+    ///
+    /// Uses ALPN to negotiate HTTP/2 (h2) or HTTP/1.1 with TLS clients.
+    /// Automatically detects and handles both protocols.
+    #[allow(dead_code)]
+    pub async fn serve_https_h2(
+        self,
+        sni_resolver: crate::proxy::tls::SniResolver,
+    ) -> Result<(), String> {
+        use tokio_rustls::TlsAcceptor;
+
+        let listener = TcpListener::bind(&self.bind_addr)
+            .await
+            .map_err(|e| format!("Failed to bind to {}: {}", self.bind_addr, e))?;
+
+        info!(
+            "HTTPS/H2 proxy server listening on {} (ALPN: h2, http/1.1)",
+            self.bind_addr
+        );
+
+        // Build ServerConfig with ALPN protocols for HTTP/2 and HTTP/1.1
+        let mut server_config = sni_resolver
+            .to_server_config()
+            .map_err(|e| format!("Failed to build TLS config: {}", e))?;
+
+        // Enable ALPN negotiation: prefer h2, fallback to http/1.1
+        let server_config_mut = Arc::make_mut(&mut server_config);
+        server_config_mut.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let acceptor = TlsAcceptor::from(server_config);
+
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    error!("Failed to accept connection: {}", e);
+                    continue;
+                }
+            };
+
+            let router = self.router.clone();
+            let client = self.client.clone();
+            let backend_pools = self.backend_pools.clone();
+            let protocol_cache = self.protocol_cache.clone();
+            let workers = self.workers.clone();
+            let worker_selector = self.worker_selector.clone();
+            let rate_limiter = self.rate_limiter.clone();
+            let circuit_breaker = self.circuit_breaker.clone();
+            let acceptor_clone = acceptor.clone();
+
+            tokio::spawn(async move {
+                // Perform TLS handshake with ALPN negotiation
+                let tls_stream = match acceptor_clone.accept(stream).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("TLS handshake failed: {}", e);
+                        return;
+                    }
+                };
+
+                // Check negotiated ALPN protocol
+                let is_h2 = {
+                    let (_, conn) = tls_stream.get_ref();
+                    conn.alpn_protocol() == Some(b"h2")
+                };
+
+                let io = TokioIo::new(tls_stream);
+
+                let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let router = router.clone();
+                    let client = client.clone();
+                    let backend_pools = backend_pools.clone();
+                    let protocol_cache = protocol_cache.clone();
+                    let workers = workers.clone();
+                    let worker_selector = worker_selector.clone();
+                    let rate_limiter = rate_limiter.clone();
+                    let circuit_breaker = circuit_breaker.clone();
+                    async move {
+                        handle_request(
+                            req,
+                            router,
+                            client,
+                            backend_pools,
+                            protocol_cache,
+                            workers,
+                            worker_selector,
+                            rate_limiter,
+                            circuit_breaker,
+                        )
+                        .await
+                    }
+                });
+
+                // Use HTTP/2 or HTTP/1.1 based on ALPN negotiation
+                if is_h2 {
+                    let _ = http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(io, service)
+                        .await;
+                } else {
+                    let _ = http1::Builder::new().serve_connection(io, service).await;
+                }
+            });
+        }
+    }
+
     /// Start serving HTTP/2 requests
     #[allow(dead_code)]
     pub async fn serve_http2(self) -> Result<(), String> {
@@ -3699,6 +3804,219 @@ mod tests {
         assert!(
             request_count.load(Ordering::SeqCst) >= 2,
             "Backend should have been called at least twice for retry"
+        );
+    }
+
+    // =============================================================================
+    // HTTP/2 over TLS (H2) Tests
+    // =============================================================================
+
+    /// RED: Test HTTPS proxy with HTTP/2 over TLS (ALPN h2 negotiation)
+    #[tokio::test]
+    async fn test_https_proxy_with_http2_alpn() {
+        use crate::proxy::tls::{SniResolver, TlsCertificate};
+        use std::sync::Once;
+
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+
+        // Load test certificate
+        let cert_pem = include_bytes!("../../../test_fixtures/tls/example.com.crt");
+        let key_pem = include_bytes!("../../../test_fixtures/tls/example.com.key");
+        let cert =
+            TlsCertificate::from_pem(cert_pem, key_pem).expect("Should parse test certificate");
+
+        // Create SNI resolver
+        let mut resolver = SniResolver::new();
+        resolver
+            .add_cert("example.com".to_string(), cert)
+            .expect("Should add certificate");
+
+        // Start mock HTTP/2 backend
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = backend_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+
+            let service = service_fn(|_req: Request<hyper::body::Incoming>| async move {
+                Ok::<_, hyper::Error>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from("H2 Backend response")))
+                        .unwrap(),
+                )
+            });
+
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Create router pointing to backend
+        let router = crate::proxy::router::Router::new();
+        let backend_ip = match backend_addr.ip() {
+            std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
+            _ => panic!("Expected IPv4 address"),
+        };
+        let backends = vec![Backend::new(backend_ip, backend_addr.port(), 100)];
+        router
+            .add_route(HttpMethod::GET, "/api/h2test", backends)
+            .unwrap();
+
+        // Start HTTPS proxy server with HTTP/2 support
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+
+        let server = ProxyServer::new(proxy_addr.to_string(), Arc::new(router)).unwrap();
+
+        // Use serve_https_h2 method (to be implemented)
+        tokio::spawn(async move {
+            let _ = server.serve_https_h2(resolver).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Connect with HTTPS client requesting HTTP/2 via ALPN
+        use rustls::pki_types::ServerName;
+        use rustls::ClientConfig;
+        use tokio_rustls::TlsConnector;
+
+        let mut root_cert_store = rustls::RootCertStore::empty();
+        root_cert_store.add_parsable_certificates(
+            rustls_pemfile::certs(&mut std::io::BufReader::new(&cert_pem[..]))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+
+        // Configure client to prefer HTTP/2 via ALPN
+        let mut client_config = ClientConfig::builder()
+            .with_root_certificates(root_cert_store)
+            .with_no_client_auth();
+        // Set ALPN protocols to negotiate h2
+        client_config.alpn_protocols = vec![b"h2".to_vec()];
+
+        let connector = TlsConnector::from(Arc::new(client_config));
+
+        let stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let domain = ServerName::try_from("example.com").unwrap();
+        let tls_stream = connector.connect(domain, stream).await.unwrap();
+
+        // Verify h2 was negotiated
+        let (_, conn) = tls_stream.get_ref();
+        assert_eq!(
+            conn.alpn_protocol(),
+            Some(b"h2".as_slice()),
+            "Should negotiate h2 via ALPN"
+        );
+
+        // Make HTTP/2 request through HTTPS proxy
+        let io = TokioIo::new(tls_stream);
+        let (mut request_sender, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+                .await
+                .expect("HTTP/2 handshake should succeed with ALPN h2");
+
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let req = Request::builder()
+            .uri("/api/h2test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let response = request_sender.send_request(req).await.unwrap();
+
+        // Verify HTTP/2 proxy worked
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        assert_eq!(body, "H2 Backend response");
+    }
+
+    /// RED: Test ALPN negotiation returns h2 when client supports it
+    #[tokio::test]
+    async fn test_alpn_negotiation_selects_h2() {
+        use crate::proxy::tls::TlsCertificate;
+        use rustls::pki_types::ServerName;
+        use rustls::ClientConfig;
+        use std::sync::Once;
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+
+        // Load test certificate
+        let cert_pem = include_bytes!("../../../test_fixtures/tls/example.com.crt");
+        let key_pem = include_bytes!("../../../test_fixtures/tls/example.com.key");
+        let cert =
+            TlsCertificate::from_pem(cert_pem, key_pem).expect("Should parse test certificate");
+
+        // Build server config with ALPN for h2 and http/1.1
+        let mut server_config = cert.to_server_config().expect("Should build server config");
+        // Get mutable reference to set ALPN protocols
+        let server_config_mut = Arc::make_mut(&mut server_config);
+        server_config_mut.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let acceptor = TlsAcceptor::from(server_config);
+
+        // Start TLS server
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let (server_ready_tx, server_ready_rx) = tokio::sync::oneshot::channel();
+        let (negotiated_tx, negotiated_rx) = tokio::sync::oneshot::channel::<Option<Vec<u8>>>();
+
+        tokio::spawn(async move {
+            server_ready_tx.send(()).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let tls_stream = acceptor.accept(stream).await.unwrap();
+
+            // Get negotiated ALPN protocol
+            let (_, conn) = tls_stream.get_ref();
+            let alpn = conn.alpn_protocol().map(|s| s.to_vec());
+            let _ = negotiated_tx.send(alpn);
+        });
+
+        server_ready_rx.await.unwrap();
+
+        // Build client config requesting h2
+        let mut root_cert_store = rustls::RootCertStore::empty();
+        root_cert_store.add_parsable_certificates(
+            rustls_pemfile::certs(&mut std::io::BufReader::new(&cert_pem[..]))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+
+        let mut client_config = ClientConfig::builder()
+            .with_root_certificates(root_cert_store)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let connector = TlsConnector::from(Arc::new(client_config));
+
+        // Connect to server
+        let stream = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+        let domain = ServerName::try_from("example.com").unwrap();
+        let _tls_stream = connector.connect(domain, stream).await.unwrap();
+
+        // Check what protocol was negotiated
+        let negotiated = negotiated_rx.await.unwrap();
+        assert_eq!(
+            negotiated,
+            Some(b"h2".to_vec()),
+            "Server should negotiate h2 when client supports it"
         );
     }
 }
