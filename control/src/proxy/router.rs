@@ -1213,8 +1213,37 @@ impl Router {
             if routes.contains_key(&key) {
                 Some(key)
             } else {
+                // Prefix match via matchit
+                // Prepend method to path for method-aware routing
+                let method_prefix = match method {
+                    HttpMethod::GET => "GET:",
+                    HttpMethod::POST => "POST:",
+                    HttpMethod::PUT => "PUT:",
+                    HttpMethod::DELETE => "DELETE:",
+                    HttpMethod::PATCH => "PATCH:",
+                    HttpMethod::HEAD => "HEAD:",
+                    HttpMethod::OPTIONS => "OPTIONS:",
+                    HttpMethod::ALL => "",
+                };
+
+                let method_prefixed_path = if method_prefix.is_empty() {
+                    path.to_string()
+                } else {
+                    format!("{}{}", method_prefix, path)
+                };
+
                 let prefix_router = safe_read(&self.prefix_router);
-                prefix_router.at(path).ok().map(|m| *m.value)
+                let found_key = prefix_router
+                    .at(&method_prefixed_path)
+                    .ok()
+                    .map(|m| *m.value);
+
+                // If no match with specific method, try HttpMethod::ALL (wildcard)
+                if found_key.is_none() && method != HttpMethod::ALL {
+                    prefix_router.at(path).ok().map(|m| *m.value)
+                } else {
+                    found_key
+                }
             }
         }?;
 
@@ -1295,8 +1324,37 @@ impl Router {
             if routes.contains_key(&key) {
                 Some(key)
             } else {
+                // Prefix match via matchit
+                // Prepend method to path for method-aware routing
+                let method_prefix = match method {
+                    HttpMethod::GET => "GET:",
+                    HttpMethod::POST => "POST:",
+                    HttpMethod::PUT => "PUT:",
+                    HttpMethod::DELETE => "DELETE:",
+                    HttpMethod::PATCH => "PATCH:",
+                    HttpMethod::HEAD => "HEAD:",
+                    HttpMethod::OPTIONS => "OPTIONS:",
+                    HttpMethod::ALL => "",
+                };
+
+                let method_prefixed_path = if method_prefix.is_empty() {
+                    path.to_string()
+                } else {
+                    format!("{}{}", method_prefix, path)
+                };
+
                 let prefix_router = safe_read(&self.prefix_router);
-                prefix_router.at(path).ok().map(|m| *m.value)
+                let found_key = prefix_router
+                    .at(&method_prefixed_path)
+                    .ok()
+                    .map(|m| *m.value);
+
+                // If no match with specific method, try HttpMethod::ALL (wildcard)
+                if found_key.is_none() && method != HttpMethod::ALL {
+                    prefix_router.at(path).ok().map(|m| *m.value)
+                } else {
+                    found_key
+                }
             }
         }?;
 
