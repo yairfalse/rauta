@@ -276,20 +276,46 @@ spec:
 
     apply_yaml(&route_yaml);
 
-    // Wait for reconciliation
-    println!("  Step 5: Waiting for HTTPRoute reconciliation (5s)");
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    // Step 6: Test traffic through RAUTA
-    println!("  Step 6: Testing traffic through RAUTA (localhost:8080)");
-
+    // Wait for reconciliation using polling
+    println!("  Step 5: Waiting for HTTPRoute reconciliation (up to 30s)");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .expect("Should build HTTP client");
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(30);
+    let poll_interval = Duration::from_secs(1);
+    let mut response = None;
+    while start.elapsed() < timeout {
+        match client.get("http://localhost:8080/test/hello").send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    response = Some(Ok(resp));
+                    break;
+                } else {
+                    // Not ready yet, print status and retry
+                    println!(
+                        "    HTTPRoute not ready yet: got status {}. Retrying...",
+                        resp.status()
+                    );
+                }
+            }
+            Err(e) => {
+                println!("    HTTPRoute not ready yet: request error: {}. Retrying...", e);
+            }
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+    if response.is_none() {
+        panic!(
+            "Timed out waiting for HTTPRoute reconciliation after {:?}",
+            timeout
+        );
+    }
+    let response = response.unwrap();
 
-    // In kind with port mapping 80->8080, RAUTA is at localhost:8080
-    let response = client.get("http://localhost:8080/test/hello").send().await;
+    // Step 6: Test traffic through RAUTA
+    println!("  Step 6: Testing traffic through RAUTA (localhost:8080)");
 
     // Cleanup
     ctx.cleanup().await.expect("Should cleanup");
