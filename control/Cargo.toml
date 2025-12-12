@@ -85,4 +85,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = "0.4"
 
+# E2E testing with Kubernetes (path dep - only for local testing)
+# Note: Commented out for CI/Docker builds since seppo isn't available
+# Uncomment locally to run E2E tests: cargo test --test e2e -- --ignored
+# seppo = { path = "../../seppo" }
+
 [build-dependencies]

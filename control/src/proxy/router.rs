@@ -146,6 +146,24 @@ static REGEX_CACHE: Lazy<Mutex<HashMap<String, Arc<Regex>>>> =
 
 const MAX_REGEX_CACHE_SIZE: usize = 256;
 
+/// Get method prefix string for method-aware routing
+///
+/// Returns the method prefix used for prefix router lookups.
+/// Empty string for HttpMethod::ALL (wildcard routes match without prefix).
+#[inline]
+fn get_method_prefix(method: HttpMethod) -> &'static str {
+    match method {
+        HttpMethod::GET => "GET:",
+        HttpMethod::POST => "POST:",
+        HttpMethod::PUT => "PUT:",
+        HttpMethod::DELETE => "DELETE:",
+        HttpMethod::PATCH => "PATCH:",
+        HttpMethod::HEAD => "HEAD:",
+        HttpMethod::OPTIONS => "OPTIONS:",
+        HttpMethod::ALL => "",
+    }
+}
+
 /// Get or compile regex pattern with caching
 ///
 /// Returns Arc<Regex> for zero-cost cloning on hot path.
@@ -498,19 +516,8 @@ impl Router {
             if routes.contains_key(&key) {
                 Some(key)
             } else {
-                // Prefix match via matchit
-                // Prepend method to path for method-aware routing
-                let method_prefix = match method {
-                    HttpMethod::GET => "GET:",
-                    HttpMethod::POST => "POST:",
-                    HttpMethod::PUT => "PUT:",
-                    HttpMethod::DELETE => "DELETE:",
-                    HttpMethod::PATCH => "PATCH:",
-                    HttpMethod::HEAD => "HEAD:",
-                    HttpMethod::OPTIONS => "OPTIONS:",
-                    HttpMethod::ALL => "",
-                };
-
+                // Prefix match via matchit with method-aware routing
+                let method_prefix = get_method_prefix(method);
                 let method_prefixed_path = if method_prefix.is_empty() {
                     path.to_string()
                 } else {
@@ -1213,8 +1220,26 @@ impl Router {
             if routes.contains_key(&key) {
                 Some(key)
             } else {
+                // Prefix match via matchit with method-aware routing
+                let method_prefix = get_method_prefix(method);
+                let method_prefixed_path = if method_prefix.is_empty() {
+                    path.to_string()
+                } else {
+                    format!("{}{}", method_prefix, path)
+                };
+
                 let prefix_router = safe_read(&self.prefix_router);
-                prefix_router.at(path).ok().map(|m| *m.value)
+                let found_key = prefix_router
+                    .at(&method_prefixed_path)
+                    .ok()
+                    .map(|m| *m.value);
+
+                // If no match with specific method, try HttpMethod::ALL (wildcard)
+                if found_key.is_none() && method != HttpMethod::ALL {
+                    prefix_router.at(path).ok().map(|m| *m.value)
+                } else {
+                    found_key
+                }
             }
         }?;
 
@@ -1295,8 +1320,26 @@ impl Router {
             if routes.contains_key(&key) {
                 Some(key)
             } else {
+                // Prefix match via matchit with method-aware routing
+                let method_prefix = get_method_prefix(method);
+                let method_prefixed_path = if method_prefix.is_empty() {
+                    path.to_string()
+                } else {
+                    format!("{}{}", method_prefix, path)
+                };
+
                 let prefix_router = safe_read(&self.prefix_router);
-                prefix_router.at(path).ok().map(|m| *m.value)
+                let found_key = prefix_router
+                    .at(&method_prefixed_path)
+                    .ok()
+                    .map(|m| *m.value);
+
+                // If no match with specific method, try HttpMethod::ALL (wildcard)
+                if found_key.is_none() && method != HttpMethod::ALL {
+                    prefix_router.at(path).ok().map(|m| *m.value)
+                } else {
+                    found_key
+                }
             }
         }?;
 

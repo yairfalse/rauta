@@ -1,0 +1,666 @@
+//! RAUTA End-to-End Tests using Seppo
+//!
+//! These tests validate RAUTA's behavior in a real Kubernetes environment.
+//! They use the seppo testing framework for namespace isolation and cleanup.
+//!
+//! # Prerequisites
+//!
+//! 1. A Kind cluster named "rauta-e2e" must be running
+//! 2. RAUTA must be deployed as a DaemonSet in rauta-system namespace
+//! 3. Gateway API CRDs must be installed
+//!
+//! # Running Tests
+//!
+//! ```bash
+//! # Setup (one-time)
+//! kind create cluster --name rauta-e2e --config deploy/kind-config.yaml
+//! kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
+//! docker build -t rauta:latest .
+//! kind load docker-image rauta:latest --name rauta-e2e
+//! kubectl apply -f deploy/rauta-daemonset.yaml
+//!
+//! # Run tests
+//! cargo test --package control --test e2e -- --ignored --nocapture
+//! ```
+
+// Allow unwrap/expect/panic in test code - these are appropriate for tests
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
+#![allow(clippy::panic)]
+
+use seppo::{Context, Stack};
+use std::process::Command;
+use std::sync::Once;
+use std::time::Duration;
+
+// Install rustls crypto provider once at test startup
+static INIT: Once = Once::new();
+
+fn init_crypto() {
+    INIT.call_once(|| {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("Failed to install rustls crypto provider");
+    });
+}
+
+// =============================================================================
+// P0 Tests - Core Functionality (Must Work)
+// =============================================================================
+
+/// # Test: GatewayClass Acceptance
+///
+/// ## What We're Testing
+/// Verify that RAUTA's GatewayClass controller accepts GatewayClasses
+/// with the correct controllerName.
+///
+/// ## Setup
+/// 1. Create a GatewayClass with controllerName = "rauta.io/gateway-controller"
+///
+/// ## Test Steps
+/// 1. Apply the GatewayClass via kubectl
+/// 2. Wait for the status to be updated
+/// 3. Check that Accepted condition is True
+///
+/// ## Expected Results
+/// - GatewayClass exists in cluster
+/// - status.conditions contains Accepted=True
+/// - No error conditions
+///
+/// ## Failure Modes
+/// - Accepted=False: Controller running but rejecting (wrong controllerName?)
+/// - No status update: Controller not running or not watching GatewayClasses
+/// - Timeout: Controller crashed or very slow
+#[tokio::test]
+#[ignore] // Requires real cluster
+async fn test_p0_gatewayclass_acceptance() {
+    init_crypto();
+    let ctx = Context::new().await.expect("Should create context");
+    let gc_name = format!("rauta-test-{}", ctx.namespace.chars().skip(12).collect::<String>());
+
+    println!("=== Test: GatewayClass Acceptance ===");
+    println!("What: Verify RAUTA accepts GatewayClasses with correct controllerName");
+    println!("Expected: status.conditions[Accepted] = True");
+    println!();
+
+    // Step 1: Create GatewayClass via kubectl
+    println!("  Step 1: Creating GatewayClass '{}'", gc_name);
+    let yaml = format!(
+        r#"
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: {}
+spec:
+  controllerName: rauta.io/gateway-controller
+"#,
+        gc_name
+    );
+
+    let create_output = Command::new("kubectl")
+        .args(["apply", "-f", "-"])
+        .env(
+            "KUBECONFIG",
+            std::env::var("KUBECONFIG").unwrap_or_default(),
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.as_mut().unwrap().write_all(yaml.as_bytes())?;
+            child.wait_with_output()
+        })
+        .expect("kubectl apply failed");
+
+    assert!(
+        create_output.status.success(),
+        "Failed to create GatewayClass: {}",
+        String::from_utf8_lossy(&create_output.stderr)
+    );
+
+    // Step 2: Wait for status update
+    println!("  Step 2: Waiting for Accepted status (timeout: 30s)");
+    let start = std::time::Instant::now();
+    let mut accepted = false;
+
+    while start.elapsed() < Duration::from_secs(30) {
+        let output = Command::new("kubectl")
+            .args([
+                "get",
+                "gatewayclass",
+                &gc_name,
+                "-o",
+                "jsonpath={.status.conditions[?(@.type=='Accepted')].status}",
+            ])
+            .output()
+            .expect("kubectl get failed");
+
+        let status = String::from_utf8_lossy(&output.stdout);
+        if status.trim() == "True" {
+            accepted = true;
+            println!(
+                "  Step 3: GatewayClass Accepted=True after {:?}",
+                start.elapsed()
+            );
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    // Assert BEFORE cleanup to allow debugging failed tests
+    assert!(
+        accepted,
+        "GatewayClass should be Accepted=True. \
+         This means either:\n\
+         - RAUTA controller is not running\n\
+         - RAUTA is not watching GatewayClasses\n\
+         - controllerName doesn't match 'rauta.io/gateway-controller'"
+    );
+
+    println!("  PASSED: GatewayClass accepted by RAUTA controller");
+
+    // Cleanup GatewayClass
+    let _ = Command::new("kubectl")
+        .args(["delete", "gatewayclass", &gc_name])
+        .output();
+
+    // Cleanup namespace
+    ctx.cleanup().await.expect("Should cleanup");
+}
+
+/// # Test: Basic HTTP Routing
+///
+/// ## What We're Testing
+/// Verify that HTTP requests flow through RAUTA to a backend service.
+/// This is the fundamental "does it work at all" test.
+///
+/// ## Setup
+/// 1. Deploy echo-backend (nginx returning request info)
+/// 2. Create Gateway listening on port 80
+/// 3. Create HTTPRoute: /test/* -> echo-backend:80
+///
+/// ## Test Steps
+/// 1. Wait for all resources to be ready
+/// 2. Send GET /test/hello through RAUTA (via kind port mapping)
+/// 3. Verify response
+///
+/// ## Expected Results
+/// - HTTP 200 OK
+/// - Response body from nginx (proves it reached backend)
+/// - Latency < 1s (not stuck/timing out)
+///
+/// ## Failure Modes
+/// - 404: HTTPRoute not reconciled, path mismatch
+/// - 502: Backend unreachable, EndpointSlice not resolved
+/// - 503: Circuit breaker open, rate limited
+/// - Timeout: Listener not started, port not bound
+#[tokio::test]
+#[ignore] // Requires real cluster
+async fn test_p0_basic_http_routing() {
+    init_crypto();
+    let ctx = Context::new().await.expect("Should create context");
+    let ns = &ctx.namespace;
+
+    println!("=== Test: Basic HTTP Routing ===");
+    println!("What: Verify requests flow Client -> RAUTA -> Backend");
+    println!("Expected: HTTP 200 with backend response");
+    println!("Namespace: {}", ns);
+    println!();
+
+    // Step 1: Deploy backend using seppo Stack
+    // Using ealen/echo-server which responds 200 to any path
+    println!("  Step 1: Deploying echo-backend (echo-server)");
+    let stack = Stack::new()
+        .service("echo-backend")
+        .image("ealen/echo-server:latest")
+        .replicas(1)
+        .port(80)
+        .build();
+
+    ctx.up(&stack).await.expect("Should deploy backend stack");
+
+    // Wait for backend to be ready
+    println!("  Step 2: Waiting for backend to be ready");
+    ctx.wait_ready("deployment/echo-backend")
+        .await
+        .expect("Backend should be ready");
+
+    // Step 3: Create Gateway via kubectl
+    println!("  Step 3: Creating Gateway");
+    let gateway_yaml = format!(
+        r#"
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: rauta-gateway
+  namespace: {}
+spec:
+  gatewayClassName: rauta
+  listeners:
+  - name: http
+    port: 80
+    protocol: HTTP
+"#,
+        ns
+    );
+
+    apply_yaml(&gateway_yaml);
+
+    // Step 4: Create HTTPRoute via kubectl
+    println!("  Step 4: Creating HTTPRoute /test/* -> echo-backend");
+    let route_yaml = format!(
+        r#"
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: test-route
+  namespace: {}
+spec:
+  parentRefs:
+  - name: rauta-gateway
+    namespace: {}
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /test
+    backendRefs:
+    - name: echo-backend
+      port: 80
+"#,
+        ns, ns
+    );
+
+    apply_yaml(&route_yaml);
+
+    // Wait for reconciliation using polling
+    println!("  Step 5: Waiting for HTTPRoute reconciliation (up to 30s)");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("Should build HTTP client");
+
+    let rauta_url = std::env::var("RAUTA_TEST_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(30);
+    let poll_interval = Duration::from_secs(1);
+    let mut response = None;
+    while start.elapsed() < timeout {
+        match client.get(format!("{}/test/hello", rauta_url)).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    response = Some(Ok(resp));
+                    break;
+                } else {
+                    // Not ready yet, print status and retry
+                    println!(
+                        "    HTTPRoute not ready yet: got status {}. Retrying...",
+                        resp.status()
+                    );
+                }
+            }
+            Err(e) => {
+                println!("    HTTPRoute not ready yet: request error: {}. Retrying...", e);
+            }
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+    if response.is_none() {
+        panic!(
+            "Timed out waiting for HTTPRoute reconciliation after {:?}",
+            timeout
+        );
+    }
+    let response = response.unwrap();
+
+    // Step 6: Test traffic through RAUTA
+    println!("  Step 6: Testing traffic through RAUTA ({})", rauta_url);
+
+    // Assert BEFORE cleanup to allow debugging failed tests
+    match response {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+
+            println!(
+                "  Response: HTTP {} ({} bytes)",
+                status.as_u16(),
+                body.len()
+            );
+
+            assert!(
+                status.is_success(),
+                "Expected 2xx response, got {}. Body: {}\n\
+                 This means:\n\
+                 - 404: HTTPRoute not reconciled or path mismatch\n\
+                 - 502: Backend unreachable\n\
+                 - 503: Circuit breaker or rate limit",
+                status.as_u16(),
+                &body[..body.len().min(200)]
+            );
+
+            println!("  PASSED: Basic HTTP routing works");
+        }
+        Err(e) => {
+            panic!(
+                "Failed to connect to RAUTA: {}\n\
+                 This means:\n\
+                 - RAUTA not listening on port 80\n\
+                 - Kind port mapping not configured (80->8080)\n\
+                 - Network connectivity issue",
+                e
+            );
+        }
+    }
+
+    // Cleanup after assertions
+    ctx.cleanup().await.expect("Should cleanup");
+}
+
+/// # Test: Gateway Status Update
+///
+/// ## What We're Testing
+/// Verify that Gateway resources get proper status updates after reconciliation.
+///
+/// ## Setup
+/// 1. Create Gateway with HTTP listener on port 80
+///
+/// ## Test Steps
+/// 1. Apply Gateway
+/// 2. Wait for status update
+/// 3. Verify Accepted condition is True
+///
+/// ## Expected Results
+/// - status.conditions[Accepted] = True
+///
+/// ## Failure Modes
+/// - Accepted=False: Gateway rejected (invalid config?)
+/// - No status: Controller not reconciling Gateways
+#[tokio::test]
+#[ignore] // Requires real cluster
+async fn test_p0_gateway_status_update() {
+    init_crypto();
+    let ctx = Context::new().await.expect("Should create context");
+    let ns = &ctx.namespace;
+
+    println!("=== Test: Gateway Status Update ===");
+    println!("What: Verify Gateway gets Accepted status");
+    println!("Expected: Accepted=True");
+    println!("Namespace: {}", ns);
+    println!();
+
+    // Create Gateway
+    println!("  Step 1: Creating Gateway with HTTP listener");
+    let gateway_yaml = format!(
+        r#"
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: rauta-gateway
+  namespace: {}
+spec:
+  gatewayClassName: rauta
+  listeners:
+  - name: http
+    port: 80
+    protocol: HTTP
+"#,
+        ns
+    );
+
+    apply_yaml(&gateway_yaml);
+
+    // Wait for status
+    println!("  Step 2: Waiting for status update (timeout: 30s)");
+    let start = std::time::Instant::now();
+    let mut accepted = false;
+
+    while start.elapsed() < Duration::from_secs(30) {
+        let output = Command::new("kubectl")
+            .args([
+                "get",
+                "gateway",
+                "rauta-gateway",
+                "-n",
+                ns,
+                "-o",
+                "jsonpath={.status.conditions[?(@.type=='Accepted')].status}",
+            ])
+            .output()
+            .expect("kubectl get failed");
+
+        let status = String::from_utf8_lossy(&output.stdout);
+        if status.trim() == "True" {
+            accepted = true;
+            println!(
+                "  Step 3: Gateway Accepted=True after {:?}",
+                start.elapsed()
+            );
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    // Assert BEFORE cleanup to allow debugging failed tests
+    assert!(
+        accepted,
+        "Gateway should have Accepted=True status.\n\
+         This means:\n\
+         - Gateway controller not running\n\
+         - GatewayClass 'rauta' doesn't exist\n\
+         - Gateway rejected due to invalid config"
+    );
+
+    println!("  PASSED: Gateway status updated correctly");
+
+    // Cleanup after assertions
+    ctx.cleanup().await.expect("Should cleanup");
+}
+
+// =============================================================================
+// P1 Tests - Core Features
+// =============================================================================
+
+/// # Test: EndpointSlice Dynamic Updates
+///
+/// ## What We're Testing
+/// Verify that scaling a backend deployment updates the routing table.
+/// RAUTA should pick up new pod IPs via EndpointSlice watching.
+///
+/// ## Setup
+/// 1. Deploy backend with 1 replica
+/// 2. Create Gateway + HTTPRoute
+///
+/// ## Test Steps
+/// 1. Verify traffic works with 1 backend
+/// 2. Scale to 3 replicas
+/// 3. Wait for EndpointSlice update
+/// 4. Verify traffic still works
+///
+/// ## Expected Results
+/// - Traffic works before and after scaling
+/// - No 502 errors during scale-up
+///
+/// ## Failure Modes
+/// - 502 after scale: EndpointSlice watcher not updating router
+/// - Traffic to old IPs: Stale cache
+#[tokio::test]
+#[ignore] // Requires real cluster
+async fn test_p1_endpointslice_scaling() {
+    init_crypto();
+    let ctx = Context::new().await.expect("Should create context");
+    let ns = &ctx.namespace;
+
+    println!("=== Test: EndpointSlice Dynamic Updates ===");
+    println!("What: Verify scaling backends updates routing table");
+    println!("Expected: Traffic works after scale 1->3");
+    println!("Namespace: {}", ns);
+    println!();
+
+    // Step 1: Deploy backend with 1 replica
+    // Using ealen/echo-server which responds 200 to any path
+    println!("  Step 1: Deploying backend with 1 replica");
+    let stack = Stack::new()
+        .service("scale-backend")
+        .image("ealen/echo-server:latest")
+        .replicas(1)
+        .port(80)
+        .build();
+
+    ctx.up(&stack).await.expect("Should deploy backend");
+    ctx.wait_ready("deployment/scale-backend")
+        .await
+        .expect("Backend should be ready");
+
+    // Create Gateway + HTTPRoute
+    println!("  Step 2: Creating Gateway and HTTPRoute");
+    let gateway_yaml = format!(
+        r#"
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: rauta-gateway
+  namespace: {}
+spec:
+  gatewayClassName: rauta
+  listeners:
+  - name: http
+    port: 80
+    protocol: HTTP
+"#,
+        ns
+    );
+    apply_yaml(&gateway_yaml);
+
+    let route_yaml = format!(
+        r#"
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: scale-route
+  namespace: {}
+spec:
+  parentRefs:
+  - name: rauta-gateway
+    namespace: {}
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /scale
+    backendRefs:
+    - name: scale-backend
+      port: 80
+"#,
+        ns, ns
+    );
+    apply_yaml(&route_yaml);
+
+    // Wait for HTTPRoute reconciliation using polling
+    println!("  Step 3: Waiting for HTTPRoute reconciliation (up to 30s)");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("Should build HTTP client");
+
+    let rauta_url = std::env::var("RAUTA_TEST_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(30);
+    let poll_interval = Duration::from_secs(1);
+
+    while start.elapsed() < timeout {
+        match client.get(format!("{}/scale/test", rauta_url)).send().await {
+            Ok(resp) if resp.status().is_success() => break,
+            _ => {}
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    // Step 4: Scale to 3
+    println!("  Step 4: Scaling to 3 replicas");
+    ctx.scale("deployment/scale-backend", 3)
+        .await
+        .expect("Should scale");
+
+    // Wait for all replicas
+    println!("  Step 5: Waiting for 3 replicas to be ready");
+    ctx.wait_ready("deployment/scale-backend")
+        .await
+        .expect("Scaled backend should be ready");
+
+    // Wait for EndpointSlice update using polling (up to 30s)
+    println!("  Step 6: Waiting for EndpointSlice update (up to 30s)");
+    let start = std::time::Instant::now();
+    let mut response = None;
+
+    while start.elapsed() < timeout {
+        match client.get(format!("{}/scale/test", rauta_url)).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                response = Some(Ok(resp));
+                break;
+            }
+            Ok(resp) => {
+                println!("    Not ready yet: got status {}. Retrying...", resp.status());
+            }
+            Err(e) => {
+                println!("    Not ready yet: {}. Retrying...", e);
+            }
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    // Step 7: Verify traffic works
+    println!("  Step 7: Verifying traffic works after scale");
+
+    // Assert BEFORE cleanup to allow debugging failed tests
+    match response {
+        Some(Ok(resp)) => {
+            assert!(
+                resp.status().is_success(),
+                "Traffic should work after scaling, got {}",
+                resp.status()
+            );
+            println!("  PASSED: EndpointSlice scaling works");
+        }
+        Some(Err(e)) => {
+            panic!("Traffic failed after scaling: {}", e);
+        }
+        None => {
+            panic!("Timed out waiting for traffic after scaling");
+        }
+    }
+
+    // Cleanup after assertions
+    ctx.cleanup().await.expect("Should cleanup");
+}
+
+// =============================================================================
+// Utilities
+// =============================================================================
+
+/// Apply YAML via kubectl
+fn apply_yaml(yaml: &str) {
+    let output = Command::new("kubectl")
+        .args(["apply", "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.as_mut().unwrap().write_all(yaml.as_bytes())?;
+            child.wait_with_output()
+        })
+        .expect("kubectl apply failed");
+
+    if !output.status.success() {
+        panic!(
+            "kubectl apply failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
