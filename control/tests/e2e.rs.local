@@ -76,7 +76,7 @@ fn init_crypto() {
 async fn test_p0_gatewayclass_acceptance() {
     init_crypto();
     let ctx = Context::new().await.expect("Should create context");
-    let gc_name = format!("rauta-test-{}", &ctx.namespace[12..]);
+    let gc_name = format!("rauta-test-{}", ctx.namespace.chars().skip(12).collect::<String>());
 
     println!("=== Test: GatewayClass Acceptance ===");
     println!("What: Verify RAUTA accepts GatewayClasses with correct controllerName");
