@@ -150,15 +150,7 @@ spec:
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
-    // Cleanup GatewayClass
-    let _ = Command::new("kubectl")
-        .args(["delete", "gatewayclass", &gc_name])
-        .output();
-
-    // Cleanup namespace
-    ctx.cleanup().await.expect("Should cleanup");
-
-    // Assert
+    // Assert BEFORE cleanup to allow debugging failed tests
     assert!(
         accepted,
         "GatewayClass should be Accepted=True. \
@@ -169,6 +161,14 @@ spec:
     );
 
     println!("  PASSED: GatewayClass accepted by RAUTA controller");
+
+    // Cleanup GatewayClass
+    let _ = Command::new("kubectl")
+        .args(["delete", "gatewayclass", &gc_name])
+        .output();
+
+    // Cleanup namespace
+    ctx.cleanup().await.expect("Should cleanup");
 }
 
 /// # Test: Basic HTTP Routing
@@ -282,12 +282,14 @@ spec:
         .timeout(Duration::from_secs(5))
         .build()
         .expect("Should build HTTP client");
+
+    let rauta_url = std::env::var("RAUTA_TEST_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(30);
     let poll_interval = Duration::from_secs(1);
     let mut response = None;
     while start.elapsed() < timeout {
-        match client.get("http://localhost:8080/test/hello").send().await {
+        match client.get(format!("{}/test/hello", rauta_url)).send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
                     response = Some(Ok(resp));
@@ -315,12 +317,9 @@ spec:
     let response = response.unwrap();
 
     // Step 6: Test traffic through RAUTA
-    println!("  Step 6: Testing traffic through RAUTA (localhost:8080)");
+    println!("  Step 6: Testing traffic through RAUTA ({})", rauta_url);
 
-    // Cleanup
-    ctx.cleanup().await.expect("Should cleanup");
-
-    // Assert
+    // Assert BEFORE cleanup to allow debugging failed tests
     match response {
         Ok(resp) => {
             let status = resp.status();
@@ -356,6 +355,9 @@ spec:
             );
         }
     }
+
+    // Cleanup after assertions
+    ctx.cleanup().await.expect("Should cleanup");
 }
 
 /// # Test: Gateway Status Update
@@ -443,10 +445,7 @@ spec:
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
-    // Cleanup
-    ctx.cleanup().await.expect("Should cleanup");
-
-    // Assert
+    // Assert BEFORE cleanup to allow debugging failed tests
     assert!(
         accepted,
         "Gateway should have Accepted=True status.\n\
@@ -457,6 +456,9 @@ spec:
     );
 
     println!("  PASSED: Gateway status updated correctly");
+
+    // Cleanup after assertions
+    ctx.cleanup().await.expect("Should cleanup");
 }
 
 // =============================================================================
@@ -558,38 +560,65 @@ spec:
     );
     apply_yaml(&route_yaml);
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    // Step 3: Scale to 3
-    println!("  Step 3: Scaling to 3 replicas");
-    ctx.scale("deployment/scale-backend", 3)
-        .await
-        .expect("Should scale");
-
-    // Wait for all replicas
-    println!("  Step 4: Waiting for 3 replicas to be ready");
-    ctx.wait_ready("deployment/scale-backend")
-        .await
-        .expect("Scaled backend should be ready");
-
-    // Give EndpointSlice watcher time to update
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    // Step 5: Verify traffic still works
-    println!("  Step 5: Verifying traffic works after scale");
+    // Wait for HTTPRoute reconciliation using polling
+    println!("  Step 3: Waiting for HTTPRoute reconciliation (up to 30s)");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .expect("Should build HTTP client");
 
-    let response = client.get("http://localhost:8080/scale/test").send().await;
+    let rauta_url = std::env::var("RAUTA_TEST_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(30);
+    let poll_interval = Duration::from_secs(1);
 
-    // Cleanup
-    ctx.cleanup().await.expect("Should cleanup");
+    while start.elapsed() < timeout {
+        match client.get(format!("{}/scale/test", rauta_url)).send().await {
+            Ok(resp) if resp.status().is_success() => break,
+            _ => {}
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
 
-    // Assert
+    // Step 4: Scale to 3
+    println!("  Step 4: Scaling to 3 replicas");
+    ctx.scale("deployment/scale-backend", 3)
+        .await
+        .expect("Should scale");
+
+    // Wait for all replicas
+    println!("  Step 5: Waiting for 3 replicas to be ready");
+    ctx.wait_ready("deployment/scale-backend")
+        .await
+        .expect("Scaled backend should be ready");
+
+    // Wait for EndpointSlice update using polling (up to 30s)
+    println!("  Step 6: Waiting for EndpointSlice update (up to 30s)");
+    let start = std::time::Instant::now();
+    let mut response = None;
+
+    while start.elapsed() < timeout {
+        match client.get(format!("{}/scale/test", rauta_url)).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                response = Some(Ok(resp));
+                break;
+            }
+            Ok(resp) => {
+                println!("    Not ready yet: got status {}. Retrying...", resp.status());
+            }
+            Err(e) => {
+                println!("    Not ready yet: {}. Retrying...", e);
+            }
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    // Step 7: Verify traffic works
+    println!("  Step 7: Verifying traffic works after scale");
+
+    // Assert BEFORE cleanup to allow debugging failed tests
     match response {
-        Ok(resp) => {
+        Some(Ok(resp)) => {
             assert!(
                 resp.status().is_success(),
                 "Traffic should work after scaling, got {}",
@@ -597,10 +626,16 @@ spec:
             );
             println!("  PASSED: EndpointSlice scaling works");
         }
-        Err(e) => {
+        Some(Err(e)) => {
             panic!("Traffic failed after scaling: {}", e);
         }
+        None => {
+            panic!("Timed out waiting for traffic after scaling");
+        }
     }
+
+    // Cleanup after assertions
+    ctx.cleanup().await.expect("Should cleanup");
 }
 
 // =============================================================================
