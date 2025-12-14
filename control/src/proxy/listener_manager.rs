@@ -101,11 +101,13 @@ pub struct ListenerManager {
     /// Protocol cache: tracks which backends support HTTP/2
     /// Key: "ip:port", Value: HttpProtocol enum
     protocol_cache: Arc<tokio::sync::RwLock<HashMap<String, HttpProtocol>>>,
+    /// Optional TLS acceptor for HTTPS listeners (with ALPN for HTTP/2)
+    tls_acceptor: Option<TlsAcceptor>,
 }
 
 #[allow(dead_code)] // Methods used in Gateway reconciliation and tests
 impl ListenerManager {
-    /// Create new ListenerManager
+    /// Create new ListenerManager (HTTP only, no TLS)
     pub fn new(
         router: Arc<Router>,
         rate_limiter: Arc<crate::proxy::rate_limiter::RateLimiter>,
@@ -126,6 +128,44 @@ impl ListenerManager {
             circuit_breaker,
             http_client,
             protocol_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            tls_acceptor: None,
+        }
+    }
+
+    /// Create ListenerManager with TLS support (HTTPS with ALPN for HTTP/2)
+    ///
+    /// The SniResolver provides SNI-based certificate selection for multiple hostnames.
+    /// ALPN is configured to negotiate HTTP/2 (h2) or fall back to HTTP/1.1.
+    pub fn with_tls(
+        router: Arc<Router>,
+        rate_limiter: Arc<crate::proxy::rate_limiter::RateLimiter>,
+        circuit_breaker: Arc<crate::proxy::circuit_breaker::CircuitBreakerManager>,
+        sni_resolver: SniResolver,
+    ) -> Self {
+        let http_client = Client::builder(TokioExecutor::new())
+            .pool_max_idle_per_host(16)
+            .pool_idle_timeout(Duration::from_secs(60))
+            .build_http();
+
+        // Build ServerConfig with ALPN for HTTP/2 and HTTP/1.1
+        let server_config = sni_resolver
+            .to_server_config()
+            .expect("Failed to build TLS config from SniResolver");
+
+        // Enable ALPN: prefer h2, fall back to http/1.1
+        let mut server_config = (*server_config).clone();
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        Self {
+            listeners: Arc::new(RwLock::new(HashMap::new())),
+            router,
+            rate_limiter,
+            circuit_breaker,
+            http_client,
+            protocol_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            tls_acceptor: Some(tls_acceptor),
         }
     }
 
@@ -271,8 +311,17 @@ impl ListenerManager {
         let circuit_breaker = self.circuit_breaker.clone();
         let http_client = self.http_client.clone();
         let protocol_cache = self.protocol_cache.clone();
+        let tls_acceptor = self.tls_acceptor.clone();
         let bind_addr = config.bind_addr();
         let protocol = config.protocol.clone();
+
+        // Verify TLS is configured for HTTPS
+        if protocol == Protocol::HTTPS && tls_acceptor.is_none() {
+            return Err(
+                "HTTPS listener requires TLS configuration. Use ListenerManager::with_tls()"
+                    .to_string(),
+            );
+        }
 
         // Try to bind immediately to detect port conflicts
         let listener = TcpListener::bind(&bind_addr)
@@ -295,40 +344,38 @@ impl ListenerManager {
                                 let http_client = http_client.clone();
                                 let protocol_cache = protocol_cache.clone();
                                 let protocol = protocol.clone();
+                                let tls_acceptor = tls_acceptor.clone();
 
                                 // Spawn connection handler
                                 tokio::spawn(async move {
-                                    let io = TokioIo::new(stream);
-
-                                    // Create service that uses the router
-                                    let service = service_fn(move |req: Request<hyper::body::Incoming>| {
-                                        let router = router.clone();
-                                        let rate_limiter = rate_limiter.clone();
-                                        let circuit_breaker = circuit_breaker.clone();
-                                        let http_client = http_client.clone();
-                                        let protocol_cache = protocol_cache.clone();
-                                        async move {
-                                            Self::handle_request(req, router, rate_limiter, circuit_breaker, http_client, protocol_cache).await
-                                        }
-                                    });
-
-                                    // Serve connection based on protocol
-                                    let result = match protocol {
+                                    match protocol {
                                         Protocol::HTTP => {
-                                            http1::Builder::new()
-                                                .serve_connection(io, service)
-                                                .await
+                                            // HTTP: serve directly
+                                            Self::serve_http_connection(
+                                                stream,
+                                                router,
+                                                rate_limiter,
+                                                circuit_breaker,
+                                                http_client,
+                                                protocol_cache,
+                                            ).await;
                                         }
                                         Protocol::HTTPS => {
-                                            // TODO: TLS termination
-                                            http1::Builder::new()
-                                                .serve_connection(io, service)
-                                                .await
+                                            // HTTPS: TLS handshake with ALPN, then HTTP/2 or HTTP/1.1
+                                            if let Some(acceptor) = tls_acceptor {
+                                                Self::serve_https_connection(
+                                                    stream,
+                                                    acceptor,
+                                                    router,
+                                                    rate_limiter,
+                                                    circuit_breaker,
+                                                    http_client,
+                                                    protocol_cache,
+                                                ).await;
+                                            } else {
+                                                error!("HTTPS connection received but TLS not configured");
+                                            }
                                         }
-                                    };
-
-                                    if let Err(e) = result {
-                                        debug!("Connection error: {}", e);
                                     }
                                 });
                             }
@@ -353,6 +400,107 @@ impl ListenerManager {
             cancel_tx,
             task_handle,
         })
+    }
+
+    /// Serve an HTTP connection (HTTP/1.1)
+    async fn serve_http_connection(
+        stream: TcpStream,
+        router: Arc<Router>,
+        rate_limiter: Arc<crate::proxy::rate_limiter::RateLimiter>,
+        circuit_breaker: Arc<crate::proxy::circuit_breaker::CircuitBreakerManager>,
+        http_client: PooledClient,
+        protocol_cache: Arc<tokio::sync::RwLock<HashMap<String, HttpProtocol>>>,
+    ) {
+        let io = TokioIo::new(stream);
+
+        let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+            let router = router.clone();
+            let rate_limiter = rate_limiter.clone();
+            let circuit_breaker = circuit_breaker.clone();
+            let http_client = http_client.clone();
+            let protocol_cache = protocol_cache.clone();
+            async move {
+                Self::handle_request(
+                    req,
+                    router,
+                    rate_limiter,
+                    circuit_breaker,
+                    http_client,
+                    protocol_cache,
+                )
+                .await
+            }
+        });
+
+        if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+            debug!("HTTP connection error: {}", e);
+        }
+    }
+
+    /// Serve an HTTPS connection with TLS termination and ALPN negotiation
+    ///
+    /// Uses ALPN to negotiate HTTP/2 (h2) or HTTP/1.1 with the client.
+    async fn serve_https_connection(
+        stream: TcpStream,
+        acceptor: TlsAcceptor,
+        router: Arc<Router>,
+        rate_limiter: Arc<crate::proxy::rate_limiter::RateLimiter>,
+        circuit_breaker: Arc<crate::proxy::circuit_breaker::CircuitBreakerManager>,
+        http_client: PooledClient,
+        protocol_cache: Arc<tokio::sync::RwLock<HashMap<String, HttpProtocol>>>,
+    ) {
+        // Perform TLS handshake with ALPN negotiation
+        let tls_stream = match acceptor.accept(stream).await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("TLS handshake failed: {}", e);
+                return;
+            }
+        };
+
+        // Check negotiated ALPN protocol
+        let is_h2 = {
+            let (_, conn) = tls_stream.get_ref();
+            conn.alpn_protocol() == Some(b"h2")
+        };
+
+        let io = TokioIo::new(tls_stream);
+
+        // Create service for request handling
+        let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+            let router = router.clone();
+            let rate_limiter = rate_limiter.clone();
+            let circuit_breaker = circuit_breaker.clone();
+            let http_client = http_client.clone();
+            let protocol_cache = protocol_cache.clone();
+            async move {
+                Self::handle_request(
+                    req,
+                    router,
+                    rate_limiter,
+                    circuit_breaker,
+                    http_client,
+                    protocol_cache,
+                )
+                .await
+            }
+        });
+
+        // Use HTTP/2 or HTTP/1.1 based on ALPN negotiation
+        if is_h2 {
+            debug!("Serving HTTP/2 connection (ALPN negotiated h2)");
+            if let Err(e) = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await
+            {
+                debug!("HTTP/2 connection error: {}", e);
+            }
+        } else {
+            debug!("Serving HTTP/1.1 connection (ALPN negotiated http/1.1 or no ALPN)");
+            if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+                debug!("HTTP/1.1 connection error: {}", e);
+            }
+        }
     }
 
     /// Build a 502 Bad Gateway response

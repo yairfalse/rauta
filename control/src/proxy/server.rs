@@ -1307,6 +1307,13 @@ async fn handle_request(
             warn!("Failed to gather HTTP/2 pool metrics");
         }
 
+        // Append GatewayIndex metrics (lock-free atomics)
+        let gateway_index_text = crate::apis::gateway::gateway_index::gateway_index_metrics();
+        if !gateway_index_text.is_empty() {
+            buffer.extend_from_slice(b"\n");
+            buffer.extend_from_slice(gateway_index_text.as_bytes());
+        }
+
         // Response builder with valid status/headers should never fail
         #[allow(clippy::unwrap_used)]
         return Ok(Response::builder()

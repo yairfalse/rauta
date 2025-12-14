@@ -41,7 +41,7 @@ use tracing::warn;
 /// We use .into_inner() to extract the guard, logging the poisoning event
 /// for observability but continuing operation.
 #[inline]
-fn safe_read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+pub fn safe_read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
     lock.read().unwrap_or_else(|poisoned| {
         warn!("RwLock poisoned during read, recovering (data is still valid)");
         poisoned.into_inner()
@@ -50,7 +50,7 @@ fn safe_read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
 
 /// Safe RwLock write access with automatic poison recovery
 #[inline]
-fn safe_write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+pub fn safe_write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     lock.write().unwrap_or_else(|poisoned| {
         warn!("RwLock poisoned during write, recovering (data is still valid)");
         poisoned.into_inner()
@@ -59,7 +59,7 @@ fn safe_write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 
 /// Safe Mutex access with automatic poison recovery
 #[inline]
-fn safe_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub fn safe_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
         warn!("Mutex poisoned, recovering (data is still valid)");
         poisoned.into_inner()
@@ -514,8 +514,25 @@ impl Router {
         let route_key = {
             let routes = safe_read(&self.routes);
             if routes.contains_key(&key) {
+                // Exact match with specific method
                 Some(key)
+            } else if method != HttpMethod::ALL {
+                // Try HttpMethod::ALL fallback for exact match (O(1))
+                // Gateway API: routes without method constraints match all methods
+                let all_key = RouteKey {
+                    method: HttpMethod::ALL,
+                    path_hash,
+                };
+                if routes.contains_key(&all_key) {
+                    Some(all_key)
+                } else {
+                    // Fall through to prefix match
+                    None
+                }
             } else {
+                None
+            }
+            .or_else(|| {
                 // Prefix match via matchit with method-aware routing
                 let method_prefix = get_method_prefix(method);
                 let method_prefixed_path = if method_prefix.is_empty() {
@@ -537,7 +554,7 @@ impl Router {
                 } else {
                     found_key
                 }
-            }
+            })
         }?;
 
         // Look up route
@@ -2119,6 +2136,78 @@ mod tests {
                 method
             );
         }
+    }
+
+    #[test]
+    fn test_exact_match_falls_back_to_method_all() {
+        // RED: Test that exact match falls back to HttpMethod::ALL
+        // When a route is registered with HttpMethod::ALL, requests with any specific
+        // method should match via exact lookup (not just prefix router fallback)
+        let router = Router::new();
+
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 2, 10), 8080, 100)];
+
+        // Add route with HttpMethod::ALL (wildcard)
+        router
+            .add_route(HttpMethod::ALL, "/exact/path", backends)
+            .expect("Should add route with HttpMethod::ALL");
+
+        // Verify exact path matches work for all methods
+        // This should hit the exact match path in select_backend, NOT prefix router
+        for method in &[
+            HttpMethod::GET,
+            HttpMethod::POST,
+            HttpMethod::PUT,
+            HttpMethod::DELETE,
+        ] {
+            let route_match = router
+                .select_backend(*method, "/exact/path", None, None)
+                .unwrap_or_else(|| panic!("Should match {:?} via exact path", method));
+            assert_eq!(
+                route_match.backend.as_ipv4().unwrap(),
+                Ipv4Addr::new(10, 0, 2, 10),
+                "Exact match should fall back to HttpMethod::ALL for {:?}",
+                method
+            );
+        }
+    }
+
+    #[test]
+    fn test_specific_method_takes_precedence_over_all() {
+        // RED: Test that specific method routes take precedence over HttpMethod::ALL
+        // When both GET /api and ALL /api exist, GET /api should win for GET requests
+        let router = Router::new();
+
+        let all_backend = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 2, 20), 8080, 100)];
+        let get_backend = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 2, 21), 8080, 100)];
+
+        // Add both routes - ALL first, then GET
+        router
+            .add_route(HttpMethod::ALL, "/api/dual", all_backend)
+            .expect("Should add ALL route");
+        router
+            .add_route(HttpMethod::GET, "/api/dual", get_backend)
+            .expect("Should add GET route");
+
+        // GET should match specific GET route (10.0.2.21)
+        let get_match = router
+            .select_backend(HttpMethod::GET, "/api/dual", None, None)
+            .expect("Should match GET");
+        assert_eq!(
+            get_match.backend.as_ipv4().unwrap(),
+            Ipv4Addr::new(10, 0, 2, 21),
+            "GET should match specific GET route, not ALL"
+        );
+
+        // POST should fall back to ALL route (10.0.2.20)
+        let post_match = router
+            .select_backend(HttpMethod::POST, "/api/dual", None, None)
+            .expect("Should match POST via ALL fallback");
+        assert_eq!(
+            post_match.backend.as_ipv4().unwrap(),
+            Ipv4Addr::new(10, 0, 2, 20),
+            "POST should fall back to ALL route"
+        );
     }
 
     // ============================================
