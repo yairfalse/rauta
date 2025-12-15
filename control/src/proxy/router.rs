@@ -288,6 +288,7 @@ struct RouteKey {
 /// - Prefix match via matchit radix tree (O(log n) for prefixes)
 /// - Passive health checking (circuit breaker for unhealthy backends)
 /// - Active health checking (TCP probes with Prometheus metrics)
+/// - Route LRU cache for O(1) repeated lookups
 pub struct Router {
     routes: Arc<RwLock<HashMap<RouteKey, Route>>>,
     prefix_router: Arc<RwLock<matchit::Router<RouteKey>>>,
@@ -297,6 +298,110 @@ pub struct Router {
     backend_health: Arc<RwLock<HashMap<Backend, BackendHealth>>>,
     /// Active health checker (TCP probes)
     health_checker: Arc<HealthChecker>,
+    /// Route lookup cache: (method, path_hash) -> RouteKey
+    /// Provides O(1) lookup for hot paths, avoiding prefix router traversal
+    route_cache: Arc<RwLock<RouteLruCache>>,
+}
+
+/// LRU cache for route lookups with hit/miss statistics
+struct RouteLruCache {
+    /// Cache entries: path_hash -> (RouteKey, access_order)
+    entries: HashMap<RouteKey, CacheEntry>,
+    /// Access order for LRU eviction (most recent at back)
+    access_order: VecDeque<RouteKey>,
+    /// Cache statistics
+    hits: u64,
+    misses: u64,
+    /// Maximum cache size
+    max_size: usize,
+}
+
+struct CacheEntry {
+    /// The resolved route key (for prefix matches)
+    resolved_key: RouteKey,
+}
+
+const ROUTE_CACHE_MAX_SIZE: usize = 128;
+
+impl RouteLruCache {
+    fn new(max_size: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(max_size),
+            access_order: VecDeque::with_capacity(max_size),
+            hits: 0,
+            misses: 0,
+            max_size,
+        }
+    }
+
+    /// Get cached route key, returns None on miss
+    fn get(&mut self, key: &RouteKey) -> Option<RouteKey> {
+        if let Some(entry) = self.entries.get(key) {
+            self.hits += 1;
+            // Move to back of access order (most recently used)
+            if let Some(pos) = self.access_order.iter().position(|k| k == key) {
+                self.access_order.remove(pos);
+            }
+            self.access_order.push_back(*key);
+            Some(entry.resolved_key)
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    /// Insert or update cache entry with LRU eviction
+    fn insert(&mut self, lookup_key: RouteKey, resolved_key: RouteKey) {
+        // If already present, just update
+        if self.entries.contains_key(&lookup_key) {
+            if let Some(entry) = self.entries.get_mut(&lookup_key) {
+                entry.resolved_key = resolved_key;
+            }
+            // Move to back of access order (most recently used)
+            if let Some(pos) = self.access_order.iter().position(|k| k == &lookup_key) {
+                self.access_order.remove(pos);
+            }
+            self.access_order.push_back(lookup_key);
+            return;
+        }
+
+        // Evict oldest entry if at capacity
+        if self.entries.len() >= self.max_size {
+            if let Some(oldest) = self.access_order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+
+        // Insert new entry
+        self.entries.insert(lookup_key, CacheEntry { resolved_key });
+        self.access_order.push_back(lookup_key);
+    }
+
+    /// Invalidate a specific key (e.g., when route is updated)
+    fn invalidate(&mut self, key: &RouteKey) {
+        self.entries.remove(key);
+        if let Some(pos) = self.access_order.iter().position(|k| k == key) {
+            self.access_order.remove(pos);
+        }
+    }
+
+    /// Clear all cache entries (e.g., when routes are rebuilt)
+    #[allow(dead_code)] // For future use when full route table is rebuilt
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.access_order.clear();
+        // Don't reset stats - they're useful for monitoring
+    }
+
+    /// Get cache statistics
+    fn stats(&self) -> (u64, u64) {
+        (self.hits, self.misses)
+    }
+
+    /// Get current cache size
+    fn size(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 impl Default for Router {
@@ -312,6 +417,7 @@ impl Default for Router {
             draining_backends: Arc::new(RwLock::new(HashMap::new())),
             backend_health: Arc::new(RwLock::new(HashMap::new())),
             health_checker: Arc::new(HealthChecker::new(HealthCheckConfig::default(), &registry)),
+            route_cache: Arc::new(RwLock::new(RouteLruCache::new(ROUTE_CACHE_MAX_SIZE))),
         }
     }
 }
@@ -320,6 +426,23 @@ impl Router {
     /// Create new router
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Get route cache statistics (hits, misses)
+    ///
+    /// Useful for monitoring cache effectiveness.
+    /// Hit ratio = hits / (hits + misses)
+    pub fn get_cache_stats(&self) -> (u64, u64) {
+        let cache = safe_read(&self.route_cache);
+        cache.stats()
+    }
+
+    /// Get current route cache size
+    ///
+    /// Returns the number of entries currently in the cache.
+    pub fn get_cache_size(&self) -> usize {
+        let cache = safe_read(&self.route_cache);
+        cache.size()
     }
 
     /// Add or update route with backends (idempotent)
@@ -433,6 +556,12 @@ impl Router {
             *prefix_router = new_prefix_router;
         }
 
+        // Invalidate route cache for this key (the route was added/updated)
+        {
+            let mut cache = safe_write(&self.route_cache);
+            cache.invalidate(&key);
+        }
+
         Ok(())
     }
 
@@ -497,7 +626,7 @@ impl Router {
 
     /// Select backend for request
     ///
-    /// Tries exact match first (O(1)), then prefix match (O(log n)).
+    /// Tries LRU cache first (O(1)), then exact match (O(1)), then prefix match (O(log n)).
     /// Uses Maglev consistent hashing for backend selection.
     /// Returns backend + matched route pattern for metrics.
     pub fn select_backend(
@@ -510,52 +639,71 @@ impl Router {
         let path_hash = fnv1a_hash(path.as_bytes());
         let key = RouteKey { method, path_hash };
 
-        // Try exact match first, then prefix match
-        let route_key = {
-            let routes = safe_read(&self.routes);
-            if routes.contains_key(&key) {
-                // Exact match with specific method
-                Some(key)
-            } else if method != HttpMethod::ALL {
-                // Try HttpMethod::ALL fallback for exact match (O(1))
-                // Gateway API: routes without method constraints match all methods
-                let all_key = RouteKey {
-                    method: HttpMethod::ALL,
-                    path_hash,
-                };
-                if routes.contains_key(&all_key) {
-                    Some(all_key)
+        // Try LRU cache first (O(1) for hot paths)
+        let cached_key = {
+            let mut cache = safe_write(&self.route_cache);
+            cache.get(&key)
+        };
+
+        let route_key = if let Some(cached) = cached_key {
+            // Cache hit - use cached route key
+            cached
+        } else {
+            // Cache miss - do normal lookup
+            let resolved_key = {
+                let routes = safe_read(&self.routes);
+                if routes.contains_key(&key) {
+                    // Exact match with specific method
+                    Some(key)
+                } else if method != HttpMethod::ALL {
+                    // Try HttpMethod::ALL fallback for exact match (O(1))
+                    // Gateway API: routes without method constraints match all methods
+                    let all_key = RouteKey {
+                        method: HttpMethod::ALL,
+                        path_hash,
+                    };
+                    if routes.contains_key(&all_key) {
+                        Some(all_key)
+                    } else {
+                        // Fall through to prefix match
+                        None
+                    }
                 } else {
-                    // Fall through to prefix match
                     None
                 }
-            } else {
-                None
+                .or_else(|| {
+                    // Prefix match via matchit with method-aware routing
+                    let method_prefix = get_method_prefix(method);
+                    let method_prefixed_path = if method_prefix.is_empty() {
+                        path.to_string()
+                    } else {
+                        format!("{}{}", method_prefix, path)
+                    };
+
+                    let prefix_router = safe_read(&self.prefix_router);
+                    let found_key = prefix_router
+                        .at(&method_prefixed_path)
+                        .ok()
+                        .map(|m| *m.value);
+
+                    // If no match with specific method, try HttpMethod::ALL (wildcard)
+                    // This implements Gateway API behavior: routes without method constraints match all methods
+                    if found_key.is_none() && method != HttpMethod::ALL {
+                        prefix_router.at(path).ok().map(|m| *m.value)
+                    } else {
+                        found_key
+                    }
+                })
+            };
+
+            // Cache the result for future lookups
+            if let Some(resolved) = resolved_key {
+                let mut cache = safe_write(&self.route_cache);
+                cache.insert(key, resolved);
             }
-            .or_else(|| {
-                // Prefix match via matchit with method-aware routing
-                let method_prefix = get_method_prefix(method);
-                let method_prefixed_path = if method_prefix.is_empty() {
-                    path.to_string()
-                } else {
-                    format!("{}{}", method_prefix, path)
-                };
 
-                let prefix_router = safe_read(&self.prefix_router);
-                let found_key = prefix_router
-                    .at(&method_prefixed_path)
-                    .ok()
-                    .map(|m| *m.value);
-
-                // If no match with specific method, try HttpMethod::ALL (wildcard)
-                // This implements Gateway API behavior: routes without method constraints match all methods
-                if found_key.is_none() && method != HttpMethod::ALL {
-                    prefix_router.at(path).ok().map(|m| *m.value)
-                } else {
-                    found_key
-                }
-            })
-        }?;
+            resolved_key?
+        };
 
         // Look up route
         let routes = safe_read(&self.routes);
@@ -2990,5 +3138,118 @@ mod tests {
             ipv6_count
         );
         assert_eq!(ipv4_count + ipv6_count, 100, "Total should be 100 requests");
+    }
+
+    // ============================================================================
+    // TDD Cycle: Route LRU Cache for Performance
+    // ============================================================================
+
+    /// RED: Test route cache improves lookup performance
+    ///
+    /// This test verifies:
+    /// 1. Route cache stores route key lookups
+    /// 2. Cache hits are tracked (observable via metrics or stats)
+    /// 3. Cache has bounded size with LRU eviction
+    #[test]
+    fn test_route_cache_performance() {
+        let router = Router::new();
+
+        // Add route
+        let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100)];
+        router
+            .add_route(HttpMethod::GET, "/api/users", backends.clone())
+            .expect("Should add route");
+
+        // First lookup - should miss cache, populate it
+        let match1 = router
+            .select_backend(HttpMethod::GET, "/api/users", None, None)
+            .expect("Should find route");
+        assert_eq!(match1.backend.as_ipv4().unwrap(), Ipv4Addr::new(10, 0, 1, 1));
+
+        // Get cache stats after first lookup
+        let (hits_before, misses_before) = router.get_cache_stats();
+        assert_eq!(misses_before, 1, "First lookup should be a cache miss");
+        assert_eq!(hits_before, 0, "No hits yet");
+
+        // Second lookup - should hit cache
+        let match2 = router
+            .select_backend(HttpMethod::GET, "/api/users", None, None)
+            .expect("Should find route again");
+        assert_eq!(match2.backend.as_ipv4().unwrap(), Ipv4Addr::new(10, 0, 1, 1));
+
+        let (hits_after, misses_after) = router.get_cache_stats();
+        assert_eq!(hits_after, 1, "Second lookup should be a cache hit");
+        assert_eq!(misses_after, 1, "Still only one miss");
+
+        // Third lookup - should also hit cache
+        let _ = router.select_backend(HttpMethod::GET, "/api/users", None, None);
+        let (hits_final, _) = router.get_cache_stats();
+        assert_eq!(hits_final, 2, "Third lookup should also hit cache");
+    }
+
+    #[test]
+    fn test_route_cache_invalidation_on_route_change() {
+        let router = Router::new();
+
+        // Add initial route
+        let backends1 = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100)];
+        router
+            .add_route(HttpMethod::GET, "/api/test", backends1)
+            .expect("Should add route");
+
+        // First lookup - populates cache
+        let _ = router.select_backend(HttpMethod::GET, "/api/test", None, None);
+        let (_, misses1) = router.get_cache_stats();
+        assert_eq!(misses1, 1, "First lookup is cache miss");
+
+        // Second lookup - cache hit
+        let _ = router.select_backend(HttpMethod::GET, "/api/test", None, None);
+        let (hits1, _) = router.get_cache_stats();
+        assert_eq!(hits1, 1, "Second lookup is cache hit");
+
+        // Update route (same path, different backends)
+        let backends2 = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100)];
+        router
+            .add_route(HttpMethod::GET, "/api/test", backends2)
+            .expect("Should update route");
+
+        // After route update, cache should be invalidated for this route
+        // Lookup should get new backend
+        let match3 = router
+            .select_backend(HttpMethod::GET, "/api/test", None, None)
+            .expect("Should find updated route");
+        assert_eq!(
+            match3.backend.as_ipv4().unwrap(),
+            Ipv4Addr::new(10, 0, 1, 2),
+            "Should get new backend after route update"
+        );
+    }
+
+    #[test]
+    fn test_route_cache_lru_eviction() {
+        let router = Router::new();
+
+        // Add many routes (more than cache size)
+        for i in 0..150 {
+            let path = format!("/api/route{}", i);
+            let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, (i % 255) as u8), 8080, 100)];
+            router
+                .add_route(HttpMethod::GET, &path, backends)
+                .expect("Should add route");
+        }
+
+        // Access all routes once to populate cache
+        for i in 0..150 {
+            let path = format!("/api/route{}", i);
+            let _ = router.select_backend(HttpMethod::GET, &path, None, None);
+        }
+
+        // Cache should not grow unbounded (verify via cache_size)
+        let cache_size = router.get_cache_size();
+        assert!(
+            cache_size <= 128,
+            "Cache should be bounded (got {} entries)",
+            cache_size
+        );
     }
 }
