@@ -19,6 +19,7 @@ mod proxy;
 use apis::gateway::endpointslice_watcher::watch_endpointslices;
 use apis::gateway::gateway::GatewayReconciler;
 use apis::gateway::gateway_class::GatewayClassReconciler;
+use apis::gateway::gateway_index::{register_global_gateway_index, GatewayIndex};
 use apis::gateway::http_route::HTTPRouteReconciler;
 use proxy::listener_manager::ListenerManager;
 
@@ -69,11 +70,14 @@ async fn main() -> Result<()> {
             Ok(client) => {
                 let gateway_class_name =
                     env::var("RAUTA_GATEWAY_CLASS").unwrap_or_else(|_| "rauta".to_string());
-                let gateway_name =
-                    env::var("RAUTA_GATEWAY_NAME").unwrap_or_else(|_| "rauta-gateway".to_string());
 
                 info!("   GatewayClass: {}", gateway_class_name);
-                info!("   Gateway: {}", gateway_name);
+
+                // Create shared GatewayIndex for Gateway → HTTPRoute coordination
+                // Gateway controller updates it, HTTPRoute controller reads from it (O(1) lookup)
+                let gateway_index = GatewayIndex::new(&gateway_class_name);
+                register_global_gateway_index(&gateway_index);
+                info!("   GatewayIndex: shared state for O(1) Gateway lookups");
 
                 // Spawn GatewayClass controller
                 let gc_client = client.clone();
@@ -84,26 +88,33 @@ async fn main() -> Result<()> {
                     }
                 }));
 
-                // Spawn Gateway controller
+                // Spawn Gateway controller (updates GatewayIndex)
                 let gw_client = client.clone();
-                let gw_name = gateway_class_name.clone();
+                let gw_class_name = gateway_class_name.clone();
                 let gw_listener_manager = listener_manager.clone();
-                let gw_reconciler = GatewayReconciler::new(gw_client, gw_name, gw_listener_manager);
+                let gw_gateway_index = gateway_index.clone();
+                let gw_reconciler = GatewayReconciler::new(
+                    gw_client,
+                    gw_class_name,
+                    gw_listener_manager,
+                    gw_gateway_index,
+                );
                 controller_handles.push(tokio::spawn(async move {
                     if let Err(e) = gw_reconciler.run().await {
                         tracing::error!("Gateway controller error: {}", e);
                     }
                 }));
 
-                // Spawn HTTPRoute controller (with Router integration)
+                // Spawn HTTPRoute controller (reads from GatewayIndex - O(1) lookups, no API calls)
                 let hr_client = client.clone();
                 let hr_router = router.clone();
+                let hr_gateway_index = gateway_index.clone();
                 let hr_rate_limiter = rate_limiter.clone();
                 let hr_circuit_breaker = circuit_breaker.clone();
                 let hr_reconciler = HTTPRouteReconciler::new(
                     hr_client,
                     hr_router,
-                    gateway_name,
+                    hr_gateway_index,
                     hr_rate_limiter,
                     hr_circuit_breaker,
                 );

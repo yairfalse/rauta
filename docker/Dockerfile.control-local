@@ -1,6 +1,6 @@
 # Multi-stage build for RAUTA control plane
-# Using stable Rust (gateway-api v0.16 works with stable)
-FROM rust:1-slim AS builder
+# Using stable Rust on bookworm to match runtime GLIBC
+FROM rust:1-bookworm AS builder
 
 WORKDIR /app
 
@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
     libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy workspace
+# Copy workspace (including Cargo.lock for reproducible builds)
 COPY Cargo.toml Cargo.lock ./
 COPY common ./common
 COPY control ./control

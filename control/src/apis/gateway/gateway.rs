@@ -1,7 +1,9 @@
 //! Gateway watcher
 //!
 //! Watches Gateway resources and configures listeners (HTTP, HTTPS, TCP).
+//! Also maintains a shared GatewayIndex for HTTPRoute controller to use.
 
+use crate::apis::gateway::gateway_index::GatewayIndex;
 use crate::apis::metrics::record_gateway_reconciliation;
 use crate::proxy::listener_manager::{GatewayRef, ListenerConfig, ListenerManager, Protocol};
 use futures::StreamExt;
@@ -24,6 +26,8 @@ pub struct GatewayReconciler {
     gateway_class_name: String,
     /// Listener manager for dynamic listener lifecycle
     listener_manager: Arc<ListenerManager>,
+    /// Shared index of managed Gateways (for HTTPRoute controller)
+    gateway_index: GatewayIndex,
 }
 
 #[allow(dead_code)] // Used in K8s mode
@@ -32,11 +36,13 @@ impl GatewayReconciler {
         client: Client,
         gateway_class_name: String,
         listener_manager: Arc<ListenerManager>,
+        gateway_index: GatewayIndex,
     ) -> Self {
         Self {
             client,
             gateway_class_name,
             listener_manager,
+            gateway_index,
         }
     }
 
@@ -94,16 +100,34 @@ impl GatewayReconciler {
 
         // Check if this Gateway references our GatewayClass
         if !ctx.should_reconcile(gateway_class) {
-            debug!(
-                "Gateway {}/{} references GatewayClass '{}', ignoring",
-                namespace, name, gateway_class
-            );
+            // Gateway doesn't use our class - remove from index if it was there
+            // (handles case where Gateway changed its gatewayClassName)
+            if ctx.gateway_index.remove(&namespace, &name) {
+                info!(
+                    "Gateway {}/{} changed to GatewayClass '{}', removed from index",
+                    namespace, name, gateway_class
+                );
+            } else {
+                debug!(
+                    "Gateway {}/{} references GatewayClass '{}', ignoring",
+                    namespace, name, gateway_class
+                );
+            }
             return Ok(Action::await_change());
         }
 
         info!(
             "Gateway {}/{} references our GatewayClass, configuring listeners",
             namespace, name
+        );
+
+        // Register this Gateway in the shared index (for HTTPRoute controller)
+        ctx.gateway_index.add(&namespace, &name);
+        debug!(
+            "Added Gateway {}/{} to index (total managed: {})",
+            namespace,
+            name,
+            ctx.gateway_index.len()
         );
 
         // Configure listeners

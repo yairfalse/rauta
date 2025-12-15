@@ -1,7 +1,9 @@
 //! HTTPRoute watcher
 //!
 //! Watches HTTPRoute resources and updates routing rules.
+//! Uses shared GatewayIndex for O(1) parent ref lookups (no API calls).
 
+use crate::apis::gateway::gateway_index::GatewayIndex;
 use crate::apis::metrics::record_httproute_reconciliation;
 use crate::proxy::circuit_breaker::CircuitBreakerManager;
 use crate::proxy::rate_limiter::RateLimiter;
@@ -23,8 +25,8 @@ use tracing::{debug, error, info, warn};
 pub struct HTTPRouteReconciler {
     client: Client,
     router: Arc<Router>,
-    /// Gateway name to watch routes for
-    gateway_name: String,
+    /// Shared index of Gateways managed by our GatewayClass (O(1) lookup, no API calls)
+    gateway_index: GatewayIndex,
     rate_limiter: Arc<RateLimiter>,
     circuit_breaker: Arc<CircuitBreakerManager>,
 }
@@ -36,6 +38,8 @@ struct RouteStatus {
     resolved_refs_reason: String,
     resolved_refs_message: String,
     generation: i64,
+    /// Parent refs (Gateways) that matched our GatewayClass
+    parent_refs: Vec<gateway_api::apis::standard::httproutes::HTTPRouteParentRefs>,
 }
 
 #[allow(dead_code)] // Used in K8s mode
@@ -43,29 +47,51 @@ impl HTTPRouteReconciler {
     pub fn new(
         client: Client,
         router: Arc<Router>,
-        gateway_name: String,
+        gateway_index: GatewayIndex,
         rate_limiter: Arc<RateLimiter>,
         circuit_breaker: Arc<CircuitBreakerManager>,
     ) -> Self {
         Self {
             client,
             router,
-            gateway_name,
+            gateway_index,
             rate_limiter,
             circuit_breaker,
         }
     }
 
-    /// Check if this HTTPRoute references our Gateway
-    fn should_reconcile(
+    /// Find parent refs that reference Gateways managed by our GatewayClass
+    ///
+    /// O(1) lookup per parent ref using shared GatewayIndex - no API calls!
+    /// The Gateway controller maintains the index as Gateways are reconciled.
+    fn get_matching_parent_refs(
         &self,
         parent_refs: &Option<Vec<gateway_api::apis::standard::httproutes::HTTPRouteParentRefs>>,
-    ) -> bool {
-        if let Some(refs) = parent_refs {
-            refs.iter().any(|r| r.name == self.gateway_name)
-        } else {
-            false
-        }
+        route_namespace: &str,
+    ) -> Vec<gateway_api::apis::standard::httproutes::HTTPRouteParentRefs> {
+        let Some(refs) = parent_refs else {
+            return Vec::new();
+        };
+
+        refs.iter()
+            .filter(|parent_ref| {
+                // Get the Gateway namespace (defaults to route's namespace)
+                let gw_namespace = parent_ref.namespace.as_deref().unwrap_or(route_namespace);
+
+                // O(1) lookup in shared index - no API call!
+                let is_managed = self.gateway_index.contains(gw_namespace, &parent_ref.name);
+                if is_managed {
+                    debug!(
+                        "Gateway {}/{} is managed by our GatewayClass '{}'",
+                        gw_namespace,
+                        parent_ref.name,
+                        self.gateway_index.gateway_class_name()
+                    );
+                }
+                is_managed
+            })
+            .cloned()
+            .collect()
     }
 
     /// Resolve Service name to Pod IPs via Kubernetes EndpointSlice API
@@ -298,6 +324,24 @@ fn validate_header_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Convert Gateway API method enum to HttpMethod enum
+fn parse_http_method(
+    method: &gateway_api::apis::standard::httproutes::HTTPRouteRulesMatchesMethod,
+) -> Option<HttpMethod> {
+    use gateway_api::apis::standard::httproutes::HTTPRouteRulesMatchesMethod;
+    match method {
+        HTTPRouteRulesMatchesMethod::Get => Some(HttpMethod::GET),
+        HTTPRouteRulesMatchesMethod::Post => Some(HttpMethod::POST),
+        HTTPRouteRulesMatchesMethod::Put => Some(HttpMethod::PUT),
+        HTTPRouteRulesMatchesMethod::Delete => Some(HttpMethod::DELETE),
+        HTTPRouteRulesMatchesMethod::Patch => Some(HttpMethod::PATCH),
+        HTTPRouteRulesMatchesMethod::Head => Some(HttpMethod::HEAD),
+        HTTPRouteRulesMatchesMethod::Options => Some(HttpMethod::OPTIONS),
+        // CONNECT and TRACE are not supported by our HttpMethod enum
+        _ => None,
+    }
+}
+
 impl HTTPRouteReconciler {
     /// Reconcile a single HTTPRoute
     #[allow(dead_code)]
@@ -308,18 +352,24 @@ impl HTTPRouteReconciler {
 
         info!("Reconciling HTTPRoute: {}/{}", namespace, name);
 
-        // Check if this HTTPRoute references our Gateway
-        if !ctx.should_reconcile(&route.spec.parent_refs) {
+        // Find parent refs that reference Gateways using our GatewayClass
+        // O(1) lookup per parent ref - no API calls!
+        let matching_parent_refs =
+            ctx.get_matching_parent_refs(&route.spec.parent_refs, &namespace);
+
+        if matching_parent_refs.is_empty() {
             debug!(
-                "HTTPRoute {}/{} does not reference our Gateway, ignoring",
-                namespace, name
+                "HTTPRoute {}/{} does not reference any Gateway using our GatewayClass '{}', ignoring",
+                namespace, name, ctx.gateway_index.gateway_class_name()
             );
             return Ok(Action::await_change());
         }
 
         info!(
-            "HTTPRoute {}/{} references our Gateway, configuring routes",
-            namespace, name
+            "HTTPRoute {}/{} references {} Gateway(s) using our GatewayClass, configuring routes",
+            namespace,
+            name,
+            matching_parent_refs.len()
         );
 
         // Parse and configure routes
@@ -330,20 +380,35 @@ impl HTTPRouteReconciler {
 
         if let Some(rules) = &route.spec.rules {
             for (rule_idx, rule) in rules.iter().enumerate() {
-                // Extract path from matches (default to "/" if no matches)
-                let path = if let Some(matches) = &rule.matches {
-                    if let Some(first_match) = matches.first() {
-                        if let Some(path_match) = &first_match.path {
-                            path_match.value.as_deref().unwrap_or("/")
-                        } else {
-                            "/"
-                        }
-                    } else {
-                        "/"
+                // Extract path and methods from matches
+                // Gateway API allows multiple matches per rule, each with its own path and method
+                let mut path_method_pairs: Vec<(&str, Option<HttpMethod>)> = Vec::new();
+
+                if let Some(matches) = &rule.matches {
+                    for route_match in matches {
+                        let path = route_match
+                            .path
+                            .as_ref()
+                            .and_then(|p| p.value.as_deref())
+                            .unwrap_or("/");
+
+                        // Extract HTTP method from match (if specified)
+                        let method = route_match
+                            .method
+                            .as_ref()
+                            .and_then(|m| parse_http_method(m));
+
+                        path_method_pairs.push((path, method));
                     }
-                } else {
-                    "/"
-                };
+                }
+
+                // If no matches specified, default to "/" with all methods (None means match all)
+                if path_method_pairs.is_empty() {
+                    path_method_pairs.push(("/", None));
+                }
+
+                // Use first path for validation (all paths in a rule go to same backends)
+                let path = path_method_pairs.first().map(|(p, _)| *p).unwrap_or("/");
 
                 // Validate path
                 if let Err(validation_error) = validate_path(path) {
@@ -358,6 +423,7 @@ impl HTTPRouteReconciler {
                         &name,
                         &format!("Invalid path: {}", validation_error),
                         generation,
+                        &matching_parent_refs,
                     )
                     .await?;
 
@@ -509,46 +575,69 @@ impl HTTPRouteReconciler {
 
                     if !backends.is_empty() {
                         let backend_count = backends.len();
-                        // Add route to router (using GET as default method)
-                        match ctx
-                            .router
-                            .add_route(HttpMethod::GET, path, backends.clone())
-                        {
-                            Ok(_) => {
-                                info!(
-                                    "  - Added route: {} -> {} total backends",
-                                    path, backend_count
-                                );
-                                routes_added += 1;
 
-                                // Configure rate limiting from annotations
-                                if let Some(annotations) = &route.metadata.annotations {
-                                    if let Some(rate_limit_config) =
-                                        annotations.get("rauta.io/rate-limit")
-                                    {
-                                        match parse_rate_limit_annotation(rate_limit_config) {
-                                            Ok((rate, burst)) => {
-                                                ctx.rate_limiter.configure_route(path, rate, burst);
-                                                info!(
-                                                    "  - Configured rate limit: {} ({}rps, burst={})",
-                                                    path, rate, burst
-                                                );
-                                            }
-                                            Err(e) => {
-                                                warn!("Failed to parse rate limit annotation '{}': {}", rate_limit_config, e);
-                                            }
-                                        }
+                        // Add routes for all path/method combinations
+                        for (match_path, method_opt) in &path_method_pairs {
+                            // Validate each path
+                            if let Err(e) = validate_path(match_path) {
+                                warn!("Skipping invalid path '{}': {}", match_path, e);
+                                continue;
+                            }
+
+                            // If method is specified, add route for that method only
+                            // If method is None, use HttpMethod::ALL (wildcard - matches any method)
+                            // This reduces 7 route entries to 1, using exact match fallback in Router
+                            let methods_to_add: Vec<HttpMethod> = if let Some(method) = method_opt {
+                                vec![*method]
+                            } else {
+                                // No method specified = match all methods via HttpMethod::ALL
+                                vec![HttpMethod::ALL]
+                            };
+
+                            for method in methods_to_add {
+                                match ctx.router.add_route(method, match_path, backends.clone()) {
+                                    Ok(_) => {
+                                        info!(
+                                            "  - Added route: {:?} {} -> {} backends",
+                                            method, match_path, backend_count
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to add route {:?} {}: {}",
+                                            method, match_path, e
+                                        );
                                     }
                                 }
-
-                                // Note: Circuit breaker is per-backend, not per-route
-                                // It's automatically configured with default thresholds for all backends
-                                // Future: Support BackendPolicy for per-backend customization
-                            }
-                            Err(e) => {
-                                warn!("Failed to add route {}: {}", path, e);
                             }
                         }
+
+                        // Configure rate limiting from annotations (once per rule, not per method)
+                        if let Some(annotations) = &route.metadata.annotations {
+                            if let Some(rate_limit_config) = annotations.get("rauta.io/rate-limit")
+                            {
+                                match parse_rate_limit_annotation(rate_limit_config) {
+                                    Ok((rate, burst)) => {
+                                        ctx.rate_limiter.configure_route(path, rate, burst);
+                                        info!(
+                                            "  - Configured rate limit: {} ({}rps, burst={})",
+                                            path, rate, burst
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to parse rate limit annotation '{}': {}",
+                                            rate_limit_config, e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        // Note: Circuit breaker is per-backend, not per-route
+                        // It's automatically configured with default thresholds for all backends
+                        // Future: Support BackendPolicy for per-backend customization
+                        routes_added += 1;
                     } else {
                         warn!(
                             "No backends found for route {} (all services failed to resolve)",
@@ -561,7 +650,7 @@ impl HTTPRouteReconciler {
             }
         }
 
-        // Update HTTPRoute status
+        // Update HTTPRoute status for all matching parent Gateways
         let generation = route.metadata.generation.unwrap_or(0);
         ctx.set_route_status(
             &namespace,
@@ -572,6 +661,7 @@ impl HTTPRouteReconciler {
                 resolved_refs_reason: resolution_error_reason,
                 resolved_refs_message: resolution_error_message,
                 generation,
+                parent_refs: matching_parent_refs,
             },
         )
         .await?;
@@ -588,7 +678,7 @@ impl HTTPRouteReconciler {
         Ok(Action::requeue(Duration::from_secs(300)))
     }
 
-    /// Update HTTPRoute status with Accepted condition
+    /// Update HTTPRoute status with Accepted condition for all matching parent Gateways
     #[allow(dead_code)]
     async fn set_route_status(
         &self,
@@ -624,16 +714,28 @@ impl HTTPRouteReconciler {
             }));
         }
 
-        let status_json = json!({
-            "status": {
-                "parents": [{
+        // Build parent status for each matching Gateway
+        let parents: Vec<serde_json::Value> = status
+            .parent_refs
+            .iter()
+            .map(|parent_ref| {
+                json!({
                     "parentRef": {
-                        "name": self.gateway_name,
+                        "group": "gateway.networking.k8s.io",
                         "kind": "Gateway",
+                        "name": parent_ref.name,
+                        "namespace": parent_ref.namespace.as_deref().unwrap_or(namespace),
+                        "sectionName": parent_ref.section_name,
                     },
                     "controllerName": "rauta.io/gateway-controller",
-                    "conditions": conditions
-                }]
+                    "conditions": conditions.clone()
+                })
+            })
+            .collect();
+
+        let status_json = json!({
+            "status": {
+                "parents": parents
             }
         });
 
@@ -645,8 +747,11 @@ impl HTTPRouteReconciler {
         .await?;
 
         info!(
-            "Updated HTTPRoute {}/{} status: accepted={}",
-            namespace, name, status.accepted
+            "Updated HTTPRoute {}/{} status: accepted={}, gateways={}",
+            namespace,
+            name,
+            status.accepted,
+            status.parent_refs.len()
         );
         Ok(())
     }
@@ -659,14 +764,21 @@ impl HTTPRouteReconciler {
         name: &str,
         error_message: &str,
         generation: i64,
+        parent_refs: &[gateway_api::apis::standard::httproutes::HTTPRouteParentRefs],
     ) -> Result<(), kube::Error> {
         let api: Api<HTTPRoute> = Api::namespaced(self.client.clone(), namespace);
-        let status = json!({
-            "status": {
-                "parents": [{
+
+        // Build parent status for each matching Gateway
+        let parents: Vec<serde_json::Value> = parent_refs
+            .iter()
+            .map(|parent_ref| {
+                json!({
                     "parentRef": {
-                        "name": self.gateway_name,
+                        "group": "gateway.networking.k8s.io",
                         "kind": "Gateway",
+                        "name": parent_ref.name,
+                        "namespace": parent_ref.namespace.as_deref().unwrap_or(namespace),
+                        "sectionName": parent_ref.section_name,
                     },
                     "controllerName": "rauta.io/gateway-controller",
                     "conditions": [{
@@ -677,7 +789,13 @@ impl HTTPRouteReconciler {
                         "lastTransitionTime": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                         "observedGeneration": generation,
                     }]
-                }]
+                })
+            })
+            .collect();
+
+        let status = json!({
+            "status": {
+                "parents": parents
             }
         });
 
