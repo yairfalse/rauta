@@ -22,6 +22,7 @@ use apis::gateway::gateway_class::GatewayClassReconciler;
 use apis::gateway::gateway_index::{register_global_gateway_index, GatewayIndex};
 use apis::gateway::http_route::HTTPRouteReconciler;
 use proxy::listener_manager::ListenerManager;
+use proxy::tls::SniResolver;
 
 /// RAUTA Control Plane
 ///
@@ -167,17 +168,63 @@ async fn main() -> Result<()> {
         let server = ProxyServer::new_with_workers(bind_addr.clone(), router, num_cpus)
             .map_err(|e| anyhow::anyhow!("Failed to create server: {}", e))?;
 
-        info!(
-            "🚀 HTTP proxy server listening on {} (per-core workers enabled)",
-            bind_addr
-        );
-        info!("📋 Routes configured:");
-        info!("   GET /api/*       -> 127.0.0.1:9090 (Python backend)");
-        info!("");
-        info!("Press Ctrl-C to exit.");
+        // Check for TLS configuration (standalone HTTPS mode)
+        let tls_cert_path = env::var("RAUTA_TLS_CERT").ok();
+        let tls_key_path = env::var("RAUTA_TLS_KEY").ok();
+        let tls_hostname =
+            env::var("RAUTA_TLS_HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
 
-        // Run server with graceful shutdown (SIGTERM + Ctrl-C)
-        run_with_signal_handling(server, controller_handles).await
+        if let (Some(cert_path), Some(key_path)) = (tls_cert_path, tls_key_path) {
+            // HTTPS mode with file-based certificates
+            info!("🔐 TLS enabled - loading certificates from files");
+            info!("   Certificate: {}", cert_path);
+            info!("   Private key: {}", key_path);
+            info!("   Hostname: {}", tls_hostname);
+
+            // Load certificate and key
+            let cert_pem = std::fs::read(&cert_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read TLS cert {}: {}", cert_path, e))?;
+            let key_pem = std::fs::read(&key_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read TLS key {}: {}", key_path, e))?;
+
+            let tls_cert = proxy::tls::TlsCertificate::from_pem(&cert_pem, &key_pem)
+                .map_err(|e| anyhow::anyhow!("Failed to parse TLS certificate: {}", e))?;
+
+            // Create SNI resolver with the certificate
+            let mut sni_resolver = SniResolver::new();
+            sni_resolver
+                .add_cert(tls_hostname, tls_cert)
+                .map_err(|e| anyhow::anyhow!("Failed to add TLS certificate: {}", e))?;
+
+            info!(
+                "🚀 HTTPS proxy server listening on {} (per-core workers enabled)",
+                bind_addr
+            );
+            info!("📋 Routes configured:");
+            info!("   GET /api/*       -> configured backend");
+            info!("");
+            info!("Press Ctrl-C to exit.");
+
+            // Run HTTPS server
+            if let Err(e) = server.serve_https(sni_resolver).await {
+                error!("HTTPS server error: {}", e);
+            }
+            Ok(())
+        } else {
+            // HTTP mode (default)
+            info!(
+                "🚀 HTTP proxy server listening on {} (per-core workers enabled)",
+                bind_addr
+            );
+            info!("📋 Routes configured:");
+            info!("   GET /api/*       -> configured backend");
+            info!("💡 Tip: Set RAUTA_TLS_CERT and RAUTA_TLS_KEY for HTTPS");
+            info!("");
+            info!("Press Ctrl-C to exit.");
+
+            // Run server with graceful shutdown (SIGTERM + Ctrl-C)
+            run_with_signal_handling(server, controller_handles).await
+        }
     }
 }
 

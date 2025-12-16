@@ -394,11 +394,13 @@ impl RouteLruCache {
     }
 
     /// Get cache statistics
+    #[allow(dead_code)] // Reserved for future /metrics endpoint
     fn stats(&self) -> (u64, u64) {
         (self.hits, self.misses)
     }
 
     /// Get current cache size
+    #[allow(dead_code)] // Reserved for future /metrics endpoint
     fn size(&self) -> usize {
         self.entries.len()
     }
@@ -432,6 +434,7 @@ impl Router {
     ///
     /// Useful for monitoring cache effectiveness.
     /// Hit ratio = hits / (hits + misses)
+    #[allow(dead_code)] // Reserved for future /metrics endpoint
     pub fn get_cache_stats(&self) -> (u64, u64) {
         let cache = safe_read(&self.route_cache);
         cache.stats()
@@ -440,6 +443,7 @@ impl Router {
     /// Get current route cache size
     ///
     /// Returns the number of entries currently in the cache.
+    #[allow(dead_code)] // Reserved for future /metrics endpoint
     pub fn get_cache_size(&self) -> usize {
         let cache = safe_read(&self.route_cache);
         cache.size()
@@ -3164,7 +3168,10 @@ mod tests {
         let match1 = router
             .select_backend(HttpMethod::GET, "/api/users", None, None)
             .expect("Should find route");
-        assert_eq!(match1.backend.as_ipv4().unwrap(), Ipv4Addr::new(10, 0, 1, 1));
+        assert_eq!(
+            match1.backend.as_ipv4().unwrap(),
+            Ipv4Addr::new(10, 0, 1, 1)
+        );
 
         // Get cache stats after first lookup
         let (hits_before, misses_before) = router.get_cache_stats();
@@ -3175,7 +3182,10 @@ mod tests {
         let match2 = router
             .select_backend(HttpMethod::GET, "/api/users", None, None)
             .expect("Should find route again");
-        assert_eq!(match2.backend.as_ipv4().unwrap(), Ipv4Addr::new(10, 0, 1, 1));
+        assert_eq!(
+            match2.backend.as_ipv4().unwrap(),
+            Ipv4Addr::new(10, 0, 1, 1)
+        );
 
         let (hits_after, misses_after) = router.get_cache_stats();
         assert_eq!(hits_after, 1, "Second lookup should be a cache hit");
@@ -3232,7 +3242,11 @@ mod tests {
         // Add many routes (more than cache size)
         for i in 0..150 {
             let path = format!("/api/route{}", i);
-            let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, (i % 255) as u8), 8080, 100)];
+            let backends = vec![Backend::from_ipv4(
+                Ipv4Addr::new(10, 0, 1, (i % 255) as u8),
+                8080,
+                100,
+            )];
             router
                 .add_route(HttpMethod::GET, &path, backends)
                 .expect("Should add route");

@@ -393,10 +393,7 @@ impl HTTPRouteReconciler {
                             .unwrap_or("/");
 
                         // Extract HTTP method from match (if specified)
-                        let method = route_match
-                            .method
-                            .as_ref()
-                            .and_then(|m| parse_http_method(m));
+                        let method = route_match.method.as_ref().and_then(parse_http_method);
 
                         path_method_pairs.push((path, method));
                     }

@@ -28,7 +28,6 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
-use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info};
 
@@ -151,9 +150,12 @@ impl ListenerManager {
             .build_http();
 
         // Build ServerConfig with ALPN for HTTP/2 and HTTP/1.1
+        // SAFETY: expect is appropriate here - invalid TLS config is a programming error
+        // that should fail fast at initialization rather than silently produce broken TLS
+        #[allow(clippy::expect_used)]
         let server_config = sni_resolver
             .to_server_config()
-            .expect("Failed to build TLS config from SniResolver");
+            .expect("Failed to build TLS config from SniResolver - check certificates");
 
         // Enable ALPN: prefer h2, fall back to http/1.1
         let mut server_config = (*server_config).clone();
@@ -429,9 +431,7 @@ impl ListenerManager {
         // Peek at the first bytes to detect HTTP/2 preface (h2c)
         let mut preface_buf = [0u8; 24]; // HTTP/2 preface is exactly 24 bytes
         let is_h2c = match stream.peek(&mut preface_buf).await {
-            Ok(n) if n >= Self::HTTP2_PREFACE.len() => {
-                preface_buf.starts_with(Self::HTTP2_PREFACE)
-            }
+            Ok(n) if n >= Self::HTTP2_PREFACE.len() => preface_buf.starts_with(Self::HTTP2_PREFACE),
             _ => false,
         };
 
@@ -588,9 +588,11 @@ impl ListenerManager {
             return Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(
-                    Full::new(Bytes::from("Bad Request: Missing Host header or :authority"))
-                        .map_err(std::io::Error::other)
-                        .boxed(),
+                    Full::new(Bytes::from(
+                        "Bad Request: Missing Host header or :authority",
+                    ))
+                    .map_err(std::io::Error::other)
+                    .boxed(),
                 )
                 .expect("Building 400 response should never fail"));
         }
@@ -1102,7 +1104,6 @@ mod tests {
         // 2. Multiple requests reuse the same connection (multiplexing)
         // 3. Connection count stays at 1 even with 5 concurrent requests
 
-        use hyper::server::conn::http2;
         use hyper::service::service_fn;
         use std::net::Ipv4Addr;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1457,7 +1458,8 @@ mod tests {
             .unwrap();
 
         // Send multiple concurrent requests to test multiplexing (use localhost for SNI)
-        let mut handles: Vec<tokio::task::JoinHandle<Result<reqwest::Response, reqwest::Error>>> = vec![];
+        let mut handles: Vec<tokio::task::JoinHandle<Result<reqwest::Response, reqwest::Error>>> =
+            vec![];
         for i in 0..3 {
             let client = client.clone();
             handles.push(tokio::spawn(async move {
@@ -1562,10 +1564,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Test 1: HTTP/1.1 request should work
-        let http1_client = reqwest::Client::builder()
-            .http1_only()
-            .build()
-            .unwrap();
+        let http1_client = reqwest::Client::builder().http1_only().build().unwrap();
 
         let response = http1_client
             .get(format!("http://127.0.0.1:{}/h2c-test", proxy_port))

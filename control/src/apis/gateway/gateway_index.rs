@@ -76,6 +76,9 @@ pub struct GatewayIndexMetrics {
     removes: AtomicU64,
 }
 
+// Allow dead_code in this impl - methods are used by main.rs binary
+// but clippy analyzes library code separately
+#[allow(dead_code)]
 impl GatewayIndexMetrics {
     /// Create new metrics (all counters at zero)
     pub fn new() -> Self {
@@ -203,6 +206,9 @@ pub struct GatewayIndex {
     metrics: Arc<GatewayIndexMetrics>,
 }
 
+// Allow dead_code in this impl - methods are used by main.rs binary
+// but clippy analyzes library code separately
+#[allow(dead_code)]
 impl GatewayIndex {
     /// Create a new GatewayIndex for the specified GatewayClass
     pub fn new(gateway_class_name: impl Into<String>) -> Self {
@@ -391,6 +397,7 @@ static GLOBAL_GATEWAY_INDEX: OnceLock<GatewayIndex> = OnceLock::new();
 ///
 /// Call this once during startup to enable /metrics export.
 /// Safe to call multiple times - only the first call takes effect.
+#[allow(dead_code)] // Used by main.rs binary
 pub fn register_global_gateway_index(index: &GatewayIndex) {
     if GLOBAL_GATEWAY_INDEX.set(index.clone()).is_err() {
         debug!("GatewayIndex already registered globally");
