@@ -3,24 +3,29 @@
 //! These tests validate RAUTA's behavior in a real Kubernetes environment.
 //! They use the seppo testing framework for namespace isolation and cleanup.
 //!
+//! # Local Testing Only
+//!
+//! This file uses .local extension to exclude from CI/Docker builds.
+//! To run these tests:
+//!
+//! 1. Rename: `mv control/tests/e2e.rs.local control/tests/e2e.rs`
+//! 2. Add to control/Cargo.toml dev-dependencies: `seppo = { path = "../../seppo" }`
+//! 3. Run: `cargo test --test e2e -- --ignored --nocapture`
+//!
 //! # Prerequisites
 //!
-//! 1. A Kind cluster named "rauta-e2e" must be running
-//! 2. RAUTA must be deployed as a DaemonSet in rauta-system namespace
-//! 3. Gateway API CRDs must be installed
+//! - Kind cluster running
+//! - RAUTA deployed as DaemonSet
+//! - Gateway API CRDs installed
 //!
-//! # Running Tests
+//! # Quick Setup
 //!
 //! ```bash
-//! # Setup (one-time)
-//! kind create cluster --name rauta-e2e --config deploy/kind-config.yaml
+//! kind create cluster --config deploy/kind-config.yaml
 //! kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
-//! docker build -t rauta:latest .
-//! kind load docker-image rauta:latest --name rauta-e2e
+//! docker build -t rauta:latest -f docker/Dockerfile.control-local .
+//! kind load docker-image rauta:latest --name rauta-test
 //! kubectl apply -f deploy/rauta-daemonset.yaml
-//!
-//! # Run tests
-//! cargo test --package control --test e2e -- --ignored --nocapture
 //! ```
 
 // Allow unwrap/expect/panic in test code - these are appropriate for tests
