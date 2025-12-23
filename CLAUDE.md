@@ -1,1155 +1,324 @@
-# RAUTA: Kubernetes Gateway API Controller with WASM Plugins
+# RAUTA: Gateway API Controller
 
-**RAUTA = Iron-clad routing with safe extensibility**
-
----
-
-## CRITICAL: Project Nature
-
-**THIS IS A PRODUCTION-FOCUSED LEARNING PROJECT**
-- **Goal**: Build a production-ready K8s Gateway API controller with WASM plugin extensibility
-- **Language**: 100% Rust (userspace) + WASM (plugins)
-- **Status**: Stage 1 COMPLETE (Gateway API controller) | Stage 2 NEXT (WASM plugins)
-- **Approach**: Ship working software, learn by building, validate with research
+**A learning project for Kubernetes Gateway API with L7 HTTP proxy**
 
 ---
 
-## PROJECT MISSION
+## PROJECT STATUS
 
-**Mission**: Build a Kubernetes Gateway API controller that developers can safely extend with WASM plugins
+**What's Implemented:**
+- Gateway API v1 (GatewayClass, Gateway, HTTPRoute)
+- HTTP/1.1 and HTTP/2 proxy (cleartext and TLS)
+- TLS termination with SNI and ALPN
+- Maglev consistent hashing load balancer
+- Path, header, and query parameter matching
+- Request/response filters (headers, redirects)
+- Rate limiting (token bucket)
+- Circuit breaker (passive health checking)
+- Connection pooling (per-backend, per-protocol)
+- Retries with exponential backoff
+- EndpointSlice watcher (dynamic pod discovery)
+- Prometheus metrics
+- 201+ test cases
 
-**Core Value Proposition:**
-
-**"Gateway API routing you can extend with WASM plugins - like Kong, but safer"**
-
-**The Differentiator: WASM Plugins**
-- Kong uses Lua plugins (can crash the gateway)
-- Envoy uses C++ filters (dangerous to write, requires recompilation)
-- RAUTA uses WASM plugins (sandboxed, multi-language, hot-reload)
-
-**Why This Matters:**
-- Write plugins in ANY language (Rust, Go, TypeScript, C++)
-- Cannot crash the gateway (sandboxed execution)
-- Hot-reload without downtime
-- Built-in rate limiting (CPU, memory per plugin)
-
-**Core Philosophy:**
-- **Rust for safety and performance** (Cloudflare Pingora validates this)
-- **Gateway API native** (no legacy Ingress baggage)
-- **WASM for extensibility** (safe, fast, multi-language)
-- **Research-backed decisions** (HTTP/2 > HTTP/3, skip DPDK, skip io_uring for L7)
+**Code Stats:**
+- ~15,000 lines of Rust
+- Workspace: `common` (shared types) + `control` (main controller)
+- jemalloc for async workloads
+- Safe lock helpers (poison recovery)
 
 ---
 
-## ARCHITECTURE PHILOSOPHY
-
-### The Vision
-
-**RAUTA is a Gateway API controller with three layers:**
+## ARCHITECTURE OVERVIEW
 
 ```
-┌────────────────────────────────────────────────────────┐
-│                RAUTA Architecture                       │
-├────────────────────────────────────────────────────────┤
-│                                                        │
-│  WASM Plugin Layer (Stage 2 - NEXT)                    │
-│  ┌──────────────────────────────────────────────────┐ │
-│  │  Plugin Runtime (wasmtime)                       │ │
-│  │  - Request/Response hooks                        │ │
-│  │  - Plugin SDK (Rust, Go, TypeScript)             │ │
-│  │  - Hot-reload support                            │ │
-│  │  - CPU/memory limits per plugin                  │ │
-│  │                                                  │ │
-│  │  Built-in Plugins                                │ │
-│  │  - JWT authentication                            │ │
-│  │  - CORS handling                                 │ │
-│  │  - Rate limiting                                 │ │
-│  │  - Request transformation                        │ │
-│  └──────────────────────────────────────────────────┘ │
-│                                                        │
-│  Gateway Core (Rust - Stage 1 DONE)                    │
-│  ┌──────────────────────────────────────────────────┐ │
-│  │  Gateway API Controllers                         │ │
-│  │  - GatewayClass, Gateway, HTTPRoute              │ │
-│  │  - Service → EndpointSlice resolver              │ │
-│  │                                                  │ │
-│  │  HTTP Proxy (tokio + hyper)                      │ │
-│  │  - HTTP/1.1, HTTP/2 (future)                     │ │
-│  │  - Maglev load balancing                         │ │
-│  │  - TLS termination (future)                      │ │
-│  │                                                  │ │
-│  │  Observability                                   │ │
-│  │  - Prometheus metrics                            │ │
-│  │  - OTLP traces (future)                          │ │
-│  └──────────────────────────────────────────────────┘ │
-│                                                        │
-└────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         RAUTA Controller                                 │
+│                                                                          │
+│  main.rs                                                                 │
+│  └── Bootstrap: K8s client, listeners, controllers, metrics server      │
+│                                                                          │
+│  apis/gateway/                                                           │
+│  ├── gateway_class.rs      # GatewayClass reconciler                    │
+│  ├── gateway.rs            # Gateway reconciler + ListenerManager       │
+│  ├── http_route.rs         # HTTPRoute reconciler → Router              │
+│  ├── endpointslice_watcher.rs  # Dynamic pod IP discovery              │
+│  ├── secret_watcher.rs     # TLS certificate management                 │
+│  └── gateway_index.rs      # O(1) Gateway lookup optimization           │
+│                                                                          │
+│  proxy/                                                                  │
+│  ├── router.rs             # matchit radix tree + Maglev tables         │
+│  ├── server.rs             # HTTP server setup                          │
+│  ├── listener_manager.rs   # Dynamic listener creation                  │
+│  ├── request_handler.rs    # Request routing logic                      │
+│  ├── forwarder.rs          # Backend request forwarding                 │
+│  ├── filters.rs            # HTTPRoute filter types                     │
+│  ├── tls.rs                # TLS/HTTPS with rustls                      │
+│  ├── backend_pool.rs       # Connection pooling abstraction             │
+│  ├── http1_pool.rs         # HTTP/1.1 connection pool                   │
+│  ├── circuit_breaker.rs    # Passive health (error rate threshold)      │
+│  ├── rate_limiter.rs       # Token bucket algorithm                     │
+│  ├── health_checker.rs     # Active health (TCP probes)                 │
+│  ├── worker.rs             # Per-core workers (lock-free)               │
+│  └── metrics.rs            # Prometheus /metrics                        │
+│                                                                          │
+│  common/                                                                 │
+│  └── lib.rs                # HttpMethod, Backend, Maglev, RouteKey      │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Why This Architecture:**
-- **Userspace L7** - Full HTTP/2, TLS, complex routing (not eBPF)
-- **WASM plugins** - Safe extensibility without gateway crashes
-- **Gateway API** - Modern K8s standard (not legacy Ingress)
-- **Rust core** - Memory safety, performance, zero-cost abstractions
+### Request Flow
 
-**What We Learned from "Learning eBPF" (Liz Rice):**
-- XDP operates on raw packets BEFORE TCP reassembly
-- XDP cannot parse HTTP/2, TLS, or complex protocols
-- Even Cilium uses Envoy for L7 HTTP parsing (not eBPF)
-- eBPF is excellent for L3/L4, NOT for L7 application logic
-- Conclusion: HTTP routing belongs in userspace, NOT in XDP
+```
+Client → Listener → Router → Filters → Forwarder → Backend
+                      │
+                      └── matchit (path) → Maglev (backend selection)
+```
+
+### Key Design Decisions
+
+1. **Userspace L7** - HTTP/2 and TLS require TCP reassembly (XDP can't do this)
+2. **Maglev hashing** - O(1) lookup, ~1/N disruption on backend changes
+3. **Gateway API** - Modern K8s standard, not legacy Ingress
+4. **Safe lock helpers** - Recover from RwLock poisoning instead of cascading panics
 
 ---
 
-## RUST + WASM REQUIREMENTS
+## RUST REQUIREMENTS
 
-### Language Requirements
-- **THIS IS A RUST PROJECT** - All userspace code in Rust
-- **WASM for Plugins**: wasmtime runtime (Rust-based)
-- **NO GO CODE** - Unlike Cilium's Go control plane, we use Rust everywhere
-- **STRONG TYPING ONLY** - No `Box<dyn Any>` or runtime type checking
+### Absolute Rules
 
-### WASM Plugin Pattern
+1. **No `.unwrap()` in production** - Use `?` or `safe_read()`/`safe_write()`
+2. **No `println!`** - Use `tracing::{info, warn, error, debug}`
+3. **No string enums** - Use proper Rust enums
+4. **No TODOs or stubs** - Complete implementations only
+
+### Safe Lock Helpers (MANDATORY)
 
 ```rust
-// Loading and running WASM plugins
-use wasmtime::*;
+// BAD - Will panic on lock poisoning
+let routes = self.routes.read().unwrap();
 
-pub struct PluginRuntime {
-    engine: Engine,
-    plugins: HashMap<String, Plugin>,
-}
+// GOOD - Recovers from poisoning
+let routes = safe_read(&self.routes);
 
-pub struct Plugin {
-    instance: Instance,
-    on_request: TypedFunc<(u32, u32), u32>,  // (request_ptr, request_len) -> decision
-    on_response: TypedFunc<(u32, u32), u32>,
-}
-
-impl PluginRuntime {
-    pub async fn load_plugin(&mut self, name: &str, wasm_bytes: &[u8]) -> Result<()> {
-        let module = Module::new(&self.engine, wasm_bytes)?;
-        let mut store = Store::new(&self.engine, ());
-
-        // Create instance with memory limits
-        let instance = Instance::new(&mut store, &module, &[])?;
-
-        // Get exported functions
-        let on_request = instance
-            .get_typed_func::<(u32, u32), u32>(&mut store, "on_request")?;
-        let on_response = instance
-            .get_typed_func::<(u32, u32), u32>(&mut store, "on_response")?;
-
-        self.plugins.insert(name.to_string(), Plugin {
-            instance,
-            on_request,
-            on_response,
-        });
-
-        Ok(())
-    }
-
-    pub async fn run_request_plugins(&self, req: &Request) -> PluginDecision {
-        for plugin in self.plugins.values() {
-            // Serialize request to plugin memory
-            let req_bytes = serialize_request(req);
-
-            // Call plugin (with timeout and resource limits)
-            let decision = plugin.on_request.call(&mut store,
-                (req_ptr, req_len))?;
-
-            match decision {
-                PLUGIN_CONTINUE => continue,
-                PLUGIN_REJECT => return PluginDecision::Reject,
-                PLUGIN_MODIFY => {
-                    // Read modified request from plugin memory
-                    let modified_req = deserialize_request(&plugin_memory);
-                    *req = modified_req;
-                }
-            }
-        }
-
-        PluginDecision::Allow
-    }
+// The helper:
+fn safe_read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| {
+        warn!("RwLock poisoned, recovering");
+        poisoned.into_inner()  // Data is still valid
+    })
 }
 ```
 
-**NO STUBS. NO TODOs. COMPLETE CODE ONLY.**
-
----
-
-## TDD Workflow (RED → GREEN → REFACTOR)
-
-**MANDATORY**: All code must follow strict Test-Driven Development
-
-### RED Phase: Write Failing Tests First
+### Error Handling Pattern
 
 ```rust
-// Step 1: Write test that FAILS (RED)
-#[tokio::test]
-async fn test_gateway_route_idempotency() {
-    let router = Router::new();
+// BAD
+let name = gateway.metadata.name.unwrap();
 
-    let backends = vec![Backend::new(
-        u32::from(Ipv4Addr::new(10, 0, 1, 1)), 8080, 100
-    )];
-
-    // Add route first time
-    router.add_route(HttpMethod::GET, "/api/users", backends.clone())
-        .expect("First add should succeed");
-
-    // Add same route again (should be idempotent)
-    router.add_route(HttpMethod::GET, "/api/users", backends.clone())
-        .expect("Second add should succeed (idempotent)");
-
-    // Verify route still works
-    let route_match = router
-        .select_backend(HttpMethod::GET, "/api/users", None, None)
-        .expect("Should find backend after duplicate add");
-
-    assert_eq!(
-        Ipv4Addr::from(route_match.backend.ipv4),
-        Ipv4Addr::new(10, 0, 1, 1)
-    );
-}
-
-// Step 2: Verify test FAILS
-// $ cargo test
-// # test_gateway_route_idempotency ... FAILED (RED phase confirmed)
-```
-
-### GREEN Phase: Minimal Implementation
-
-```rust
-// Step 3: Write MINIMAL code to pass test
-impl Router {
-    pub fn add_route(
-        &self,
-        method: HttpMethod,
-        path: &str,
-        backends: Vec<Backend>,
-    ) -> Result<(), String> {
-        let path_hash = fnv1a_hash(path.as_bytes());
-        let key = RouteKey { method, path_hash };
-
-        // Check if route exists with same backends (idempotent fast path)
-        {
-            let routes = self.routes.read().unwrap();
-            if let Some(existing) = routes.get(&key) {
-                if existing.backends == backends {
-                    return Ok(());  // No-op if identical
-                }
-            }
-        }
-
-        // Build Maglev table and insert
-        let maglev_table = maglev_build_compact_table(&backends);
-        let route = Route {
-            pattern: Arc::from(path),
-            backends,
-            maglev_table,
-        };
-
-        let mut routes = self.routes.write().unwrap();
-        routes.insert(key, route);
-
-        // Rebuild matchit router (doesn't support updates)
-        // ... rebuild logic
-
-        Ok(())
-    }
-}
-
-// Step 4: Verify tests PASS
-// $ cargo test
-// # test_gateway_route_idempotency ... ok (GREEN phase confirmed)
-```
-
-### REFACTOR Phase: Improve Code Quality
-
-```rust
-// Step 5: Add edge cases
-#[tokio::test]
-async fn test_router_update_route_backends() {
-    // Test updating backends for existing route
-}
-
-// Step 6: Refactor for better design
-impl Router {
-    fn rebuild_prefix_router(&self, routes: &HashMap<RouteKey, Route>) -> Result<matchit::Router<RouteKey>, String> {
-        let mut new_router = matchit::Router::new();
-
-        for (route_key, route) in routes.iter() {
-            let path_str = route.pattern.as_ref();
-            new_router.insert(path_str.to_string(), *route_key)?;
-
-            let prefix_pattern = if path_str == "/" {
-                "/{*rest}".to_string()
-            } else {
-                format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
-            };
-            new_router.insert(prefix_pattern, *route_key)?;
-        }
-
-        Ok(new_router)
-    }
-}
-
-// Step 7: Verify tests still PASS after refactor
-// $ cargo test
-// # All tests ... ok (REFACTOR complete)
-```
-
-### TDD Checklist
-
-- [ ] **RED**: Write failing test first
-- [ ] **RED**: Verify compilation fails or test fails
-- [ ] **GREEN**: Write minimal implementation
-- [ ] **GREEN**: Verify all tests pass
-- [ ] **REFACTOR**: Add edge cases, improve design
-- [ ] **REFACTOR**: Verify tests still pass
-- [ ] **Commit**: `git add . && git commit -m "feat: ..."` (incremental commits)
-
-**Example Session:**
-```bash
-# Router idempotency (TDD - 3 commits)
-1. RED:   Write test_gateway_route_idempotency → FAIL
-2. GREEN: Implement idempotent add_route → PASS
-3. COMMIT: git commit -m "feat: add router idempotency for K8s reconciliation"
-
-# Add update test (TDD - 2 commits)
-1. RED:   Write test_router_update_route_backends → FAIL
-2. GREEN: Fix backend comparison logic → PASS
-3. COMMIT: git commit -m "fix: handle backend updates in router"
+// GOOD
+let name = gateway.metadata.name.as_ref()
+    .ok_or_else(|| anyhow!("Gateway missing name"))?;
 ```
 
 ---
 
-## PERFORMANCE REQUIREMENTS
+## TDD WORKFLOW
 
-### Target: Production-Ready L7 Performance
+**RED → GREEN → REFACTOR** - Always.
 
-**Current (Stage 1):**
-- ~10,000 rps baseline (validated)
-- ~55ns metrics overhead (0.0016% of latency)
-- Maglev O(1) backend selection
-
-**Research-Backed Roadmap:**
-
-From **cutting-edge-research-2024-2025.md**:
-
-**Month 1-2: Production-Ready Gateway**
-- EndpointSlice resolution (dynamic backends)
-- HTTP/2 support (ACM 2024: HTTP/3 is 45% slower)
-- TLS termination with rustls
-- Basic rate limiting and circuit breakers
-- DaemonSet deployment model
-- Expected: 50,000+ rps
-
-**Month 3-4: WASM Plugin System (THE DIFFERENTIATOR)**
-- wasmtime runtime integration
-- Plugin SDK (Rust, Go, TypeScript bindings)
-- Built-in plugins (JWT, CORS, rate-limit)
-- Hot-reload and resource limits
-- Expected: 40,000+ rps (with plugins enabled)
-
-**Month 5-6: HTTP/2 & Connection Pool Optimization**
-- Connection pool tuning (max streams, idle timeout, pre-warming)
-- HTTP/2 HPACK optimization (static table, Huffman encoding)
-- Body streaming (zero-copy within userspace)
-- Passive health checks (observe 5xx rates, circuit breakers)
-- Expected: 70,000+ rps
-
-**Decisions NOT to Implement:**
-- **HTTP/3**: Research proves it's 45% slower than HTTP/2 (ACM 2024)
-- **DPDK**: L7 bottleneck is HTTP parsing, not network (F-Stack research)
-- **XDP HTTP parsing**: Impossible for HTTP/2, TLS (Learning eBPF validates)
-- **io_uring**: Incompatible with hyper, 15% slower for HTTP (2024 benchmarks - see docs/research/IO_URING_ANALYSIS.md)
-
-**Expected Final Performance:**
-```
-Baseline (Stage 1):       ~10,000 rps
-+ HTTP/2:                 → 50,000 rps
-+ WASM plugins:           → 40,000 rps (20% overhead acceptable)
-+ Connection pool tuning: → 50,000 rps (1.25x over plugins)
-+ HPACK optimization:     → 55,000 rps (1.10x)
-+ Body streaming:         → 60,000 rps (1.09x)
-────────────────────────────────────────
-Target: 60,000+ rps (6x baseline, proven path)
-```
-
-### Performance Patterns
-
-```rust
-// Zero-allocation strings (Arc<str>)
-struct Route {
-    pattern: Arc<str>,  // 5ns clone vs 50ns for String
-    backends: Vec<Backend>,
-    maglev_table: Vec<u8>,
-}
-
-// Static string helpers
-fn method_to_str(method: &HttpMethod) -> &'static str {
-    match method {
-        HttpMethod::GET => "GET",
-        HttpMethod::POST => "POST",
-        // No allocations
-    }
-}
-
-// Cardinality control for metrics
-HTTP_REQUESTS_TOTAL
-    .with_label_values(&[method_str, route.pattern.as_ref(), status_str])
-    .inc();  // Use pattern, not actual path
-
-// Early return for /metrics endpoint
-if path == "/metrics" && *req.method() == hyper::Method::GET {
-    return serve_metrics().await;  // Don't record metrics for metrics endpoint
-}
-```
-
----
-
-## KUBERNETES INTEGRATION
-
-### Gateway API v1 (Stage 1 - DONE)
-
-```rust
-use gateway_api::apis::standard::{
-    gateway_classes::GatewayClass,
-    gateways::Gateway,
-    http_routes::HTTPRoute,
-};
-use kube::runtime::{controller, watcher};
-
-// GatewayClass reconciler
-async fn reconcile_gateway_class(gc: Arc<GatewayClass>, ctx: Arc<Context>) -> Result<Action> {
-    // Accept if controllerName == "rauta.io/gateway-controller"
-    if gc.spec.controller_name == "rauta.io/gateway-controller" {
-        update_status(gc, Condition::Accepted(true)).await?;
-    }
-    Ok(Action::requeue(Duration::from_secs(300)))
-}
-
-// HTTPRoute reconciler
-async fn reconcile_http_route(route: Arc<HTTPRoute>, ctx: Arc<Context>) -> Result<Action> {
-    // Parse routing rules
-    for rule in route.spec.rules {
-        let matches = rule.matches;  // PathPrefix, Headers, etc.
-        let backend_refs = rule.backend_refs;  // Services
-
-        // Add route to router (idempotent)
-        ctx.router.add_route(
-            HttpMethod::GET,  // HTTPRoute doesn't specify method
-            &matches[0].path.value,
-            resolve_backends(&backend_refs).await?,
-        )?;
-    }
-
-    // Update status
-    update_route_status(route, Condition::Accepted(true)).await?;
-    Ok(Action::requeue(Duration::from_secs(300)))
-}
-```
-
-**Status**: WORKING
-- GatewayClass, Gateway, HTTPRoute controllers implemented
-- Router idempotency handles reconciliation loops
-- Validated in kind cluster
-
-**Next**: Service → EndpointSlice resolution (dynamic backends)
-
----
-
-## WASM PLUGIN SYSTEM (Stage 2 - NEXT)
-
-### Plugin SDK Design
-
-**Plugin Lifecycle Hooks:**
-```rust
-// Plugin interface (exported by WASM module)
-#[no_mangle]
-pub extern "C" fn on_request(req_ptr: *const u8, req_len: usize) -> u32 {
-    // PLUGIN_CONTINUE = 0
-    // PLUGIN_REJECT = 1
-    // PLUGIN_MODIFY = 2
-}
-
-#[no_mangle]
-pub extern "C" fn on_response(resp_ptr: *const u8, resp_len: usize) -> u32 {
-    // Same return codes
-}
-```
-
-**Example: JWT Authentication Plugin (Rust)**
-```rust
-use rauta_plugin_sdk::*;
-
-#[rauta_plugin]
-fn on_request(req: Request) -> PluginResult {
-    // Extract Authorization header
-    let auth_header = req.headers().get("Authorization")?;
-
-    // Verify JWT
-    let claims = verify_jwt(auth_header)?;
-
-    // Add user ID to request context
-    req.set_metadata("user_id", &claims.sub);
-
-    PluginResult::Continue
-}
-```
-
-**Example: Rate Limiting Plugin (Go)**
-```go
-package main
-
-import "github.com/rauta/plugin-sdk-go"
-
-//export on_request
-func on_request(reqPtr *byte, reqLen int) int32 {
-    req := plugin.DecodeRequest(reqPtr, reqLen)
-
-    // Get client IP
-    clientIP := req.Header("X-Forwarded-For")
-
-    // Check rate limit
-    if rateLimiter.IsAllowed(clientIP) {
-        return plugin.CONTINUE
-    }
-
-    // Reject with 429 Too Many Requests
-    req.SetResponse(429, "Rate limit exceeded")
-    return plugin.REJECT
-}
-```
-
-**Plugin Configuration (HTTPRoute annotation):**
-```yaml
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: api-route
-  annotations:
-    rauta.io/plugins: |
-      - name: jwt-auth
-        config:
-          secret: jwt-signing-key
-          issuer: https://auth.example.com
-      - name: rate-limit
-        config:
-          requests_per_minute: 100
-          burst: 20
-spec:
-  parentRefs:
-  - name: rauta-gateway
-  rules:
-  - matches:
-    - path:
-        type: PathPrefix
-        value: /api
-    backendRefs:
-    - name: api-service
-      port: 8080
-```
-
----
-
-## TESTING STRATEGY
-
-### Unit Tests (Rust)
+### RED: Write Failing Test First
 
 ```rust
 #[tokio::test]
 async fn test_router_maglev_distribution() {
     let router = Router::new();
-
     let backends = vec![
-        Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 1)), 8080, 100),
-        Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 2)), 8080, 100),
-        Backend::new(u32::from(Ipv4Addr::new(10, 0, 1, 3)), 8080, 100),
+        Backend::new(ip1, 8080, 100),
+        Backend::new(ip2, 8080, 100),
     ];
 
-    router.add_route(HttpMethod::GET, "/api/users", backends).unwrap();
+    router.add_route(HttpMethod::GET, "/api", backends).unwrap();
 
-    // Simulate 10K requests
-    let mut distribution = HashMap::new();
-    for i in 0..10_000 {
-        let src_ip = Some(0x0100007f + i);  // Vary client IP
-        let src_port = Some((i % 65535) as u16);
-
-        let route_match = router
-            .select_backend(HttpMethod::GET, "/api/users", src_ip, src_port)
-            .unwrap();
-
-        *distribution.entry(route_match.backend.ipv4).or_insert(0) += 1;
-    }
-
-    // Each backend should get ~33% (within 5% variance)
-    for count in distribution.values() {
-        let percentage = (*count as f64) / 10_000.0;
-        assert!((percentage - 0.33).abs() < 0.05);
-    }
+    // Verify even distribution across 10K requests
+    // ...
 }
 ```
 
-### WASM Plugin Tests
+### GREEN: Minimal Implementation
+
+Write just enough code to make the test pass.
+
+### REFACTOR: Clean Up
+
+Extract helpers, improve naming, add edge cases. Tests must still pass.
+
+---
+
+## KEY PATTERNS IN THE CODEBASE
+
+### Maglev Load Balancing
 
 ```rust
-#[tokio::test]
-async fn test_jwt_plugin_rejects_invalid_token() {
-    let runtime = PluginRuntime::new();
-    runtime.load_plugin("jwt-auth", include_bytes!("plugins/jwt_auth.wasm")).await.unwrap();
+// Build lookup table (65,537 entries)
+let table = maglev_build_compact_table(&backends);
 
-    let mut req = Request::builder()
-        .uri("/api/users")
-        .header("Authorization", "Bearer invalid_token")
-        .body(())
-        .unwrap();
+// O(1) backend selection
+let hash = fnv1a_hash(path, client_ip, client_port);
+let backend_idx = table[hash % table.len()];
+```
 
-    let decision = runtime.run_request_plugins(&req).await;
+### Router with matchit + Maglev
 
-    assert_eq!(decision, PluginDecision::Reject);
+```rust
+pub struct Router {
+    prefix_router: RwLock<matchit::Router<RouteKey>>,  // Path matching
+    routes: RwLock<HashMap<RouteKey, Route>>,          // Route data
+}
+
+pub struct Route {
+    pattern: Arc<str>,
+    backends: Vec<Backend>,
+    maglev_table: Vec<u8>,  // Compact Maglev lookup
 }
 ```
 
-### Integration Tests (Kind Cluster)
-
-```bash
-# Create kind cluster
-kind create cluster --name rauta-test
-
-# Install Gateway API CRDs
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.0.0/standard-install.yaml
-
-# Deploy RAUTA
-kubectl apply -f deploy/rauta-daemonset.yaml
-
-# Create test GatewayClass
-kubectl apply -f - <<EOF
-apiVersion: gateway.networking.k8s.io/v1
-kind: GatewayClass
-metadata:
-  name: rauta
-spec:
-  controllerName: rauta.io/gateway-controller
-EOF
-
-# Verify GatewayClass accepted
-kubectl get gatewayclass rauta -o yaml
-# Should show: status.conditions[type=Accepted].status=True
-
-# Create Gateway + HTTPRoute with plugin
-kubectl apply -f examples/gateway-httproute-with-plugins.yaml
-
-# Test routing with JWT
-curl -H "Authorization: Bearer $(generate_jwt)" \
-  http://$(kubectl get svc rauta -o jsonpath='{.status.loadBalancer.ingress[0].ip}')/api/test
-```
-
-### Load Testing
-
-```bash
-# HTTP/1.1 load test
-wrk -t12 -c400 -d30s http://rauta-lb/api/test
-
-Expected:
-  Requests/sec: 10,000+
-  Latency p99: <50ms
-  Memory: <100MB
-
-# With WASM plugins enabled
-wrk -t12 -c400 -d30s -H "Authorization: Bearer $JWT" http://rauta-lb/api/test
-
-Expected:
-  Requests/sec: 8,000+ (20% overhead acceptable)
-  Latency p99: <60ms
-  Memory: <150MB
-
-# Check metrics
-curl http://rauta-lb:9090/metrics | grep rauta_requests_total
-```
-
----
-
-## DEPLOYMENT
-
-### DaemonSet (One per Node)
-
-```yaml
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: rauta
-  namespace: kube-system
-spec:
-  selector:
-    matchLabels:
-      app: rauta
-  template:
-    spec:
-      hostNetwork: true  # Access node network
-      containers:
-      - name: rauta
-        image: rauta:v0.1.0
-        securityContext:
-          capabilities:
-            add: ["NET_BIND_SERVICE"]  # For ports 80/443
-        ports:
-        - containerPort: 80
-        - containerPort: 443
-        - containerPort: 9090  # Prometheus metrics
-        env:
-        - name: RAUTA_GATEWAY_CLASS
-          value: "rauta"
-        - name: RAUTA_LOG_LEVEL
-          value: "info"
-        - name: RAUTA_PLUGIN_DIR
-          value: "/etc/rauta/plugins"
-        volumeMounts:
-        - name: plugin-config
-          mountPath: /etc/rauta/plugins
-      volumes:
-      - name: plugin-config
-        configMap:
-          name: rauta-plugins
-```
-
----
-
-## LEARNING RESOURCES
-
-### Must Read
-
-1. **"Learning eBPF"** (Liz Rice) - Chapter 8: Networking
-   - Key lesson: XDP cannot parse HTTP/2, TLS, or complex protocols
-   - Even Cilium uses Envoy for L7 (not eBPF)
-
-2. **"Crafting Interpreters"** (Bob Nystrom) - WASM runtime concepts
-
-3. **Cloudflare Pingora**: https://github.com/cloudflare/pingora
-   - Validates Rust for L7 proxies
-
-4. **Gateway API**: https://gateway-api.sigs.k8s.io/
-
-5. **wasmtime Book**: https://docs.wasmtime.dev/
-
-### Code References
-
-- **Cloudflare Pingora**: Rust proxy (validates architecture)
-- **Kong**: Lua plugins (what we're improving upon)
-- **Envoy**: C++ filters (shows need for safer extension model)
-
-### Research Papers
-
-- **ACM 2024**: "QUIC is not Quick Enough" (HTTP/3 is 45% slower)
-- **Google**: "Maglev: A Fast and Reliable Software Network Load Balancer"
-- **Cloudflare**: Pingora architecture (Rust proxy validates our approach)
-
-### Internal Research
-
-- **docs/research/IO_URING_ANALYSIS.md**: Why io_uring doesn't help L7 HTTP proxies (2024)
-
----
-
-## REALISTIC SCOPE
-
-### What RAUTA IS
-
-**Production-ready Gateway API controller**
-- Full Gateway API v1 support (GatewayClass, Gateway, HTTPRoute)
-- Maglev load balancing
-- Prometheus observability
-- Validated in kind cluster
-
-**Safe plugin extensibility**
-- WASM runtime (wasmtime)
-- Multi-language SDK (Rust, Go, TypeScript)
-- Sandboxed execution (cannot crash gateway)
-- Hot-reload support
-
-**Learning project for Rust + WASM**
-- Explore Rust async patterns (tokio, hyper)
-- Learn WASM runtime integration
-- Build production-quality systems
-
-### What RAUTA IS NOT
-
-**Not an XDP HTTP router**
-- XDP sees raw packets (no TCP reassembly)
-- Modern protocols (HTTP/2, TLS) require userspace
-- Learning eBPF (Liz Rice) confirms: even Cilium uses Envoy for L7
-
-**Not trying to beat Katran**
-- Katran does L4 (10M pps)
-- RAUTA does L7 (100K+ rps)
-- Different problem spaces
-
-**Not replacing Envoy/NGINX**
-- Those are mature, battle-tested
-- RAUTA is a focused tool with unique strengths (WASM plugins)
-
-**Not building eBPF observability**
-- Observability is out of scope
-- Focus on Gateway API routing and WASM plugins
-- Keep concerns separated
-
----
-
-## DEVELOPMENT WORKFLOW
-
-### Initial Setup
-
-After cloning the repository:
-
-```bash
-# Install pre-commit hooks (REQUIRED)
-./scripts/git-hooks/install.sh
-```
-
-**What the pre-commit hook does:**
-- ✅ Blocks `.unwrap()` in production code
-- ✅ Blocks `.expect()` in production code
-- ✅ Blocks `panic!()` in production code
-- ❌ Allows all of the above in test code (`#[cfg(test)]` modules)
-
-**Why this matters:**
-- Lock poisoning from `.unwrap()` on RwLock/Mutex causes cascading panics → gateway crash
-- Metric registration failures shouldn't kill the gateway
-- Production code must be resilient to failures
-
-### Safe Lock Helpers (MANDATORY)
-
-**NEVER use `.unwrap()` on locks.** Always use these helpers:
+### Connection Pooling
 
 ```rust
-use crate::proxy::router::{safe_read, safe_write, safe_lock};
-
-// ❌ BAD - Will panic on lock poisoning, cascades to all threads
-let routes = self.routes.read().unwrap();
-
-// ✅ GOOD - Recovers from poisoning, logs warning, continues
-let routes = safe_read(&self.routes);
-
-// ❌ BAD - RwLock write
-let mut routes = self.routes.write().unwrap();
-
-// ✅ GOOD
-let mut routes = safe_write(&self.routes);
-
-// ❌ BAD - Mutex
-let inner = self.inner.lock().unwrap();
-
-// ✅ GOOD
-let inner = safe_lock(&self.inner);
-```
-
-**How the helpers work:**
-```rust
-/// Safe RwLock read with automatic poison recovery
-#[inline]
-fn safe_read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
-    lock.read().unwrap_or_else(|poisoned| {
-        warn!("RwLock poisoned during read, recovering (data is still valid)");
-        poisoned.into_inner()  // Extract data, continue operation
-    })
+// Per-backend, per-protocol pools
+pub struct BackendPool {
+    http1_pools: HashMap<BackendKey, Http1Pool>,
+    http2_pools: HashMap<BackendKey, Http2Pool>,
 }
+
+// Reuse connections
+let conn = pool.get_or_create(backend).await?;
+conn.send_request(req).await
 ```
 
-**Why poison recovery is safe:**
-- Lock poisoning means a thread panicked while holding the lock
-- The DATA is still valid (Rust prevents memory corruption)
-- Extracting the data and continuing is safer than cascading panics
-- Warning is logged for observability
+### Circuit Breaker
 
-### Error Handling Rules
+```rust
+pub struct CircuitBreaker {
+    state: AtomicU8,  // Closed, Open, HalfOpen
+    failure_count: AtomicU32,
+    last_failure: AtomicU64,
+}
 
-1. **Production Code**:
-   - Use `Result<T, E>` and propagate errors with `?`
-   - Use `Option<T>` with `.ok_or()` or early returns
-   - Never use `.unwrap()` or `.expect()`
-   - Graceful degradation (e.g., metrics failures shouldn't crash gateway)
-
-2. **Test Code**:
-   - `.unwrap()` and `.expect()` are FINE in tests
-   - Tests should panic on unexpected failures
-   - Use descriptive messages: `.expect("Should parse test certificate")`
-
-3. **Metrics and Observability**:
-   - Metric registration failures log warnings but don't crash
-   - Gateway runs even with degraded observability
-   - Better to serve traffic without metrics than not serve at all
-
-### Commit Workflow
-
-```bash
-# Make changes
-git add .
-
-# Pre-commit hook runs automatically
-git commit -m "feat: your change"
-
-# If hook blocks you:
-# 1. Check if unwrap/expect are in production code (fix them)
-# 2. If they're in tests, the hook has a bug (override)
-git commit --no-verify -m "feat: your change"
+// 50% error rate threshold → open circuit
+// 30 seconds timeout → half-open
+// 1 success in half-open → close
 ```
 
 ---
 
-## CI COST OPTIMIZATION
+## VERIFICATION CHECKLIST
 
-**CRITICAL: GitHub Actions costs were burning money - Now optimized for ~90% savings**
-
-### The Problem
-
-CI was running expensive release builds on EVERY push to feat/* branches:
-- Release builds with LTO (10-20 min) on every push
-- No path filtering (rebuilt even for docs changes)
-- cargo-audit installed from scratch every run
-- Result: ~6,000 GitHub Actions minutes/month 💸
-
-### The Solution: Three Lines of Defense
-
-**Defense 1: Enhanced Pre-Commit Hooks** (Automatic)
-```bash
-# Runs automatically on git commit
-# - Checks unwrap()/expect()/panic!()
-# - Runs cargo fmt --check
-# - Runs cargo clippy
-# - Runs cargo check
-# Speed: 10-30 seconds | Catches: 80% of issues
-```
-
-**Defense 2: Local CI Checks** (Before push)
-```bash
-# Run ALL CI checks locally (saves GitHub minutes)
-make ci-local    # Full CI suite (2-3 min)
-make check       # Fast compilation check (10s)
-make fmt         # Format code
-make clippy      # Lints
-make test        # Tests
-```
-
-**Defense 3: Optimized GitHub Actions**
-- ✅ Only runs on main + PRs to main (NOT feat/* branches)
-- ✅ Path filtering (skips CI for docs-only changes)
-- ✅ Release builds ONLY on main/PR to main
-- ✅ Faster Rust caching (Swatinem/rust-cache@v2)
-- ✅ cargo-audit binary cached
-- ✅ Security audit only when Cargo.lock changes
-
-### The Workflow
+Before every commit:
 
 ```bash
-# 1. Make changes
-vim control/src/main.rs
+# Format
+cargo fmt
 
-# 2. Quick check (10-30s)
-make check
+# Lint (treat warnings as errors)
+cargo clippy -- -D warnings
 
-# 3. Commit (pre-commit hook runs automatically)
-git commit -m "feat: awesome feature"
+# Tests
+cargo test
 
-# 4. Run FULL CI locally BEFORE pushing (2-3 min)
+# Full CI locally
 make ci-local
-
-# 5. If all passes, push with confidence
-git push origin feat/my-feature
-
-# 6. Create PR (CI runs once, not on every push)
 ```
 
-### Cost Savings
+---
 
-**Before**: ~6,000 GitHub Actions minutes/month
-**After**: ~500 GitHub Actions minutes/month
-**Savings**: ~90% reduction 💰
+## COMMON TASKS
 
-### BONUS: Local GitHub Actions Testing
+### Adding a New Filter Type
 
-Run the EXACT GitHub Actions workflow locally (NO cloud minutes):
+1. Add variant to `FilterAction` enum in `filters.rs`
+2. Implement filter logic in `apply_request_filters()` or `apply_response_filters()`
+3. Parse from HTTPRoute in `http_route.rs`
+4. Add tests
 
-```bash
-# Install 'act' (one-time)
-make install-act
+### Adding a New Matching Condition
 
-# Run CI locally using Docker
-make ci-act
-```
+1. Add to `RouteMatch` struct
+2. Update `matches_request()` in `router.rs`
+3. Parse from HTTPRoute in `http_route.rs`
+4. Add tests
 
-### Documentation
+### Adding a New Metric
 
-- **Quick Start**: `docs/CI_QUICK_START.md`
-- **Full Guide**: `docs/CI_COST_OPTIMIZATION.md`
-- **All Commands**: `make help`
-
-### IMPORTANT
-
-CI now ONLY triggers on:
-- ✅ Push to `main`
-- ✅ PRs to `main`
-
-CI does NOT trigger on:
-- ❌ Push to `feat/*` branches
-- ❌ Push to `dev` branch
-
-**This is INTENTIONAL to save money. Use `make ci-local` before pushing!**
+1. Register in `metrics.rs`
+2. Instrument in relevant code path
+3. Add to `/metrics` endpoint tests
 
 ---
 
-## DEFINITION OF DONE
+## FILE LOCATIONS
 
-A feature is complete when:
-
-- [ ] Design documented in `docs/`
-- [ ] Rust tests passing (unit + integration)
-- [ ] TDD workflow followed (RED → GREEN → REFACTOR)
-- [ ] Load test meets performance targets
-- [ ] K8s integration tested (if applicable)
-- [ ] Documentation updated
-- [ ] Code reviewed (pre-commit hooks pass)
-
-**NO STUBS. NO TODOs. COMPLETE CODE OR NOTHING.**
-
----
-
-## DEVELOPMENT ROADMAP
-
-### Month 1-2: Production-Ready Gateway (Table Stakes)
-
-**Week 1: EndpointSlice resolution**
-- Dynamic backend discovery
-- Pod IP updates without restart
-- Health checking integration
-
-**Week 2: HTTP/2 support**
-- Multiplexing
-- Header compression
-- Server push (optional)
-
-**Week 3: TLS termination**
-- rustls integration
-- SNI support
-- Certificate rotation
-
-**Week 4: Basic rate limiting and circuit breakers**
-- Token bucket algorithm
-- Per-route limits
-- Failure detection
-
-**Week 5-6: DaemonSet deployment model**
-- Host network mode
-- Node-local routing
-- HA considerations
-
-**Week 7-8: Testing and production hardening**
-- Load testing (wrk, vegeta)
-- Chaos testing (toxiproxy)
-- Security review
-
-### Month 3-4: WASM Plugin System (THE DIFFERENTIATOR)
-
-**Week 9-10: WASM runtime integration**
-- wasmtime setup
-- Memory limits
-- CPU limits
-- Timeout handling
-
-**Week 11-12: Plugin SDK and lifecycle hooks**
-- Rust SDK
-- Go SDK bindings
-- TypeScript SDK (wit-bindgen)
-- Request/response hooks
-
-**Week 13-14: Built-in plugins**
-- JWT authentication
-- CORS handling
-- Rate limiting (WASM-based)
-- Request transformation
-
-**Week 15-16: Plugin configuration and hot-reload**
-- HTTPRoute annotations
-- ConfigMap integration
-- Reload without downtime
-- Plugin versioning
-
-### Month 5-6: Developer Experience and Launch
-
-**Week 17-18: kubectl rauta plugin**
-- Debugging tools
-- Plugin logs
-- Performance profiling
-
-**Week 19-20: Plugin marketplace**
-- Plugin registry
-- Installation CLI
-- Documentation site
-
-**Week 21-22: Examples and tutorials**
-- Getting started guide
-- Plugin development tutorial
-- Production deployment guide
-
-**Week 23-24: Launch prep**
-- Blog posts
-- Conference talks
-- Community building
+| What | Where |
+|------|-------|
+| Main entry point | `control/src/main.rs` |
+| Router + Maglev | `control/src/proxy/router.rs` |
+| HTTP server | `control/src/proxy/server.rs` |
+| TLS support | `control/src/proxy/tls.rs` |
+| Connection pools | `control/src/proxy/backend_pool.rs` |
+| Circuit breaker | `control/src/proxy/circuit_breaker.rs` |
+| Rate limiter | `control/src/proxy/rate_limiter.rs` |
+| GatewayClass controller | `control/src/apis/gateway/gateway_class.rs` |
+| Gateway controller | `control/src/apis/gateway/gateway.rs` |
+| HTTPRoute controller | `control/src/apis/gateway/http_route.rs` |
+| EndpointSlice watcher | `control/src/apis/gateway/endpointslice_watcher.rs` |
+| Shared types | `common/src/lib.rs` |
+| K8s manifests | `deploy/` |
 
 ---
 
-## COMPETITIVE POSITIONING
+## DEPENDENCIES
 
-**vs Kong**
-- Kong: Lua plugins can crash gateway
-- RAUTA: WASM plugins are sandboxed
-- Expected: 10-15x faster (no LuaJIT overhead)
-
-**vs Envoy**
-- Envoy: C++ filters are dangerous to write
-- RAUTA: WASM plugins in any language
-- Benefit: Memory safe, easier to extend
-
-**vs Traefik**
-- Traefik: Limited plugin ecosystem
-- RAUTA: Multi-language WASM support
-- Benefit: Write plugins in Rust, Go, TypeScript
-
-**vs NGINX**
-- NGINX: C modules require recompilation
-- RAUTA: Hot-reload WASM plugins
-- Benefit: Zero-downtime updates
-
-**Unique Differentiators:**
-1. **Gateway API native** - Modern standard from day 1
-2. **WASM plugins** - Safe, fast, multi-language extensibility
-3. **Rust core** - Memory safety without garbage collection
-4. **Maglev hashing** - Google's algorithm (proven at scale)
-5. **Research-backed** - ACM papers, not hype
-
-**The Pitch:**
-> "RAUTA is the Gateway API controller you can safely extend with WASM plugins. Like Kong, but your plugins can't crash the gateway. Like Envoy, but you don't need to write C++. Write plugins in Rust, Go, or TypeScript - they run sandboxed with CPU and memory limits."
+| Crate | Purpose |
+|-------|---------|
+| `kube` 1.0 | Kubernetes API client + controller runtime |
+| `gateway-api` 0.16 | Gateway API CRD types |
+| `hyper` 1.0 | HTTP/1.1 and HTTP/2 |
+| `hyper-util` 0.1 | Hyper utilities |
+| `tokio` 1.41 | Async runtime |
+| `tokio-rustls` 0.26 | TLS with rustls |
+| `matchit` 0.8 | Radix tree for path matching |
+| `regex` 1.11 | Header/query regex matching |
+| `prometheus` 0.14 | Metrics |
+| `tracing` 0.1 | Structured logging |
+| `tikv-jemalloc` 0.6 | Memory allocator |
 
 ---
 
-## FINAL MANIFESTO
+## AGENT INSTRUCTIONS
 
-**RAUTA is a production-focused learning project for building modern K8s infrastructure in Rust.**
+When working on this codebase:
 
-**We're building:**
-- Real-world Gateway API controller (working in kind cluster)
-- Safe WASM plugin extensibility (the differentiator)
-- Research-backed architecture (Cloudflare Pingora, wasmtime)
-- Production-quality Rust (TDD, strong typing, pre-commit hooks)
+1. **Read first** - Understand existing patterns before changing
+2. **TDD always** - Write failing test, implement, refactor
+3. **Use safe_read/safe_write** - Never raw `.unwrap()` on locks
+4. **Small commits** - One logical change per commit
+5. **Run checks** - `make ci-local` before pushing
 
-**We're NOT building:**
-- XDP HTTP parser (unrealistic for HTTP/2, TLS - Learning eBPF validates)
-- Another Envoy clone (learn from Envoy, improve the plugin model)
-- Experimental dead-end (every feature has production use case)
-- eBPF observability (that's TAPIO's job - separation of concerns)
-
-**Learn. Build. Ship.**
+**This is a learning project** - code quality matters, but we're exploring and experimenting. Ask questions if unclear.
 
 ---
 
-**Iron-clad routing with safe extensibility.**
+## ROADMAP
+
+**Stage 1 (Complete):**
+- Gateway API controller
+- HTTP proxy with all features
+- TLS, HTTP/2, connection pooling
+- Health checking, rate limiting
+
+**Stage 2 (Planned):**
+- WASM plugin system (wasmtime)
+- Plugin SDK
+- Built-in plugins
