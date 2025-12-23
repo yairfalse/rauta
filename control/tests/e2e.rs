@@ -76,7 +76,10 @@ fn init_crypto() {
 async fn test_p0_gatewayclass_acceptance() {
     init_crypto();
     let ctx = Context::new().await.expect("Should create context");
-    let gc_name = format!("rauta-test-{}", ctx.namespace.chars().skip(12).collect::<String>());
+    let gc_name = format!(
+        "rauta-test-{}",
+        ctx.namespace.chars().skip(12).collect::<String>()
+    );
 
     println!("=== Test: GatewayClass Acceptance ===");
     println!("What: Verify RAUTA accepts GatewayClasses with correct controllerName");
@@ -283,11 +286,12 @@ spec:
         .build()
         .expect("Should build HTTP client");
 
-    let rauta_url = std::env::var("RAUTA_TEST_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let rauta_url =
+        std::env::var("RAUTA_TEST_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(30);
     let poll_interval = Duration::from_secs(1);
-    let mut response = None;
+    let mut response: Option<Result<reqwest::Response, reqwest::Error>> = None;
     while start.elapsed() < timeout {
         match client.get(format!("{}/test/hello", rauta_url)).send().await {
             Ok(resp) => {
@@ -303,7 +307,10 @@ spec:
                 }
             }
             Err(e) => {
-                println!("    HTTPRoute not ready yet: request error: {}. Retrying...", e);
+                println!(
+                    "    HTTPRoute not ready yet: request error: {}. Retrying...",
+                    e
+                );
             }
         }
         tokio::time::sleep(poll_interval).await;
@@ -567,7 +574,8 @@ spec:
         .build()
         .expect("Should build HTTP client");
 
-    let rauta_url = std::env::var("RAUTA_TEST_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let rauta_url =
+        std::env::var("RAUTA_TEST_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(30);
     let poll_interval = Duration::from_secs(1);
@@ -595,7 +603,7 @@ spec:
     // Wait for EndpointSlice update using polling (up to 30s)
     println!("  Step 6: Waiting for EndpointSlice update (up to 30s)");
     let start = std::time::Instant::now();
-    let mut response = None;
+    let mut response: Option<Result<reqwest::Response, reqwest::Error>> = None;
 
     while start.elapsed() < timeout {
         match client.get(format!("{}/scale/test", rauta_url)).send().await {
@@ -604,7 +612,10 @@ spec:
                 break;
             }
             Ok(resp) => {
-                println!("    Not ready yet: got status {}. Retrying...", resp.status());
+                println!(
+                    "    Not ready yet: got status {}. Retrying...",
+                    resp.status()
+                );
             }
             Err(e) => {
                 println!("    Not ready yet: {}. Retrying...", e);

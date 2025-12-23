@@ -18,7 +18,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY common ./common
 COPY control ./control
 
-# Build release binary
+# Create dummy seppo for dev-dependency resolution (not actually built)
+RUN mkdir -p /seppo && echo '[package]\nname = "seppo"\nversion = "0.1.0"\n[lib]\npath = "lib.rs"' > /seppo/Cargo.toml && touch /seppo/lib.rs
+
+# Build release binary (excludes tests/dev-deps)
 RUN cargo build --release --package control
 
 # Runtime image (must match builder's glibc version)
