@@ -19,7 +19,7 @@ COPY common ./common
 COPY control ./control
 
 # Create dummy seppo for dev-dependency resolution (not actually built)
-RUN mkdir -p /seppo && echo '[package]\nname = "seppo"\nversion = "0.1.0"\n[lib]\npath = "lib.rs"' > /seppo/Cargo.toml && touch /seppo/lib.rs
+RUN mkdir -p /seppo/src && printf '[package]\nname = "seppo"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\npath = "src/lib.rs"\n' > /seppo/Cargo.toml && touch /seppo/src/lib.rs
 
 # Build release binary (excludes tests/dev-deps)
 RUN cargo build --release --package control
