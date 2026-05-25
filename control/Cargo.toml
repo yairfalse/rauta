@@ -10,7 +10,7 @@ agent-api = { path = "../agent-api" }
 tokio = { version = "1.41", features = ["full"] }
 tokio-util = "0.7"  # For CancellationToken
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 num_cpus = "1.16"
 
 # Kubernetes
