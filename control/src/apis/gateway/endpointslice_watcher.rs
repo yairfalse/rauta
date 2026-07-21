@@ -248,7 +248,7 @@ fn aggregate_backends_for_service(
 
     // Get all slices for this service
     if let Some(slices) = service_slices.get(service_key) {
-        for (_slice_name, endpointslice) in slices.iter() {
+        for endpointslice in slices.values() {
             // Parse backends from this slice
             let slice_backends = parse_endpointslice_to_backends(endpointslice, target_port);
 
