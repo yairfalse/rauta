@@ -17,10 +17,11 @@ jobs:
   # Main CI job - just calls `just ci`
   ci:
     name: CI (just ci)
-    runs-on: ubuntu-latest
+    runs-on: arc-arm64
     steps:
       - uses: actions/checkout@v4
 
+      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -32,7 +33,9 @@ jobs:
       # Install Just
       - name: Install Just
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+          mkdir -p "$HOME/.local/bin"
+          curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # Install cargo-audit (for security checks)
       - name: Install cargo-audit
@@ -45,7 +48,7 @@ jobs:
   # Status check for branch protection
   status:
     name: CI Status
-    runs-on: ubuntu-latest
+    runs-on: arc-arm64
     needs: [ci]
     if: always()
     steps:

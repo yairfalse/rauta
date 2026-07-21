@@ -377,7 +377,7 @@ impl GatewayReconciler {
                 .spec
                 .listeners
                 .iter()
-                .zip(tls_validation_results.into_iter())
+                .zip(tls_validation_results)
                 .map(|(listener, tls_validation)| {
                     // RAUTA currently only supports HTTPRoute
                     let rauta_supported_kinds = ["HTTPRoute"];
