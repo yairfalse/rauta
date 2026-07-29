@@ -19,7 +19,7 @@ k8s-openapi = { version = "0.25", features = ["v1_31"] }  # Updated to match gat
 kube-runtime = "1"  # Updated with kube
 
 # Gateway API (official Rust bindings from kube-rs)
-gateway-api = "0.16"  # Latest version with Gateway API v1.x support
+gateway-api = "0.21"  # Latest version with Gateway API v1.x support
 
 # Logging
 tracing = "0.1"
