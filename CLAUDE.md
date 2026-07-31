@@ -15,10 +15,18 @@ cargo test --workspace                                    # All 220+ tests
 cargo test TEST_NAME -- --nocapture                       # Single test with output
 cargo fmt --all -- --check                                # Check format
 cargo clippy --all-targets --all-features -- -D warnings  # Lint (strict)
+cargo bench -p control --bench hot_path                   # Run hot-path benchmarks
 make ci-local                                             # Full CI locally
 ```
 
-`just test-one TEST` runs a single test with output. Pre-commit and pre-push hooks run fmt, clippy, and tests automatically.
+`just test-one TEST` runs a single test with output. `make check` does a fast compile check without codegen (common + control only). `make ci-local` also only checks common + control — use `cargo test --workspace` for the full 5-crate suite. Pre-commit and pre-push hooks run fmt, clippy, and tests automatically.
+
+### Benchmarks
+
+`control/benches/hot_path.rs` — custom harness (not criterion), three benchmarks:
+1. Circuit breaker `allow_request` (AtomicU64 CAS)
+2. Rate limiter `check_rate_limit` (AtomicU64 CAS-backed token bucket)
+3. Router `select_backend` (route lookup + Maglev + ArcSwap health check)
 
 ### Oracle (ground truth tests against live gateway)
 
@@ -40,7 +48,9 @@ The oracle is a standalone crate (NOT a workspace member). It connects to a live
 
 **NOT workspace members:** `eval/oracle/` (standalone test binary)
 
-**Two subsystems in `control/src/`:**
+**Crate dependencies:** `mcp-server` → `agent-api` (transport-agnostic tools). `rauta-cli` → `mcp-server` + `agent-api` (CLI + MCP dual interface). `control` is the main binary and does not depend on rauta-cli.
+
+**Three subsystems in `control/src/`:**
 
 1. **`apis/gateway/`** — K8s controllers (kube-rs reconcilers). Watch GatewayClass, Gateway, HTTPRoute, EndpointSlice, Secret. Push routing config into Router.
 
@@ -68,7 +78,7 @@ Proxy errors use `ProxyError` enum (in `error.rs`): `Timeout` → 504, `BackendE
 1. **No `.unwrap()` in production code** — Use `?`, `safe_read()`/`safe_write()`, or `.ok_or_else()`. Tests may use `.unwrap()`.
 2. **No `println!`** — Use `tracing::{info, warn, error, debug}`.
 3. **No string enums** — Use proper Rust enums with `#[repr(u8)]` where appropriate.
-4. **No TODOs or stubs** — Complete implementations only.
+4. **No new TODOs or stubs** — Complete implementations only. Existing incomplete operator surfaces must be made explicit in docs and errors until implemented.
 5. **Safe lock helpers** for `RwLock`/`Mutex` — use `safe_read(&lock)` / `safe_write(&lock)` instead of `.read().unwrap()`. These recover from lock poisoning. Defined in `router.rs`.
 6. **Clippy lints** in `control/Cargo.toml` warn on `unwrap_used`, `expect_used`, `panic`.
 7. **Arc-wrap filters** in Route struct — `RouteMatch` construction uses `Arc::clone` (~1ns), not deep clone.
@@ -84,9 +94,23 @@ RED → GREEN → REFACTOR. Write a failing test first, implement minimally, the
 
 **Adding a diagnostic rule:** Implement `DiagnosticRule` trait in `agent-api/src/diagnostics/rules.rs` → register in `DiagnosticsEngine::with_builtin_rules()` → add test in `engine.rs`.
 
-**Adding an MCP tool:** Add tool definition to `McpToolExecutor::list_tools()` in `mcp-server/src/tools.rs` → add match arm in `call_tool()` → add method to `GatewayQuery` trait if needed.
+**Adding an MCP tool:** Add a `#[tool]` method and parameter type in `mcp-server/src/handler.rs` → add or reuse a method on the `GatewayQuery` trait in `agent-api/src/query.rs` → implement both `LocalGatewayQuery` in `control/src/admin/local_query.rs` and `RemoteGatewayQuery` in `rauta-cli/src/remote_query.rs` → add CLI/admin endpoints if the tool must work out of process.
 
 **Adding a metric:** Register in `metrics.rs` → instrument in code path → test.
+
+**Adding ontology or timeline behavior:** Start from `docs/plan-agentic-gateway.md` and `docs/adr/004-rauta-ontology-and-temporal-state.md`. Keep eBPF as an optional evidence source that feeds ontology `HealthSignal`/`Evidence`, not as a required routing dependency.
+
+## MCP Server (AI Agent Integration)
+
+The MCP server lives in `rauta-cli`, not `control`. Start it with:
+
+```bash
+rauta --endpoint http://localhost:9091 mcp
+```
+
+This runs stdio transport: MCP JSON-RPC frames on stdout, tracing logs on stderr. Used by Claude Code, Cursor, and other MCP clients. The `RemoteGatewayQuery` (HTTP client to admin API) is wrapped in `RautaMcpHandler` and served over `rmcp::transport::stdio()`. Streamable HTTP transport (`POST /mcp` on admin port) is planned but not yet implemented.
+
+Current remote read tools are wired through the admin API. Backend drain and undrain are intentionally explicit-unavailable operations until the safe-actions spec adds bounded action semantics.
 
 ## Environment Variables
 
@@ -99,6 +123,7 @@ RED → GREEN → REFACTOR. Write a failing test first, implement minimally, the
 | `RAUTA_ADMIN_ENDPOINT` | `http://localhost:9091` | CLI target |
 | `RAUTA_TLS_CERT` / `_KEY` | — | TLS termination |
 | `RAUTA_GATEWAY_CLASS` | `rauta` | GatewayClass to watch |
+| `RAUTA_TLS_HOSTNAME` | `localhost` | SNI hostname for TLS |
 | `RUST_LOG` | `info` | Log level |
 
 ## Verification Before Commit
@@ -107,4 +132,11 @@ RED → GREEN → REFACTOR. Write a failing test first, implement minimally, the
 make ci-local   # runs fmt check, clippy, cargo check, tests
 ```
 
-Pre-commit hooks enforce this automatically. Pre-push hooks also run release build.
+Pre-commit hooks enforce this automatically (blocks `.unwrap()`, `.expect()`, `panic!()` in non-test code, plus fmt and clippy). Pre-push hooks also run release build. Install hooks: `./scripts/git-hooks/install.sh`.
+
+## Useful Scripts
+
+- `deploy/deploy-to-kind.sh` — one-command Kind cluster + RAUTA + demo backend
+- `scripts/run_load_test.sh` — load test suite with HTTP/2 backend
+- `scripts/run-conformance.sh` — Gateway API conformance tests
+- `scripts/watch_control.sh` — auto-rebuild on file changes

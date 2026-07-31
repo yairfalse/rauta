@@ -1,6 +1,8 @@
 //! Output rendering for different formats (table, json, agent)
 
-use agent_api::types::{Diagnosis, GatewaySnapshot, RouteSnapshot};
+use agent_api::types::{
+    BackendSnapshot, Diagnosis, GatewaySnapshot, MetricSnapshot, RouteSnapshot,
+};
 use comfy_table::{Cell, Table};
 
 use crate::OutputFormat;
@@ -188,6 +190,101 @@ pub fn render_diagnoses(diagnoses: &[Diagnosis], format: &OutputFormat) {
                     "urgent": critical_count > 0,
                 },
                 "data": diagnoses
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&agent_output).unwrap_or_default()
+            );
+        }
+    }
+}
+
+pub fn render_backend_health(backends: &[BackendSnapshot], format: &OutputFormat) {
+    match format {
+        OutputFormat::Table => {
+            if backends.is_empty() {
+                println!("No backends configured");
+                return;
+            }
+
+            let mut table = Table::new();
+            table.set_header(vec!["Backend", "Weight", "Draining", "Health"]);
+
+            for backend in backends {
+                table.add_row(vec![
+                    Cell::new(format!("{}:{}", backend.address, backend.port)),
+                    Cell::new(backend.weight),
+                    Cell::new(backend.is_draining),
+                    Cell::new(
+                        backend
+                            .health_score
+                            .map(|score| format!("{:.0}%", score * 100.0))
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    ),
+                ]);
+            }
+
+            println!("{table}");
+        }
+        OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(backends).unwrap_or_default();
+            println!("{json}");
+        }
+        OutputFormat::Agent => {
+            let draining = backends.iter().filter(|b| b.is_draining).count();
+            let agent_output = serde_json::json!({
+                "_meta": { "tool": "rauta", "command": "backends health", "format": "agent" },
+                "_hints": {
+                    "summary": format!("{} backends configured, {} draining", backends.len(), draining),
+                    "actions": if draining > 0 {
+                        vec!["Inspect route ownership before undraining backends"]
+                    } else {
+                        vec![]
+                    }
+                },
+                "data": backends
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&agent_output).unwrap_or_default()
+            );
+        }
+    }
+}
+
+pub fn render_metrics(metrics: &[MetricSnapshot], format: &OutputFormat) {
+    match format {
+        OutputFormat::Table => {
+            if metrics.is_empty() {
+                println!("No metrics found");
+                return;
+            }
+
+            let mut table = Table::new();
+            table.set_header(vec!["Metric", "Type", "Values", "Help"]);
+
+            for metric in metrics {
+                table.add_row(vec![
+                    Cell::new(&metric.name),
+                    Cell::new(&metric.metric_type),
+                    Cell::new(metric.values.len()),
+                    Cell::new(&metric.help),
+                ]);
+            }
+
+            println!("{table}");
+        }
+        OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(metrics).unwrap_or_default();
+            println!("{json}");
+        }
+        OutputFormat::Agent => {
+            let agent_output = serde_json::json!({
+                "_meta": { "tool": "rauta", "command": "metrics", "format": "agent" },
+                "_hints": {
+                    "summary": format!("{} metric families returned", metrics.len()),
+                },
+                "data": metrics
             });
             println!(
                 "{}",
