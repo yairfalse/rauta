@@ -100,7 +100,7 @@ Diagnostic rules must preserve human-readable `evidence` and also attach `ontolo
 
 **Adding a metric:** Register in `metrics.rs` → instrument in code path → test.
 
-**Adding ontology or timeline behavior:** Use `agent-api/src/ontology.rs` for stable agent-facing entities and evidence. Keep eBPF as an optional evidence source that feeds ontology evidence, not as a required routing dependency.
+**Adding ontology or timeline behavior:** Use `agent-api/src/ontology.rs` for stable agent-facing entities and evidence. Use `agent-api/src/temporal.rs` for bounded recent-history contracts and keep `LocalGatewayQuery` retention finite. Keep eBPF as an optional evidence source that feeds ontology evidence, not as a required routing dependency.
 
 ## MCP Server (AI Agent Integration)
 
@@ -112,7 +112,7 @@ rauta --endpoint http://localhost:9091 mcp
 
 This runs stdio transport: MCP JSON-RPC frames on stdout, tracing logs on stderr. Used by Claude Code, Cursor, and other MCP clients. The `RemoteGatewayQuery` (HTTP client to admin API) is wrapped in `RautaMcpHandler` and served over `rmcp::transport::stdio()`. Streamable HTTP transport (`POST /mcp` on admin port) is planned but not yet implemented.
 
-Current remote read tools are wired through the admin API. Backend drain and undrain are intentionally explicit-unavailable operations until the safe-actions spec adds bounded action semantics.
+Current remote read tools are wired through the admin API, including bounded timeline and diff reads. Backend drain and undrain are intentionally explicit-unavailable operations until the safe-actions spec adds bounded action semantics.
 
 ## Environment Variables
 
