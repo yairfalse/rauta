@@ -130,6 +130,14 @@ enum BackendAction {
         /// Backend address
         backend: String,
     },
+    /// Quarantine a backend until expiry
+    Quarantine {
+        /// Backend address
+        backend: String,
+        /// Quarantine TTL in seconds
+        #[arg(long, default_value = "300")]
+        ttl: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -180,20 +188,15 @@ async fn main() -> anyhow::Result<()> {
                 output::render_backend_health(&backends, &cli.format);
             }
             BackendAction::Drain { backend, timeout } => {
-                client.drain_backend(&backend, timeout).await?;
-                let result = serde_json::json!({
-                    "status": "draining",
-                    "backend": backend,
-                    "timeout_secs": timeout
-                });
+                let result = client.drain_backend(&backend, timeout).await?;
                 println!("{}", serde_json::to_string_pretty(&result)?);
             }
             BackendAction::Undrain { backend } => {
-                client.undrain_backend(&backend).await?;
-                let result = serde_json::json!({
-                    "status": "active",
-                    "backend": backend
-                });
+                let result = client.undrain_backend(&backend).await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            BackendAction::Quarantine { backend, ttl } => {
+                let result = client.quarantine_backend(&backend, ttl).await?;
                 println!("{}", serde_json::to_string_pretty(&result)?);
             }
         },

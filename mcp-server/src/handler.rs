@@ -78,6 +78,14 @@ pub struct UndrainBackendParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct QuarantineBackendParams {
+    /// Backend address to quarantine
+    pub backend: String,
+    /// Quarantine TTL in seconds
+    pub ttl_secs: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct MetricsSnapshotParams {
     /// Filter by metric name
     pub metric: Option<String>,
@@ -290,14 +298,14 @@ impl RautaMcpHandler {
         &self,
         Parameters(params): Parameters<DrainBackendParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.query
+        let result = self
+            .query
             .drain_backend(&params.backend, params.timeout)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        let json = serde_json::json!({"status": "draining", "backend": params.backend});
-        Ok(CallToolResult::success(vec![Content::text(
-            json.to_string(),
-        )]))
+        let json = serde_json::to_string_pretty(&result)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     #[tool(description = "Cancel drain for a backend, restoring it to active service")]
@@ -305,14 +313,29 @@ impl RautaMcpHandler {
         &self,
         Parameters(params): Parameters<UndrainBackendParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.query
+        let result = self
+            .query
             .undrain_backend(&params.backend)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        let json = serde_json::json!({"status": "active", "backend": params.backend});
-        Ok(CallToolResult::success(vec![Content::text(
-            json.to_string(),
-        )]))
+        let json = serde_json::to_string_pretty(&result)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Quarantine a backend for a bounded TTL with rollback metadata")]
+    async fn rauta_quarantine_backend(
+        &self,
+        Parameters(params): Parameters<QuarantineBackendParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self
+            .query
+            .quarantine_backend(&params.backend, params.ttl_secs)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let json = serde_json::to_string_pretty(&result)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 }
 
@@ -338,6 +361,11 @@ impl ServerHandler for RautaMcpHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_api::actions::{
+        ActionEvidence, ActionPrecondition, ActionResult, ActionRisk, ActionStatus,
+        RollbackMetadata,
+    };
+    use agent_api::ontology::{ActionKind, EntityKind, EntityRef};
     use agent_api::temporal::{GatewayDiff, TimelineSnapshot};
     use agent_api::types::{
         BackendSnapshot, CacheStats, CircuitBreakerSnapshot, Diagnosis, GatewaySnapshot,
@@ -537,17 +565,69 @@ mod tests {
             &self,
             backend: &str,
             timeout_secs: Option<u64>,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<ActionResult> {
             self.record("drain_backend");
             assert_eq!(backend, "10.0.0.1:8080");
             assert_eq!(timeout_secs, Some(30));
-            Ok(())
+            Ok(sample_action(ActionKind::DrainBackend, backend))
         }
 
-        async fn undrain_backend(&self, backend: &str) -> anyhow::Result<()> {
+        async fn undrain_backend(&self, backend: &str) -> anyhow::Result<ActionResult> {
             self.record("undrain_backend");
             assert_eq!(backend, "10.0.0.1:8080");
-            Ok(())
+            Ok(sample_action(ActionKind::UndrainBackend, backend))
+        }
+
+        async fn quarantine_backend(
+            &self,
+            backend: &str,
+            ttl_secs: u64,
+        ) -> anyhow::Result<ActionResult> {
+            self.record("quarantine_backend");
+            assert_eq!(backend, "10.0.0.1:8080");
+            assert_eq!(ttl_secs, 300);
+            Ok(sample_action(ActionKind::QuarantineBackend, backend))
+        }
+    }
+
+    fn sample_action(kind: ActionKind, backend: &str) -> ActionResult {
+        ActionResult {
+            action_id: "action-1".to_string(),
+            kind: kind.clone(),
+            target: EntityRef::new(EntityKind::Backend, backend),
+            status: ActionStatus::Applied,
+            risk: ActionRisk::Medium,
+            preconditions: vec![ActionPrecondition {
+                name: "backend_present".to_string(),
+                passed: true,
+                message: "Backend is referenced by at least one route".to_string(),
+            }],
+            before: ActionEvidence {
+                backend: backend.to_string(),
+                was_draining: false,
+                is_draining: false,
+                affected_routes: vec!["/api".to_string()],
+            },
+            after: ActionEvidence {
+                backend: backend.to_string(),
+                was_draining: true,
+                is_draining: true,
+                affected_routes: vec!["/api".to_string()],
+            },
+            rollback: Some(RollbackMetadata {
+                action: ActionKind::UndrainBackend,
+                cli_command: format!("rauta backends undrain {}", backend),
+                reason: "test rollback".to_string(),
+            }),
+            expires_at_unix_ms: Some(1),
+            timeline_event: agent_api::temporal::TemporalEvent {
+                sequence: 1,
+                timestamp_unix_ms: 1,
+                kind: agent_api::temporal::TemporalEventKind::AdminAction,
+                subject: EntityRef::new(EntityKind::Backend, backend),
+                summary: "test action".to_string(),
+                attributes: std::collections::BTreeMap::new(),
+            },
         }
     }
 
@@ -683,6 +763,13 @@ mod tests {
             }))
             .await
             .expect("undrain succeeds");
+        handler
+            .rauta_quarantine_backend(Parameters(QuarantineBackendParams {
+                backend: "10.0.0.1:8080".to_string(),
+                ttl_secs: 300,
+            }))
+            .await
+            .expect("quarantine succeeds");
 
         assert_eq!(
             query.calls(),
@@ -691,7 +778,8 @@ mod tests {
                 "diagnose",
                 "metrics_snapshot",
                 "drain_backend",
-                "undrain_backend"
+                "undrain_backend",
+                "quarantine_backend"
             ]
         );
     }

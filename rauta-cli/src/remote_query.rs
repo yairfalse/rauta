@@ -3,6 +3,7 @@
 //! HTTP client that talks to the RAUTA admin server REST API.
 //! Implements `GatewayQuery` trait so it can be used with the MCP handler.
 
+use agent_api::actions::ActionResult;
 use agent_api::query::GatewayQuery;
 use agent_api::temporal::{GatewayDiff, TemporalQuery, TimelineSnapshot};
 use agent_api::types::*;
@@ -46,12 +47,24 @@ impl RemoteGatewayQuery {
         GatewayQuery::diagnose_since(self, symptom, None, None, since_seconds).await
     }
 
-    pub async fn drain_backend(&self, backend: &str, timeout_secs: u64) -> anyhow::Result<()> {
+    pub async fn drain_backend(
+        &self,
+        backend: &str,
+        timeout_secs: u64,
+    ) -> anyhow::Result<ActionResult> {
         GatewayQuery::drain_backend(self, backend, Some(timeout_secs)).await
     }
 
-    pub async fn undrain_backend(&self, backend: &str) -> anyhow::Result<()> {
+    pub async fn undrain_backend(&self, backend: &str) -> anyhow::Result<ActionResult> {
         GatewayQuery::undrain_backend(self, backend).await
+    }
+
+    pub async fn quarantine_backend(
+        &self,
+        backend: &str,
+        ttl_secs: u64,
+    ) -> anyhow::Result<ActionResult> {
+        GatewayQuery::quarantine_backend(self, backend, ttl_secs).await
     }
 }
 
@@ -210,9 +223,14 @@ impl GatewayQuery for RemoteGatewayQuery {
         Ok(resp.json().await?)
     }
 
-    async fn drain_backend(&self, backend: &str, timeout_secs: Option<u64>) -> anyhow::Result<()> {
+    async fn drain_backend(
+        &self,
+        backend: &str,
+        timeout_secs: Option<u64>,
+    ) -> anyhow::Result<ActionResult> {
         let url = format!("{}/api/v1/backends/drain", self.base_url);
-        self.client
+        let resp = self
+            .client
             .post(&url)
             .json(&serde_json::json!({
                 "backend": backend,
@@ -221,18 +239,38 @@ impl GatewayQuery for RemoteGatewayQuery {
             .send()
             .await?
             .error_for_status()?;
-        Ok(())
+        Ok(resp.json().await?)
     }
 
-    async fn undrain_backend(&self, backend: &str) -> anyhow::Result<()> {
+    async fn undrain_backend(&self, backend: &str) -> anyhow::Result<ActionResult> {
         let url = format!("{}/api/v1/backends/undrain", self.base_url);
-        self.client
+        let resp = self
+            .client
             .post(&url)
             .json(&serde_json::json!({ "backend": backend }))
             .send()
             .await?
             .error_for_status()?;
-        Ok(())
+        Ok(resp.json().await?)
+    }
+
+    async fn quarantine_backend(
+        &self,
+        backend: &str,
+        ttl_secs: u64,
+    ) -> anyhow::Result<ActionResult> {
+        let url = format!("{}/api/v1/backends/quarantine", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({
+                "backend": backend,
+                "ttl_secs": ttl_secs
+            }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(resp.json().await?)
     }
 }
 

@@ -5,6 +5,7 @@
 //! 1. `LocalGatewayQuery` (in control crate) — reads from `Arc<Router>` directly
 //! 2. `RemoteGatewayQuery` (in rauta-cli crate) — HTTP/Unix socket client
 
+use crate::actions::ActionResult;
 use crate::temporal::{GatewayDiff, TemporalQuery, TimelineSnapshot};
 use crate::types::{
     CacheStats, CircuitBreakerSnapshot, Diagnosis, GatewaySnapshot, ListenerSnapshot,
@@ -14,7 +15,7 @@ use async_trait::async_trait;
 
 /// Abstract interface for querying gateway state
 ///
-/// All methods are read-only except `drain_backend` and `undrain_backend`.
+/// All methods are read-only except bounded safe-action methods.
 #[async_trait]
 pub trait GatewayQuery: Send + Sync {
     /// Get gateway status overview
@@ -80,8 +81,19 @@ pub trait GatewayQuery: Send + Sync {
     }
 
     /// Drain a backend (graceful removal)
-    async fn drain_backend(&self, backend: &str, timeout_secs: Option<u64>) -> anyhow::Result<()>;
+    async fn drain_backend(
+        &self,
+        backend: &str,
+        timeout_secs: Option<u64>,
+    ) -> anyhow::Result<ActionResult>;
 
     /// Cancel drain for a backend
-    async fn undrain_backend(&self, backend: &str) -> anyhow::Result<()>;
+    async fn undrain_backend(&self, backend: &str) -> anyhow::Result<ActionResult>;
+
+    /// Quarantine a backend until expiry
+    async fn quarantine_backend(
+        &self,
+        backend: &str,
+        ttl_secs: u64,
+    ) -> anyhow::Result<ActionResult>;
 }

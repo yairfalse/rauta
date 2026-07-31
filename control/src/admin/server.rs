@@ -12,7 +12,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -73,14 +73,9 @@ async fn handle_admin_request(
         ("GET", "/api/v1/metrics") => handle_metrics(&query).await,
         ("GET", "/api/v1/timeline") => handle_timeline(&query, req.uri().query()).await,
         ("GET", "/api/v1/diff") => handle_diff(&query, req.uri().query()).await,
-        ("POST", "/api/v1/backends/drain") => unavailable_response(
-            "backend_drain_unavailable",
-            "Backend drain is not yet available through the admin API",
-        ),
-        ("POST", "/api/v1/backends/undrain") => unavailable_response(
-            "backend_undrain_unavailable",
-            "Backend undrain is not yet available through the admin API",
-        ),
+        ("POST", "/api/v1/backends/drain") => handle_drain(&query, req).await,
+        ("POST", "/api/v1/backends/undrain") => handle_undrain(&query, req).await,
+        ("POST", "/api/v1/backends/quarantine") => handle_quarantine(&query, req).await,
         ("POST", "/api/v1/diagnose") => {
             // Read symptom from query string or body
             let query_string = req.uri().query();
@@ -142,6 +137,56 @@ async fn handle_diff(
     query_response(query.diff(temporal_query(query_string)).await)
 }
 
+#[derive(Deserialize)]
+struct DrainRequest {
+    backend: String,
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct UndrainRequest {
+    backend: String,
+}
+
+#[derive(Deserialize)]
+struct QuarantineRequest {
+    backend: String,
+    ttl_secs: u64,
+}
+
+async fn handle_drain(
+    query: &LocalGatewayQuery,
+    req: Request<hyper::body::Incoming>,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let body = match parse_body::<DrainRequest>(req).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    query_response(query.drain_backend(&body.backend, body.timeout_secs).await)
+}
+
+async fn handle_undrain(
+    query: &LocalGatewayQuery,
+    req: Request<hyper::body::Incoming>,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let body = match parse_body::<UndrainRequest>(req).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    query_response(query.undrain_backend(&body.backend).await)
+}
+
+async fn handle_quarantine(
+    query: &LocalGatewayQuery,
+    req: Request<hyper::body::Incoming>,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let body = match parse_body::<QuarantineRequest>(req).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    query_response(query.quarantine_backend(&body.backend, body.ttl_secs).await)
+}
+
 async fn handle_diagnose(
     query: &LocalGatewayQuery,
     symptom: &str,
@@ -193,8 +238,28 @@ fn query_response<T: Serialize>(
     }
 }
 
-fn unavailable_response(code: &str, message: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
-    error_response(StatusCode::NOT_IMPLEMENTED, code, message)
+async fn parse_body<T: for<'de> Deserialize<'de>>(
+    req: Request<hyper::body::Incoming>,
+) -> Result<T, Response<BoxBody<Bytes, hyper::Error>>> {
+    let bytes = req
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "body_read_failed",
+                &format!("failed to read request body: {}", e),
+            )
+        })?
+        .to_bytes();
+    serde_json::from_slice(&bytes).map_err(|e| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_json",
+            &format!("invalid JSON request body: {}", e),
+        )
+    })
 }
 
 fn error_response(

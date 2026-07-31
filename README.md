@@ -71,17 +71,17 @@ Three ways to talk to a running gateway. Same data model, different interfaces:
 
 ### MCP — for AI agents
 
-13 tools are defined for Claude Code, Cursor, or any MCP-compatible client:
+14 tools are defined for Claude Code, Cursor, or any MCP-compatible client:
 
 ```
 rauta_status                 rauta_list_routes           rauta_get_route
 rauta_list_circuit_breakers  rauta_list_rate_limiters    rauta_diagnose
 rauta_drain_backend          rauta_undrain_backend       rauta_cache_stats
 rauta_list_listeners         rauta_metrics_snapshot      rauta_timeline
-rauta_diff
+rauta_diff                   rauta_quarantine_backend
 ```
 
-Read paths such as status, routes, circuit breakers, rate limiters, listeners, cache stats, metrics, timeline, semantic diffs, and diagnostics are wired through the admin API. Drain and undrain are exposed as operator surfaces but currently return explicit unavailable errors until the safe-actions spec is implemented.
+Read paths such as status, routes, circuit breakers, rate limiters, listeners, cache stats, metrics, timeline, semantic diffs, and diagnostics are wired through the admin API. Mutating backend actions are bounded safe actions that return preconditions, before/after evidence, timeline event metadata, and rollback commands.
 
 ### CLI — for humans and scripts
 
@@ -94,7 +94,8 @@ rauta diagnose circuit-breaker-cascade --format=agent  # LLM-optimized
 rauta diagnose degraded --since-seconds=300 --format=agent
 rauta timeline --since-seconds=300            # recent events and compact snapshots
 rauta diff --since-seconds=300                # semantic recent-state diff
-rauta backends drain 10.0.1.5:8080            # explicit unavailable until safe actions
+rauta backends drain 10.0.1.5:8080            # bounded drain with rollback metadata
+rauta backends quarantine 10.0.1.5:8080 --ttl=300
 ```
 
 The `--format=agent` output includes `_meta` and `_hints` blocks designed for LLM consumption. The binary is also available as `kubectl-rauta`.
@@ -108,7 +109,8 @@ GET  /api/v1/circuit-breakers   GET  /api/v1/rate-limiters
 GET  /api/v1/listeners          GET  /api/v1/timeline?since_seconds=300
 GET  /api/v1/diff?since_seconds=300
 POST /api/v1/diagnose?symptom=...&since_seconds=300
-POST /api/v1/backends/drain     POST /api/v1/backends/undrain  # 501 unavailable
+POST /api/v1/backends/drain     POST /api/v1/backends/undrain
+POST /api/v1/backends/quarantine
 GET  /healthz
 ```
 
