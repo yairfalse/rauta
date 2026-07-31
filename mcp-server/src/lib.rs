@@ -17,12 +17,12 @@
 //! | `rauta_diagnose` | Run diagnostics |
 //! | `rauta_cache_stats` | Route cache stats |
 //! | `rauta_list_listeners` | Active listeners |
-//! | `rauta_drain_backend` | Graceful drain (destructive) |
-//! | `rauta_undrain_backend` | Cancel drain |
+//! | `rauta_drain_backend` | Graceful drain surface (explicit unavailable remotely until safe actions) |
+//! | `rauta_undrain_backend` | Cancel drain surface (explicit unavailable remotely until safe actions) |
 //!
 //! ## Transports
 //!
-//! - **stdio**: For Claude Code / Cursor integration (`control --mcp-stdio`)
+//! - **stdio**: For Claude Code / Cursor integration (`rauta --endpoint http://localhost:9091 mcp`)
 //! - **Streamable HTTP**: `POST /mcp` on admin port 9091 (future)
 //!
 //! ## Usage

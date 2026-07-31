@@ -23,6 +23,9 @@ Cargo.lock
 .env
 .env.local
 
+# Agent session state
+.toimija/
+
 # TLS Certificates (IMPORTANT: Prevent committing real certificates)
 # NOTE: test_fixtures/tls/*.{key,crt,pem} are explicitly tracked for testing
 *.key

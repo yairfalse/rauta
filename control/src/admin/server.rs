@@ -11,6 +11,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use serde::Serialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -65,6 +66,18 @@ async fn handle_admin_request(
         ("GET", "/api/v1/status") => handle_status(&query).await,
         ("GET", "/api/v1/routes") => handle_list_routes(&query).await,
         ("GET", "/api/v1/cache") => handle_cache_stats(&query).await,
+        ("GET", "/api/v1/circuit-breakers") => handle_circuit_breakers(&query).await,
+        ("GET", "/api/v1/rate-limiters") => handle_rate_limiters(&query).await,
+        ("GET", "/api/v1/listeners") => handle_listeners(&query).await,
+        ("GET", "/api/v1/metrics") => handle_metrics(&query).await,
+        ("POST", "/api/v1/backends/drain") => unavailable_response(
+            "backend_drain_unavailable",
+            "Backend drain is not yet available through the admin API",
+        ),
+        ("POST", "/api/v1/backends/undrain") => unavailable_response(
+            "backend_undrain_unavailable",
+            "Backend undrain is not yet available through the admin API",
+        ),
         ("POST", "/api/v1/diagnose") => {
             // Read symptom from query string or body
             let symptom = req
@@ -87,70 +100,81 @@ async fn handle_admin_request(
 }
 
 async fn handle_status(query: &LocalGatewayQuery) -> Response<BoxBody<Bytes, hyper::Error>> {
-    match query.snapshot().await {
-        Ok(snapshot) => match serde_json::to_string(&snapshot) {
-            Ok(json) => json_response(StatusCode::OK, &json),
-            Err(e) => json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &serde_json::json!({"error": format!("serialization failed: {}", e)}).to_string(),
-            ),
-        },
-        Err(e) => json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &serde_json::json!({"error": e.to_string()}).to_string(),
-        ),
-    }
+    query_response(query.snapshot().await)
 }
 
 async fn handle_list_routes(query: &LocalGatewayQuery) -> Response<BoxBody<Bytes, hyper::Error>> {
-    match query.list_routes(None, None).await {
-        Ok(routes) => match serde_json::to_string(&routes) {
-            Ok(json) => json_response(StatusCode::OK, &json),
-            Err(e) => json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &serde_json::json!({"error": format!("serialization failed: {}", e)}).to_string(),
-            ),
-        },
-        Err(e) => json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &serde_json::json!({"error": e.to_string()}).to_string(),
-        ),
-    }
+    query_response(query.list_routes(None, None).await)
 }
 
 async fn handle_cache_stats(query: &LocalGatewayQuery) -> Response<BoxBody<Bytes, hyper::Error>> {
-    match query.cache_stats().await {
-        Ok(stats) => match serde_json::to_string(&stats) {
-            Ok(json) => json_response(StatusCode::OK, &json),
-            Err(e) => json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &serde_json::json!({"error": format!("serialization failed: {}", e)}).to_string(),
-            ),
-        },
-        Err(e) => json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &serde_json::json!({"error": e.to_string()}).to_string(),
-        ),
-    }
+    query_response(query.cache_stats().await)
+}
+
+async fn handle_circuit_breakers(
+    query: &LocalGatewayQuery,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    query_response(query.list_circuit_breakers(None).await)
+}
+
+async fn handle_rate_limiters(query: &LocalGatewayQuery) -> Response<BoxBody<Bytes, hyper::Error>> {
+    query_response(query.list_rate_limiters(None).await)
+}
+
+async fn handle_listeners(query: &LocalGatewayQuery) -> Response<BoxBody<Bytes, hyper::Error>> {
+    query_response(query.list_listeners().await)
+}
+
+async fn handle_metrics(query: &LocalGatewayQuery) -> Response<BoxBody<Bytes, hyper::Error>> {
+    query_response(query.metrics_snapshot(None).await)
 }
 
 async fn handle_diagnose(
     query: &LocalGatewayQuery,
     symptom: &str,
 ) -> Response<BoxBody<Bytes, hyper::Error>> {
-    match query.diagnose(symptom, None, None).await {
-        Ok(diagnoses) => match serde_json::to_string(&diagnoses) {
+    query_response(query.diagnose(symptom, None, None).await)
+}
+
+fn query_response<T: Serialize>(
+    result: anyhow::Result<T>,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    match result {
+        Ok(value) => match serde_json::to_string(&value) {
             Ok(json) => json_response(StatusCode::OK, &json),
-            Err(e) => json_response(
+            Err(e) => error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &serde_json::json!({"error": format!("serialization failed: {}", e)}).to_string(),
+                "serialization_failed",
+                &format!("serialization failed: {}", e),
             ),
         },
-        Err(e) => json_response(
+        Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &serde_json::json!({"error": e.to_string()}).to_string(),
+            "query_failed",
+            &e.to_string(),
         ),
     }
+}
+
+fn unavailable_response(code: &str, message: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
+    error_response(StatusCode::NOT_IMPLEMENTED, code, message)
+}
+
+fn error_response(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    json_response(
+        status,
+        &serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message
+            }
+        })
+        .to_string(),
+    )
 }
 
 #[allow(clippy::unwrap_used)]

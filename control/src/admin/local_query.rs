@@ -6,6 +6,8 @@
 use agent_api::query::GatewayQuery;
 use agent_api::types::*;
 use async_trait::async_trait;
+use prometheus::proto::{Metric, MetricFamily, MetricType};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -122,9 +124,25 @@ impl GatewayQuery for LocalGatewayQuery {
 
     async fn metrics_snapshot(
         &self,
-        _metric_filter: Option<&str>,
+        metric_filter: Option<&str>,
     ) -> anyhow::Result<Vec<MetricSnapshot>> {
-        Ok(vec![])
+        let mut families = crate::proxy::metrics::METRICS_REGISTRY.gather();
+        families.extend(crate::apis::metrics::CONTROLLER_METRICS_REGISTRY.gather());
+        families.extend(crate::proxy::rate_limiter::rate_limiter_registry().gather());
+        families.extend(crate::proxy::circuit_breaker::circuit_breaker_registry().gather());
+
+        let mut snapshots: Vec<_> = families
+            .iter()
+            .filter(|family| {
+                metric_filter
+                    .map(|filter| family.name().contains(filter))
+                    .unwrap_or(true)
+            })
+            .map(metric_family_to_snapshot)
+            .collect();
+
+        snapshots.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(snapshots)
     }
 
     async fn diagnose(
@@ -161,6 +179,48 @@ impl GatewayQuery for LocalGatewayQuery {
 
     async fn undrain_backend(&self, _backend: &str) -> anyhow::Result<()> {
         anyhow::bail!("undrain_backend not yet implemented via admin API")
+    }
+}
+
+fn metric_family_to_snapshot(family: &MetricFamily) -> MetricSnapshot {
+    MetricSnapshot {
+        name: family.name().to_string(),
+        help: family.help().to_string(),
+        metric_type: metric_type_name(family.get_field_type()).to_string(),
+        values: family
+            .get_metric()
+            .iter()
+            .map(|metric| metric_to_value(family.get_field_type(), metric))
+            .collect(),
+    }
+}
+
+fn metric_to_value(metric_type: MetricType, metric: &Metric) -> MetricValue {
+    let labels = metric
+        .get_label()
+        .iter()
+        .map(|label| (label.name().to_string(), label.value().to_string()))
+        .collect::<HashMap<_, _>>();
+
+    MetricValue {
+        labels,
+        value: match metric_type {
+            MetricType::COUNTER => metric.get_counter().value(),
+            MetricType::GAUGE => metric.get_gauge().value(),
+            MetricType::UNTYPED => 0.0,
+            MetricType::HISTOGRAM => metric.get_histogram().sample_count() as f64,
+            MetricType::SUMMARY => metric.get_summary().sample_count() as f64,
+        },
+    }
+}
+
+fn metric_type_name(metric_type: MetricType) -> &'static str {
+    match metric_type {
+        MetricType::COUNTER => "counter",
+        MetricType::GAUGE => "gauge",
+        MetricType::SUMMARY => "summary",
+        MetricType::UNTYPED => "untyped",
+        MetricType::HISTOGRAM => "histogram",
     }
 }
 

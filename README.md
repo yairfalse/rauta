@@ -22,6 +22,8 @@ cargo build --release -p rauta-cli    # CLI + kubectl plugin
 cargo test --workspace                # 220+ tests, 5 crates
 ```
 
+The current implementation focuses on the gateway data plane, Gateway API reconciliation, diagnostics, and read-oriented agent access. The strategic roadmap is documented in [docs/plan-agentic-gateway.md](docs/plan-agentic-gateway.md): ontology, temporal state, safe agent actions, and optional eBPF evidence.
+
 ---
 
 ## How it works
@@ -65,11 +67,11 @@ The circuit breaker packs `state`, `failure_count`, `success_count`, and `half_o
 
 ## Agent API
 
-Three ways to talk to a running gateway. Same data, different interfaces:
+Three ways to talk to a running gateway. Same data model, different interfaces:
 
 ### MCP — for AI agents
 
-11 tools for Claude Code, Cursor, or any MCP-compatible client:
+11 tools are defined for Claude Code, Cursor, or any MCP-compatible client:
 
 ```
 rauta_status                 rauta_list_routes           rauta_get_route
@@ -78,13 +80,17 @@ rauta_drain_backend          rauta_undrain_backend       rauta_cache_stats
 rauta_list_listeners         rauta_metrics_snapshot
 ```
 
+Read paths such as status, routes, circuit breakers, rate limiters, listeners, cache stats, metrics, and diagnostics are wired through the admin API. Drain and undrain are exposed as operator surfaces but currently return explicit unavailable errors until the safe-actions spec is implemented.
+
 ### CLI — for humans and scripts
 
 ```bash
 rauta status                                  # table (default)
 rauta routes list --format=json               # machine
+rauta metrics snapshot --format=json          # structured metrics
+rauta backends health                         # backend state from route snapshots
 rauta diagnose circuit-breaker-cascade --format=agent  # LLM-optimized
-rauta backends drain 10.0.1.5:8080
+rauta backends drain 10.0.1.5:8080            # explicit unavailable until safe actions
 ```
 
 The `--format=agent` output includes `_meta` and `_hints` blocks designed for LLM consumption. The binary is also available as `kubectl-rauta`.
@@ -92,8 +98,11 @@ The `--format=agent` output includes `_meta` and `_hints` blocks designed for LL
 ### REST — for everything else
 
 ```
-GET  /api/v1/status          POST /api/v1/diagnose?symptom=...
-GET  /api/v1/routes          GET  /api/v1/cache
+GET  /api/v1/status             GET  /api/v1/routes
+GET  /api/v1/cache              GET  /api/v1/metrics
+GET  /api/v1/circuit-breakers   GET  /api/v1/rate-limiters
+GET  /api/v1/listeners          POST /api/v1/diagnose?symptom=...
+POST /api/v1/backends/drain     POST /api/v1/backends/undrain  # 501 unavailable
 GET  /healthz
 ```
 
@@ -127,7 +136,7 @@ $ rauta diagnose circuit-breaker-cascade
 
 ## Gateway API
 
-Full Kubernetes Gateway API v1:
+Kubernetes Gateway API v1 support for the core HTTP gateway path:
 
 - **Resources**: GatewayClass, Gateway, HTTPRoute, EndpointSlice, Secret
 - **Matching**: path prefix (radix tree), headers (exact + regex), query params, methods
@@ -211,6 +220,17 @@ make ci-local                                             # full CI
 ```
 
 Pre-commit and pre-push hooks enforce fmt, clippy, and tests.
+
+## Roadmap
+
+RAUTA's next major direction is agentic operation:
+
+- **Ontology** — versioned gateway entities, evidence, actions, and causal links.
+- **Timeline** — recent event journal, snapshots, diffs, and time-window diagnostics.
+- **Safe actions** — bounded drain, undrain, quarantine, and verification loops.
+- **eBPF evidence** — optional Linux kernel TCP signals feeding diagnostics.
+
+See [docs/README.md](docs/README.md) and [docs/plan-agentic-gateway.md](docs/plan-agentic-gateway.md).
 
 ---
 

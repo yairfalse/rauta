@@ -40,6 +40,14 @@ impl RemoteGatewayQuery {
     pub async fn diagnose(&self, symptom: &str) -> anyhow::Result<Vec<Diagnosis>> {
         GatewayQuery::diagnose(self, symptom, None, None).await
     }
+
+    pub async fn drain_backend(&self, backend: &str, timeout_secs: u64) -> anyhow::Result<()> {
+        GatewayQuery::drain_backend(self, backend, Some(timeout_secs)).await
+    }
+
+    pub async fn undrain_backend(&self, backend: &str) -> anyhow::Result<()> {
+        GatewayQuery::undrain_backend(self, backend).await
+    }
 }
 
 #[async_trait]
@@ -78,21 +86,39 @@ impl GatewayQuery for RemoteGatewayQuery {
 
     async fn list_circuit_breakers(
         &self,
-        _state_filter: Option<&str>,
+        state_filter: Option<&str>,
     ) -> anyhow::Result<Vec<CircuitBreakerSnapshot>> {
-        anyhow::bail!("Circuit breaker listing not available via remote query — admin API endpoint not yet implemented")
+        let url = format!("{}/api/v1/circuit-breakers", self.base_url);
+        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        let mut breakers: Vec<CircuitBreakerSnapshot> = resp.json().await?;
+
+        if let Some(state) = state_filter {
+            let normalized = state.to_uppercase();
+            breakers.retain(|b| b.state.to_uppercase() == normalized);
+        }
+
+        Ok(breakers)
     }
 
     async fn list_rate_limiters(
         &self,
-        _route_filter: Option<&str>,
+        route_filter: Option<&str>,
     ) -> anyhow::Result<Vec<RateLimiterSnapshot>> {
-        anyhow::bail!("Rate limiter listing not available via remote query — admin API endpoint not yet implemented")
+        let url = format!("{}/api/v1/rate-limiters", self.base_url);
+        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        let mut limiters: Vec<RateLimiterSnapshot> = resp.json().await?;
+
+        if let Some(route) = route_filter {
+            limiters.retain(|l| l.route.contains(route));
+        }
+
+        Ok(limiters)
     }
 
     async fn list_listeners(&self) -> anyhow::Result<Vec<ListenerSnapshot>> {
-        let snapshot = self.snapshot().await?;
-        Ok(snapshot.listeners)
+        let url = format!("{}/api/v1/listeners", self.base_url);
+        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        Ok(resp.json().await?)
     }
 
     async fn cache_stats(&self) -> anyhow::Result<Option<CacheStats>> {
@@ -103,9 +129,17 @@ impl GatewayQuery for RemoteGatewayQuery {
 
     async fn metrics_snapshot(
         &self,
-        _metric_filter: Option<&str>,
+        metric_filter: Option<&str>,
     ) -> anyhow::Result<Vec<MetricSnapshot>> {
-        anyhow::bail!("Metrics snapshot not available via remote query — admin API endpoint not yet implemented")
+        let url = format!("{}/api/v1/metrics", self.base_url);
+        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        let mut metrics: Vec<MetricSnapshot> = resp.json().await?;
+
+        if let Some(metric) = metric_filter {
+            metrics.retain(|m| m.name.contains(metric));
+        }
+
+        Ok(metrics)
     }
 
     async fn diagnose(
@@ -125,15 +159,28 @@ impl GatewayQuery for RemoteGatewayQuery {
         Ok(resp.json().await?)
     }
 
-    async fn drain_backend(
-        &self,
-        _backend: &str,
-        _timeout_secs: Option<u64>,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("drain_backend not yet implemented via remote query")
+    async fn drain_backend(&self, backend: &str, timeout_secs: Option<u64>) -> anyhow::Result<()> {
+        let url = format!("{}/api/v1/backends/drain", self.base_url);
+        self.client
+            .post(&url)
+            .json(&serde_json::json!({
+                "backend": backend,
+                "timeout_secs": timeout_secs.unwrap_or(30)
+            }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
-    async fn undrain_backend(&self, _backend: &str) -> anyhow::Result<()> {
-        anyhow::bail!("undrain_backend not yet implemented via remote query")
+    async fn undrain_backend(&self, backend: &str) -> anyhow::Result<()> {
+        let url = format!("{}/api/v1/backends/undrain", self.base_url);
+        self.client
+            .post(&url)
+            .json(&serde_json::json!({ "backend": backend }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 }

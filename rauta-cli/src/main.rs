@@ -8,6 +8,7 @@
 mod output;
 mod remote_query;
 
+use agent_api::query::GatewayQuery;
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -145,27 +146,46 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Backends { action } => match action {
-            BackendAction::Health { route: _ } => {
-                let status = client.get_status().await?;
-                output::render_status(&status, &cli.format);
+            BackendAction::Health { route } => {
+                let routes = client.get_routes(None).await?;
+                let backends = routes
+                    .into_iter()
+                    .filter(|route_snapshot| {
+                        route
+                            .as_deref()
+                            .map(|filter| route_snapshot.pattern.contains(filter))
+                            .unwrap_or(true)
+                    })
+                    .flat_map(|route_snapshot| route_snapshot.backends)
+                    .collect::<Vec<_>>();
+                output::render_backend_health(&backends, &cli.format);
             }
-            BackendAction::Drain {
-                backend,
-                timeout: _,
-            } => {
-                println!("Draining backend {}...", backend);
+            BackendAction::Drain { backend, timeout } => {
+                client.drain_backend(&backend, timeout).await?;
+                let result = serde_json::json!({
+                    "status": "draining",
+                    "backend": backend,
+                    "timeout_secs": timeout
+                });
+                println!("{}", serde_json::to_string_pretty(&result)?);
             }
             BackendAction::Undrain { backend } => {
-                println!("Undraining backend {}...", backend);
+                client.undrain_backend(&backend).await?;
+                let result = serde_json::json!({
+                    "status": "active",
+                    "backend": backend
+                });
+                println!("{}", serde_json::to_string_pretty(&result)?);
             }
         },
         Commands::Metrics { action } => match action {
             MetricsAction::Snapshot => {
-                let status = client.get_status().await?;
-                output::render_status(&status, &cli.format);
+                let metrics = client.metrics_snapshot(None).await?;
+                output::render_metrics(&metrics, &cli.format);
             }
             MetricsAction::Query { metric } => {
-                println!("Querying metric: {}", metric);
+                let metrics = client.metrics_snapshot(Some(&metric)).await?;
+                output::render_metrics(&metrics, &cli.format);
             }
         },
         Commands::Diagnose { symptom, route: _ } => {
