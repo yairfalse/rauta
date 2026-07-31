@@ -9,6 +9,7 @@ mod output;
 mod remote_query;
 
 use agent_api::query::GatewayQuery;
+use agent_api::temporal::TemporalQuery;
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -69,6 +70,24 @@ enum Commands {
         /// Filter by route pattern
         #[arg(long)]
         route: Option<String>,
+
+        /// Include temporal evidence from the last N seconds
+        #[arg(long)]
+        since_seconds: Option<u64>,
+    },
+
+    /// Show recent gateway temporal events and snapshots
+    Timeline {
+        /// Include history from the last N seconds
+        #[arg(long)]
+        since_seconds: Option<u64>,
+    },
+
+    /// Diff recent gateway state over a time window
+    Diff {
+        /// Diff against the earliest observation in the last N seconds
+        #[arg(long)]
+        since_seconds: Option<u64>,
     },
 
     /// Start MCP server over stdio (for Claude Code / Cursor integration)
@@ -188,9 +207,31 @@ async fn main() -> anyhow::Result<()> {
                 output::render_metrics(&metrics, &cli.format);
             }
         },
-        Commands::Diagnose { symptom, route: _ } => {
-            let diagnoses = client.diagnose(&symptom).await?;
+        Commands::Diagnose {
+            symptom,
+            route: _,
+            since_seconds,
+        } => {
+            let diagnoses = client.diagnose_since(&symptom, since_seconds).await?;
             output::render_diagnoses(&diagnoses, &cli.format);
+        }
+        Commands::Timeline { since_seconds } => {
+            let timeline = client
+                .timeline(TemporalQuery {
+                    since_seconds,
+                    ..TemporalQuery::default()
+                })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&timeline)?);
+        }
+        Commands::Diff { since_seconds } => {
+            let diff = client
+                .diff(TemporalQuery {
+                    since_seconds,
+                    ..TemporalQuery::default()
+                })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&diff)?);
         }
         Commands::Mcp => {
             // MCP server over stdio — stdout is the protocol channel, logs go to stderr

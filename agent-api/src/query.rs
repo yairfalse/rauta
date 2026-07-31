@@ -5,6 +5,7 @@
 //! 1. `LocalGatewayQuery` (in control crate) — reads from `Arc<Router>` directly
 //! 2. `RemoteGatewayQuery` (in rauta-cli crate) — HTTP/Unix socket client
 
+use crate::temporal::{GatewayDiff, TemporalQuery, TimelineSnapshot};
 use crate::types::{
     CacheStats, CircuitBreakerSnapshot, Diagnosis, GatewaySnapshot, ListenerSnapshot,
     MetricSnapshot, RateLimiterSnapshot, RouteSnapshot,
@@ -53,6 +54,12 @@ pub trait GatewayQuery: Send + Sync {
         metric_filter: Option<&str>,
     ) -> anyhow::Result<Vec<MetricSnapshot>>;
 
+    /// Read recent bounded temporal history
+    async fn timeline(&self, query: TemporalQuery) -> anyhow::Result<TimelineSnapshot>;
+
+    /// Diff recent gateway state over a bounded time window
+    async fn diff(&self, query: TemporalQuery) -> anyhow::Result<GatewayDiff>;
+
     /// Run diagnostics for a symptom
     async fn diagnose(
         &self,
@@ -60,6 +67,17 @@ pub trait GatewayQuery: Send + Sync {
         route_filter: Option<&str>,
         backend_filter: Option<&str>,
     ) -> anyhow::Result<Vec<Diagnosis>>;
+
+    /// Run diagnostics using recent temporal evidence when available.
+    async fn diagnose_since(
+        &self,
+        symptom: &str,
+        route_filter: Option<&str>,
+        backend_filter: Option<&str>,
+        _since_seconds: Option<u64>,
+    ) -> anyhow::Result<Vec<Diagnosis>> {
+        self.diagnose(symptom, route_filter, backend_filter).await
+    }
 
     /// Drain a backend (graceful removal)
     async fn drain_backend(&self, backend: &str, timeout_secs: Option<u64>) -> anyhow::Result<()>;

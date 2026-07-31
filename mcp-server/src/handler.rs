@@ -11,6 +11,7 @@
 //! ```
 
 use agent_api::query::GatewayQuery;
+use agent_api::temporal::TemporalQuery;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
@@ -58,6 +59,8 @@ pub struct DiagnoseParams {
     pub route: Option<String>,
     /// Filter by backend address
     pub backend: Option<String>,
+    /// Include temporal evidence from the last N seconds
+    pub since_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -78,6 +81,16 @@ pub struct UndrainBackendParams {
 pub struct MetricsSnapshotParams {
     /// Filter by metric name
     pub metric: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TemporalParams {
+    /// Include history from the last N seconds
+    pub since_seconds: Option<u64>,
+    /// Include events at or after this sequence
+    pub from_sequence: Option<u64>,
+    /// Include events at or before this sequence
+    pub to_sequence: Option<u64>,
 }
 
 // ============================================================================
@@ -188,14 +201,45 @@ impl RautaMcpHandler {
     ) -> Result<CallToolResult, McpError> {
         let diagnoses = self
             .query
-            .diagnose(
+            .diagnose_since(
                 &params.symptom,
                 params.route.as_deref(),
                 params.backend.as_deref(),
+                params.since_seconds,
             )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let json = serde_json::to_string_pretty(&diagnoses)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Get recent bounded gateway timeline events and snapshots")]
+    async fn rauta_timeline(
+        &self,
+        Parameters(params): Parameters<TemporalParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let timeline = self
+            .query
+            .timeline(temporal_query(params))
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let json = serde_json::to_string_pretty(&timeline)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Diff recent gateway state over a bounded time window")]
+    async fn rauta_diff(
+        &self,
+        Parameters(params): Parameters<TemporalParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let diff = self
+            .query
+            .diff(temporal_query(params))
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let json = serde_json::to_string_pretty(&diff)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
@@ -272,6 +316,14 @@ impl RautaMcpHandler {
     }
 }
 
+fn temporal_query(params: TemporalParams) -> TemporalQuery {
+    TemporalQuery {
+        since_seconds: params.since_seconds,
+        from_sequence: params.from_sequence,
+        to_sequence: params.to_sequence,
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for RautaMcpHandler {
     fn get_info(&self) -> ServerInfo {
@@ -286,6 +338,7 @@ impl ServerHandler for RautaMcpHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_api::temporal::{GatewayDiff, TimelineSnapshot};
     use agent_api::types::{
         BackendSnapshot, CacheStats, CircuitBreakerSnapshot, Diagnosis, GatewaySnapshot,
         ListenerSnapshot, MetricSnapshot, MetricValue, RateLimiterSnapshot, RouteSnapshot,
@@ -414,6 +467,38 @@ mod tests {
             }])
         }
 
+        async fn timeline(&self, query: TemporalQuery) -> anyhow::Result<TimelineSnapshot> {
+            self.record("timeline");
+            assert_eq!(query.since_seconds, Some(60));
+            Ok(TimelineSnapshot {
+                retention: 64,
+                generated_at_unix_ms: 1,
+                events: vec![],
+                snapshots: vec![],
+            })
+        }
+
+        async fn diff(&self, query: TemporalQuery) -> anyhow::Result<GatewayDiff> {
+            self.record("diff");
+            assert_eq!(query.since_seconds, Some(60));
+            Ok(GatewayDiff {
+                from_sequence: Some(1),
+                to_sequence: 1,
+                since_seconds: Some(60),
+                route_count_delta: 0,
+                open_circuits_delta: 0,
+                exhausted_rate_limiters_delta: 0,
+                added_routes: vec![],
+                removed_routes: vec![],
+                changed_routes: vec![],
+                added_listeners: vec![],
+                removed_listeners: vec![],
+                changed_circuit_breakers: vec![],
+                changed_rate_limiters: vec![],
+                events: vec![],
+            })
+        }
+
         async fn diagnose(
             &self,
             symptom: &str,
@@ -434,6 +519,18 @@ mod tests {
                 ontology_evidence: vec![],
                 suggested_actions: vec![],
             }])
+        }
+
+        async fn diagnose_since(
+            &self,
+            symptom: &str,
+            route_filter: Option<&str>,
+            backend_filter: Option<&str>,
+            since_seconds: Option<u64>,
+        ) -> anyhow::Result<Vec<Diagnosis>> {
+            self.record("diagnose_since");
+            assert_eq!(since_seconds, Some(60));
+            self.diagnose(symptom, route_filter, backend_filter).await
         }
 
         async fn drain_backend(
@@ -563,6 +660,7 @@ mod tests {
                 symptom: "no-healthy-backends".to_string(),
                 route: Some("/api".to_string()),
                 backend: Some("10.0.0.1:8080".to_string()),
+                since_seconds: Some(60),
             }))
             .await
             .expect("diagnose succeeds");
@@ -589,11 +687,37 @@ mod tests {
         assert_eq!(
             query.calls(),
             vec![
+                "diagnose_since",
                 "diagnose",
                 "metrics_snapshot",
                 "drain_backend",
                 "undrain_backend"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn temporal_tools_query_expected_methods() {
+        let (handler, query) = handler_with_fake_query();
+
+        let params = TemporalParams {
+            since_seconds: Some(60),
+            from_sequence: None,
+            to_sequence: None,
+        };
+        handler
+            .rauta_timeline(Parameters(params))
+            .await
+            .expect("timeline succeeds");
+        handler
+            .rauta_diff(Parameters(TemporalParams {
+                since_seconds: Some(60),
+                from_sequence: None,
+                to_sequence: None,
+            }))
+            .await
+            .expect("diff succeeds");
+
+        assert_eq!(query.calls(), vec!["timeline", "diff"]);
     }
 }

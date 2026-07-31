@@ -71,16 +71,17 @@ Three ways to talk to a running gateway. Same data model, different interfaces:
 
 ### MCP — for AI agents
 
-11 tools are defined for Claude Code, Cursor, or any MCP-compatible client:
+13 tools are defined for Claude Code, Cursor, or any MCP-compatible client:
 
 ```
 rauta_status                 rauta_list_routes           rauta_get_route
 rauta_list_circuit_breakers  rauta_list_rate_limiters    rauta_diagnose
 rauta_drain_backend          rauta_undrain_backend       rauta_cache_stats
-rauta_list_listeners         rauta_metrics_snapshot
+rauta_list_listeners         rauta_metrics_snapshot      rauta_timeline
+rauta_diff
 ```
 
-Read paths such as status, routes, circuit breakers, rate limiters, listeners, cache stats, metrics, and diagnostics are wired through the admin API. Drain and undrain are exposed as operator surfaces but currently return explicit unavailable errors until the safe-actions spec is implemented.
+Read paths such as status, routes, circuit breakers, rate limiters, listeners, cache stats, metrics, timeline, semantic diffs, and diagnostics are wired through the admin API. Drain and undrain are exposed as operator surfaces but currently return explicit unavailable errors until the safe-actions spec is implemented.
 
 ### CLI — for humans and scripts
 
@@ -90,6 +91,9 @@ rauta routes list --format=json               # machine
 rauta metrics snapshot --format=json          # structured metrics
 rauta backends health                         # backend state from route snapshots
 rauta diagnose circuit-breaker-cascade --format=agent  # LLM-optimized
+rauta diagnose degraded --since-seconds=300 --format=agent
+rauta timeline --since-seconds=300            # recent events and compact snapshots
+rauta diff --since-seconds=300                # semantic recent-state diff
 rauta backends drain 10.0.1.5:8080            # explicit unavailable until safe actions
 ```
 
@@ -101,7 +105,9 @@ The `--format=agent` output includes `_meta` and `_hints` blocks designed for LL
 GET  /api/v1/status             GET  /api/v1/routes
 GET  /api/v1/cache              GET  /api/v1/metrics
 GET  /api/v1/circuit-breakers   GET  /api/v1/rate-limiters
-GET  /api/v1/listeners          POST /api/v1/diagnose?symptom=...
+GET  /api/v1/listeners          GET  /api/v1/timeline?since_seconds=300
+GET  /api/v1/diff?since_seconds=300
+POST /api/v1/diagnose?symptom=...&since_seconds=300
 POST /api/v1/backends/drain     POST /api/v1/backends/undrain  # 501 unavailable
 GET  /healthz
 ```
@@ -228,7 +234,7 @@ Pre-commit and pre-push hooks enforce fmt, clippy, and tests.
 RAUTA's next major direction is agentic operation:
 
 - **Ontology** — versioned gateway entities and diagnostic evidence are now present; actions and causal links are the next expansion.
-- **Timeline** — recent event journal, snapshots, diffs, and time-window diagnostics.
+- **Timeline** — bounded in-memory event journal, compact snapshot history, semantic diffs, and time-window diagnostics are present.
 - **Safe actions** — bounded drain, undrain, quarantine, and verification loops.
 - **eBPF evidence** — optional Linux kernel TCP signals feeding diagnostics.
 

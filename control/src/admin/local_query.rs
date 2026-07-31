@@ -3,13 +3,18 @@
 //! Reads directly from `Arc<Router>`, `Arc<CircuitBreakerManager>`, and `Arc<RateLimiter>`.
 //! Used by the admin server and MCP server when running in-process.
 
+use agent_api::ontology::{EntityKind, EntityRef, EvidenceValue};
 use agent_api::query::GatewayQuery;
+use agent_api::temporal::{
+    GatewayDiff, SnapshotHistoryEntry, TemporalEvent, TemporalEventKind, TemporalQuery,
+    TimelineSnapshot, DEFAULT_TEMPORAL_RETENTION,
+};
 use agent_api::types::*;
 use async_trait::async_trait;
 use prometheus::proto::{Metric, MetricFamily, MetricType};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Instant;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::proxy::circuit_breaker::CircuitBreakerManager;
 use crate::proxy::rate_limiter::RateLimiter;
@@ -21,6 +26,7 @@ pub struct LocalGatewayQuery {
     circuit_breaker: Arc<CircuitBreakerManager>,
     rate_limiter: Arc<RateLimiter>,
     start_time: Instant,
+    temporal: Mutex<TemporalState>,
 }
 
 impl LocalGatewayQuery {
@@ -34,6 +40,162 @@ impl LocalGatewayQuery {
             circuit_breaker,
             rate_limiter,
             start_time: Instant::now(),
+            temporal: Mutex::new(TemporalState::new(DEFAULT_TEMPORAL_RETENTION)),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ObservedState {
+    entry: SnapshotHistoryEntry,
+    routes: Vec<RouteSnapshot>,
+    circuit_breakers: Vec<CircuitBreakerSnapshot>,
+    rate_limiters: Vec<RateLimiterSnapshot>,
+    listeners: Vec<ListenerSnapshot>,
+}
+
+struct TemporalState {
+    retention: usize,
+    next_sequence: u64,
+    events: VecDeque<TemporalEvent>,
+    observations: VecDeque<ObservedState>,
+}
+
+impl TemporalState {
+    fn new(retention: usize) -> Self {
+        Self {
+            retention,
+            next_sequence: 1,
+            events: VecDeque::with_capacity(retention),
+            observations: VecDeque::with_capacity(retention),
+        }
+    }
+
+    fn push_observation(&mut self, mut observation: ObservedState) {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        observation.entry.sequence = sequence;
+
+        if let Some(previous) = self.observations.back().cloned() {
+            self.push_diff_events(sequence, &observation, &previous);
+        } else {
+            self.push_event(TemporalEvent {
+                sequence,
+                timestamp_unix_ms: observation.entry.timestamp_unix_ms,
+                kind: TemporalEventKind::SnapshotRecorded,
+                subject: EntityRef::new(EntityKind::Gateway, "rauta"),
+                summary: "Initial temporal gateway snapshot recorded".to_string(),
+                attributes: BTreeMap::new(),
+            });
+        }
+
+        self.observations.push_back(observation);
+        while self.observations.len() > self.retention {
+            self.observations.pop_front();
+        }
+    }
+
+    fn push_diff_events(
+        &mut self,
+        sequence: u64,
+        current: &ObservedState,
+        previous: &ObservedState,
+    ) {
+        let timestamp_unix_ms = current.entry.timestamp_unix_ms;
+        if current.entry.snapshot.route_count != previous.entry.snapshot.route_count {
+            self.push_event(counter_event(
+                sequence,
+                timestamp_unix_ms,
+                TemporalEventKind::RouteChanged,
+                EntityRef::new(EntityKind::Route, "routes"),
+                "Route count changed",
+                "route_count",
+                current.entry.snapshot.route_count,
+            ));
+        }
+        if current.entry.snapshot.open_circuits != previous.entry.snapshot.open_circuits {
+            self.push_event(counter_event(
+                sequence,
+                timestamp_unix_ms,
+                TemporalEventKind::CircuitBreakerChanged,
+                EntityRef::new(EntityKind::CircuitBreaker, "all"),
+                "Open circuit count changed",
+                "open_circuits",
+                current.entry.snapshot.open_circuits,
+            ));
+        }
+        if current.entry.snapshot.exhausted_rate_limiters
+            != previous.entry.snapshot.exhausted_rate_limiters
+        {
+            self.push_event(counter_event(
+                sequence,
+                timestamp_unix_ms,
+                TemporalEventKind::RateLimiterChanged,
+                EntityRef::new(EntityKind::RateLimiter, "all"),
+                "Exhausted rate limiter count changed",
+                "exhausted_rate_limiters",
+                current.entry.snapshot.exhausted_rate_limiters,
+            ));
+        }
+
+        for route in changed_keys(
+            route_signatures(&previous.routes),
+            route_signatures(&current.routes),
+        ) {
+            self.push_event(simple_event(
+                sequence,
+                timestamp_unix_ms,
+                TemporalEventKind::RouteChanged,
+                EntityKind::Route,
+                route,
+                "Route semantics changed",
+            ));
+        }
+        for backend in changed_keys(
+            breaker_signatures(&previous.circuit_breakers),
+            breaker_signatures(&current.circuit_breakers),
+        ) {
+            self.push_event(simple_event(
+                sequence,
+                timestamp_unix_ms,
+                TemporalEventKind::CircuitBreakerChanged,
+                EntityKind::CircuitBreaker,
+                backend,
+                "Circuit breaker state changed",
+            ));
+        }
+        for route in changed_keys(
+            limiter_signatures(&previous.rate_limiters),
+            limiter_signatures(&current.rate_limiters),
+        ) {
+            self.push_event(simple_event(
+                sequence,
+                timestamp_unix_ms,
+                TemporalEventKind::RateLimiterChanged,
+                EntityKind::RateLimiter,
+                route,
+                "Rate limiter state changed",
+            ));
+        }
+        for listener in changed_keys(
+            listener_signatures(&previous.listeners),
+            listener_signatures(&current.listeners),
+        ) {
+            self.push_event(simple_event(
+                sequence,
+                timestamp_unix_ms,
+                TemporalEventKind::ListenerChanged,
+                EntityKind::Listener,
+                listener,
+                "Listener state changed",
+            ));
+        }
+    }
+
+    fn push_event(&mut self, event: TemporalEvent) {
+        self.events.push_back(event);
+        while self.events.len() > self.retention {
+            self.events.pop_front();
         }
     }
 }
@@ -46,7 +208,7 @@ impl GatewayQuery for LocalGatewayQuery {
         let open_circuits = self.circuit_breaker.open_count();
         let exhausted_rate_limiters = self.rate_limiter.exhausted_count();
 
-        Ok(GatewaySnapshot {
+        let snapshot = GatewaySnapshot {
             status: "ok".to_string(),
             uptime_seconds: uptime,
             route_count,
@@ -54,7 +216,9 @@ impl GatewayQuery for LocalGatewayQuery {
             exhausted_rate_limiters,
             listeners: vec![],
             cache_stats: Some(self.cache_stats_internal()),
-        })
+        };
+        self.record_observation(snapshot.clone())?;
+        Ok(snapshot)
     }
 
     async fn list_routes(
@@ -145,6 +309,58 @@ impl GatewayQuery for LocalGatewayQuery {
         Ok(snapshots)
     }
 
+    async fn timeline(&self, query: TemporalQuery) -> anyhow::Result<TimelineSnapshot> {
+        self.snapshot().await?;
+
+        let temporal = self
+            .temporal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("temporal state lock poisoned"))?;
+        let cutoff_ms = query
+            .since_seconds
+            .map(|seconds| now_unix_ms().saturating_sub(seconds.saturating_mul(1000)));
+        let events = temporal
+            .events
+            .iter()
+            .filter(|event| temporal_event_matches(event, &query, cutoff_ms))
+            .cloned()
+            .collect();
+        let snapshots = temporal
+            .observations
+            .iter()
+            .filter(|observation| {
+                cutoff_ms
+                    .map(|cutoff| observation.entry.timestamp_unix_ms >= cutoff)
+                    .unwrap_or(true)
+                    && query
+                        .from_sequence
+                        .map(|from| observation.entry.sequence >= from)
+                        .unwrap_or(true)
+                    && query
+                        .to_sequence
+                        .map(|to| observation.entry.sequence <= to)
+                        .unwrap_or(true)
+            })
+            .map(|observation| observation.entry.clone())
+            .collect();
+
+        Ok(TimelineSnapshot {
+            retention: temporal.retention,
+            generated_at_unix_ms: now_unix_ms(),
+            events,
+            snapshots,
+        })
+    }
+
+    async fn diff(&self, query: TemporalQuery) -> anyhow::Result<GatewayDiff> {
+        self.snapshot().await?;
+        let temporal = self
+            .temporal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("temporal state lock poisoned"))?;
+        Ok(build_diff(&temporal, &query))
+    }
+
     async fn diagnose(
         &self,
         symptom: &str,
@@ -167,6 +383,35 @@ impl GatewayQuery for LocalGatewayQuery {
 
         let engine = DiagnosticsEngine::with_builtin_rules();
         Ok(engine.diagnose_symptom(&ctx, symptom))
+    }
+
+    async fn diagnose_since(
+        &self,
+        symptom: &str,
+        route_filter: Option<&str>,
+        backend_filter: Option<&str>,
+        since_seconds: Option<u64>,
+    ) -> anyhow::Result<Vec<Diagnosis>> {
+        let mut diagnoses = self.diagnose(symptom, route_filter, backend_filter).await?;
+        if let Some(seconds) = since_seconds {
+            let diff = self
+                .diff(TemporalQuery {
+                    since_seconds: Some(seconds),
+                    ..TemporalQuery::default()
+                })
+                .await?;
+            if !diff.events.is_empty() {
+                let evidence = format!(
+                    "{} temporal events observed in the last {}s",
+                    diff.events.len(),
+                    seconds
+                );
+                for diagnosis in &mut diagnoses {
+                    diagnosis.evidence.push(evidence.clone());
+                }
+            }
+        }
+        Ok(diagnoses)
     }
 
     async fn drain_backend(
@@ -241,5 +486,271 @@ impl LocalGatewayQuery {
             size,
             hit_rate,
         }
+    }
+
+    fn record_observation(&self, snapshot: GatewaySnapshot) -> anyhow::Result<()> {
+        let mut routes = self.router.list_routes();
+        routes.sort_by(|a, b| a.pattern.cmp(&b.pattern));
+        let mut circuit_breakers = self.circuit_breaker.snapshot_all();
+        circuit_breakers.sort_by(|a, b| a.backend_id.cmp(&b.backend_id));
+        let mut rate_limiters = self.rate_limiter.snapshot_all();
+        rate_limiters.sort_by(|a, b| a.route.cmp(&b.route));
+        let listeners = snapshot.listeners.clone();
+
+        let observation = ObservedState {
+            entry: SnapshotHistoryEntry {
+                sequence: 0,
+                timestamp_unix_ms: now_unix_ms(),
+                snapshot,
+            },
+            routes,
+            circuit_breakers,
+            rate_limiters,
+            listeners,
+        };
+
+        self.temporal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("temporal state lock poisoned"))?
+            .push_observation(observation);
+        Ok(())
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+fn temporal_event_matches(
+    event: &TemporalEvent,
+    query: &TemporalQuery,
+    cutoff_ms: Option<u64>,
+) -> bool {
+    cutoff_ms
+        .map(|cutoff| event.timestamp_unix_ms >= cutoff)
+        .unwrap_or(true)
+        && query
+            .from_sequence
+            .map(|from| event.sequence >= from)
+            .unwrap_or(true)
+        && query
+            .to_sequence
+            .map(|to| event.sequence <= to)
+            .unwrap_or(true)
+}
+
+fn build_diff(temporal: &TemporalState, query: &TemporalQuery) -> GatewayDiff {
+    let Some(current) = temporal.observations.back() else {
+        return GatewayDiff {
+            from_sequence: None,
+            to_sequence: 0,
+            since_seconds: query.since_seconds,
+            route_count_delta: 0,
+            open_circuits_delta: 0,
+            exhausted_rate_limiters_delta: 0,
+            added_routes: vec![],
+            removed_routes: vec![],
+            changed_routes: vec![],
+            added_listeners: vec![],
+            removed_listeners: vec![],
+            changed_circuit_breakers: vec![],
+            changed_rate_limiters: vec![],
+            events: vec![],
+        };
+    };
+
+    let cutoff_ms = query
+        .since_seconds
+        .map(|seconds| now_unix_ms().saturating_sub(seconds.saturating_mul(1000)));
+    let baseline = temporal
+        .observations
+        .iter()
+        .find(|observation| {
+            cutoff_ms
+                .map(|cutoff| observation.entry.timestamp_unix_ms >= cutoff)
+                .unwrap_or(true)
+                && query
+                    .from_sequence
+                    .map(|from| observation.entry.sequence >= from)
+                    .unwrap_or(true)
+        })
+        .unwrap_or(current);
+
+    let previous_routes = route_signatures(&baseline.routes);
+    let current_routes = route_signatures(&current.routes);
+    let previous_listeners = listener_signatures(&baseline.listeners);
+    let current_listeners = listener_signatures(&current.listeners);
+
+    GatewayDiff {
+        from_sequence: Some(baseline.entry.sequence),
+        to_sequence: current.entry.sequence,
+        since_seconds: query.since_seconds,
+        route_count_delta: current.entry.snapshot.route_count as isize
+            - baseline.entry.snapshot.route_count as isize,
+        open_circuits_delta: current.entry.snapshot.open_circuits as isize
+            - baseline.entry.snapshot.open_circuits as isize,
+        exhausted_rate_limiters_delta: current.entry.snapshot.exhausted_rate_limiters as isize
+            - baseline.entry.snapshot.exhausted_rate_limiters as isize,
+        added_routes: added_keys(&previous_routes, &current_routes),
+        removed_routes: removed_keys(&previous_routes, &current_routes),
+        changed_routes: modified_keys(&previous_routes, &current_routes),
+        added_listeners: added_keys(&previous_listeners, &current_listeners),
+        removed_listeners: removed_keys(&previous_listeners, &current_listeners),
+        changed_circuit_breakers: changed_keys(
+            breaker_signatures(&baseline.circuit_breakers),
+            breaker_signatures(&current.circuit_breakers),
+        ),
+        changed_rate_limiters: changed_keys(
+            limiter_signatures(&baseline.rate_limiters),
+            limiter_signatures(&current.rate_limiters),
+        ),
+        events: temporal
+            .events
+            .iter()
+            .filter(|event| temporal_event_matches(event, query, cutoff_ms))
+            .cloned()
+            .collect(),
+    }
+}
+
+fn route_signatures(routes: &[RouteSnapshot]) -> BTreeMap<String, String> {
+    routes
+        .iter()
+        .map(|route| {
+            (
+                route.pattern.clone(),
+                serde_json::to_string(route).unwrap_or_else(|_| route.pattern.clone()),
+            )
+        })
+        .collect()
+}
+
+fn listener_signatures(listeners: &[ListenerSnapshot]) -> BTreeMap<String, String> {
+    listeners
+        .iter()
+        .map(|listener| {
+            let id = format!("{}/{}", listener.protocol, listener.port);
+            (
+                id.clone(),
+                serde_json::to_string(listener).unwrap_or_else(|_| id.clone()),
+            )
+        })
+        .collect()
+}
+
+fn breaker_signatures(breakers: &[CircuitBreakerSnapshot]) -> BTreeMap<String, String> {
+    breakers
+        .iter()
+        .map(|breaker| {
+            (
+                breaker.backend_id.clone(),
+                serde_json::to_string(breaker).unwrap_or_else(|_| breaker.backend_id.clone()),
+            )
+        })
+        .collect()
+}
+
+fn limiter_signatures(limiters: &[RateLimiterSnapshot]) -> BTreeMap<String, String> {
+    limiters
+        .iter()
+        .map(|limiter| {
+            (
+                limiter.route.clone(),
+                serde_json::to_string(limiter).unwrap_or_else(|_| limiter.route.clone()),
+            )
+        })
+        .collect()
+}
+
+fn added_keys(
+    previous: &BTreeMap<String, String>,
+    current: &BTreeMap<String, String>,
+) -> Vec<String> {
+    current
+        .keys()
+        .filter(|key| !previous.contains_key(*key))
+        .cloned()
+        .collect()
+}
+
+fn removed_keys(
+    previous: &BTreeMap<String, String>,
+    current: &BTreeMap<String, String>,
+) -> Vec<String> {
+    previous
+        .keys()
+        .filter(|key| !current.contains_key(*key))
+        .cloned()
+        .collect()
+}
+
+fn modified_keys(
+    previous: &BTreeMap<String, String>,
+    current: &BTreeMap<String, String>,
+) -> Vec<String> {
+    current
+        .iter()
+        .filter(|(key, value)| {
+            previous
+                .get(*key)
+                .is_some_and(|previous_value| previous_value != *value)
+        })
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+fn changed_keys(
+    previous: BTreeMap<String, String>,
+    current: BTreeMap<String, String>,
+) -> Vec<String> {
+    let keys = previous
+        .keys()
+        .chain(current.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    keys.into_iter()
+        .filter(|key| previous.get(key) != current.get(key))
+        .collect()
+}
+
+fn counter_event(
+    sequence: u64,
+    timestamp_unix_ms: u64,
+    kind: TemporalEventKind,
+    subject: EntityRef,
+    summary: &str,
+    attribute: &str,
+    value: usize,
+) -> TemporalEvent {
+    let mut attributes = BTreeMap::new();
+    attributes.insert(attribute.to_string(), EvidenceValue::from(value));
+    TemporalEvent {
+        sequence,
+        timestamp_unix_ms,
+        kind,
+        subject,
+        summary: summary.to_string(),
+        attributes,
+    }
+}
+
+fn simple_event(
+    sequence: u64,
+    timestamp_unix_ms: u64,
+    kind: TemporalEventKind,
+    entity_kind: EntityKind,
+    id: String,
+    summary: &str,
+) -> TemporalEvent {
+    TemporalEvent {
+        sequence,
+        timestamp_unix_ms,
+        kind,
+        subject: EntityRef::new(entity_kind, id),
+        summary: summary.to_string(),
+        attributes: BTreeMap::new(),
     }
 }

@@ -5,6 +5,7 @@
 
 use crate::admin::local_query::LocalGatewayQuery;
 use agent_api::query::GatewayQuery;
+use agent_api::temporal::TemporalQuery;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
@@ -70,6 +71,8 @@ async fn handle_admin_request(
         ("GET", "/api/v1/rate-limiters") => handle_rate_limiters(&query).await,
         ("GET", "/api/v1/listeners") => handle_listeners(&query).await,
         ("GET", "/api/v1/metrics") => handle_metrics(&query).await,
+        ("GET", "/api/v1/timeline") => handle_timeline(&query, req.uri().query()).await,
+        ("GET", "/api/v1/diff") => handle_diff(&query, req.uri().query()).await,
         ("POST", "/api/v1/backends/drain") => unavailable_response(
             "backend_drain_unavailable",
             "Backend drain is not yet available through the admin API",
@@ -80,17 +83,13 @@ async fn handle_admin_request(
         ),
         ("POST", "/api/v1/diagnose") => {
             // Read symptom from query string or body
-            let symptom = req
-                .uri()
-                .query()
-                .and_then(|q| {
-                    q.split('&')
-                        .find(|p| p.starts_with("symptom="))
-                        .map(|p| p.trim_start_matches("symptom=").to_string())
-                })
+            let query_string = req.uri().query();
+            let symptom = query_string
+                .and_then(|q| query_value(q, "symptom"))
                 .unwrap_or_else(|| "degraded".to_string());
+            let since_seconds = query_string.and_then(query_u64("since_seconds"));
 
-            handle_diagnose(&query, &symptom).await
+            handle_diagnose(&query, &symptom, since_seconds).await
         }
         ("GET", "/healthz") => json_response(StatusCode::OK, r#"{"status":"ok"}"#),
         _ => json_response(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#),
@@ -129,11 +128,49 @@ async fn handle_metrics(query: &LocalGatewayQuery) -> Response<BoxBody<Bytes, hy
     query_response(query.metrics_snapshot(None).await)
 }
 
+async fn handle_timeline(
+    query: &LocalGatewayQuery,
+    query_string: Option<&str>,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    query_response(query.timeline(temporal_query(query_string)).await)
+}
+
+async fn handle_diff(
+    query: &LocalGatewayQuery,
+    query_string: Option<&str>,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    query_response(query.diff(temporal_query(query_string)).await)
+}
+
 async fn handle_diagnose(
     query: &LocalGatewayQuery,
     symptom: &str,
+    since_seconds: Option<u64>,
 ) -> Response<BoxBody<Bytes, hyper::Error>> {
-    query_response(query.diagnose(symptom, None, None).await)
+    query_response(
+        query
+            .diagnose_since(symptom, None, None, since_seconds)
+            .await,
+    )
+}
+
+fn temporal_query(query: Option<&str>) -> TemporalQuery {
+    TemporalQuery {
+        since_seconds: query.and_then(query_u64("since_seconds")),
+        from_sequence: query.and_then(query_u64("from_sequence")),
+        to_sequence: query.and_then(query_u64("to_sequence")),
+    }
+}
+
+fn query_u64(key: &'static str) -> impl FnOnce(&str) -> Option<u64> {
+    move |query| query_value(query, key).and_then(|value| value.parse::<u64>().ok())
+}
+
+fn query_value(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|part| {
+        let (candidate, value) = part.split_once('=')?;
+        (candidate == key).then(|| value.to_string())
+    })
 }
 
 fn query_response<T: Serialize>(
