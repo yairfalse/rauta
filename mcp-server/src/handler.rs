@@ -431,6 +431,7 @@ mod tests {
                 confidence: 0.95,
                 causal_chain: vec!["No healthy backends".to_string()],
                 evidence: vec!["Backend unhealthy".to_string()],
+                ontology_evidence: vec![],
                 suggested_actions: vec![],
             }])
         }

@@ -144,6 +144,15 @@ mod tests {
                 .any(|d| d.rule_id == "RAUTA-CB-001" && d.severity == Severity::Critical),
             "Should detect circuit breaker cascade"
         );
+        let cascade = diagnoses
+            .iter()
+            .find(|d| d.rule_id == "RAUTA-CB-001")
+            .expect("cascade diagnosis should be present");
+        assert_eq!(cascade.ontology_evidence.len(), 2);
+        assert!(cascade
+            .ontology_evidence
+            .iter()
+            .all(|e| e.schema_version == crate::ontology::ONTOLOGY_SCHEMA_VERSION));
     }
 
     #[test]
@@ -186,5 +195,13 @@ mod tests {
                 .any(|d| d.rule_id == "RAUTA-BE-001" && d.severity == Severity::Critical),
             "Should detect no healthy backends"
         );
+        let no_backends = diagnoses
+            .iter()
+            .find(|d| d.rule_id == "RAUTA-BE-001")
+            .expect("no-backends diagnosis should be present");
+        assert!(no_backends
+            .ontology_evidence
+            .iter()
+            .any(|e| e.subject.kind == crate::ontology::EntityKind::Route));
     }
 }

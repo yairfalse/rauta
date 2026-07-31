@@ -6,6 +6,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::ontology::OntologyEvidence;
+
 /// Gateway status overview
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GatewaySnapshot {
@@ -94,6 +96,8 @@ pub struct Diagnosis {
     pub confidence: f64,
     pub causal_chain: Vec<String>,
     pub evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ontology_evidence: Vec<OntologyEvidence>,
     pub suggested_actions: Vec<SuggestedAction>,
 }
 
