@@ -94,11 +94,13 @@ RED → GREEN → REFACTOR. Write a failing test first, implement minimally, the
 
 **Adding a diagnostic rule:** Implement `DiagnosticRule` trait in `agent-api/src/diagnostics/rules.rs` → register in `DiagnosticsEngine::with_builtin_rules()` → add test in `engine.rs`.
 
+Diagnostic rules must preserve human-readable `evidence` and also attach `ontology_evidence` from `agent-api/src/ontology.rs`. Keep ontology schema changes backward-compatible or update README/agent docs with migration notes.
+
 **Adding an MCP tool:** Add a `#[tool]` method and parameter type in `mcp-server/src/handler.rs` → add or reuse a method on the `GatewayQuery` trait in `agent-api/src/query.rs` → implement both `LocalGatewayQuery` in `control/src/admin/local_query.rs` and `RemoteGatewayQuery` in `rauta-cli/src/remote_query.rs` → add CLI/admin endpoints if the tool must work out of process.
 
 **Adding a metric:** Register in `metrics.rs` → instrument in code path → test.
 
-**Adding ontology or timeline behavior:** Start from `docs/plan-agentic-gateway.md` and `docs/adr/004-rauta-ontology-and-temporal-state.md`. Keep eBPF as an optional evidence source that feeds ontology `HealthSignal`/`Evidence`, not as a required routing dependency.
+**Adding ontology or timeline behavior:** Use `agent-api/src/ontology.rs` for stable agent-facing entities and evidence. Keep eBPF as an optional evidence source that feeds ontology evidence, not as a required routing dependency.
 
 ## MCP Server (AI Agent Integration)
 

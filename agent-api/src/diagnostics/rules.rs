@@ -4,7 +4,35 @@
 //! Each rule produces structured `Diagnosis` with causal chain, evidence, and suggested actions.
 
 use crate::diagnostics::engine::{DiagnosticContext, DiagnosticRule};
+use crate::ontology::{EntityKind, EntityRef, EvidenceKind, OntologyEvidence};
 use crate::types::{Diagnosis, Severity, SuggestedAction};
+
+fn backend_entity(id: impl Into<String>) -> EntityRef {
+    EntityRef::new(EntityKind::Backend, id)
+}
+
+fn route_entity(method: &str, pattern: &str) -> EntityRef {
+    EntityRef::new(EntityKind::Route, format!("{} {}", method, pattern))
+}
+
+fn circuit_breaker_evidence(
+    rule_id: &str,
+    backend_id: &str,
+    state: &str,
+    failure_count: u32,
+) -> OntologyEvidence {
+    OntologyEvidence::new(
+        format!("{}:{}:circuit-breaker", rule_id, backend_id),
+        EvidenceKind::CircuitBreakerState,
+        backend_entity(backend_id),
+        format!(
+            "Backend {} circuit breaker is {} with {} failures",
+            backend_id, state, failure_count
+        ),
+    )
+    .with_attr("state", state)
+    .with_attr("failure_count", failure_count)
+}
 
 /// RAUTA-CB-001: Circuit breaker cascade (≥2 circuits Open simultaneously)
 pub struct CircuitBreakerCascade;
@@ -44,6 +72,17 @@ impl DiagnosticRule for CircuitBreakerCascade {
                         format!(
                             "Backend {} is Open (failures: {})",
                             cb.backend_id, cb.failure_count
+                        )
+                    })
+                    .collect(),
+                ontology_evidence: open_breakers
+                    .iter()
+                    .map(|cb| {
+                        circuit_breaker_evidence(
+                            self.id(),
+                            &cb.backend_id,
+                            &cb.state,
+                            cb.failure_count,
                         )
                     })
                     .collect(),
@@ -102,6 +141,12 @@ impl DiagnosticRule for CircuitBreakerOpen {
                     "Circuit state: {}, failures: {}",
                     cb.state, cb.failure_count
                 )],
+                ontology_evidence: vec![circuit_breaker_evidence(
+                    self.id(),
+                    &cb.backend_id,
+                    &cb.state,
+                    cb.failure_count,
+                )],
                 suggested_actions: vec![
                     SuggestedAction {
                         description: format!("Check backend {} health and logs", cb.backend_id),
@@ -153,6 +198,19 @@ impl DiagnosticRule for RateLimitExhausted {
                     "Tokens available: {:.1}/{:.0}",
                     rl.tokens_available, rl.capacity
                 )],
+                ontology_evidence: vec![OntologyEvidence::new(
+                    format!("{}:{}:rate-limiter", self.id(), rl.route),
+                    EvidenceKind::RateLimiterState,
+                    EntityRef::new(EntityKind::RateLimiter, rl.route.clone()),
+                    format!(
+                        "Route {} has {:.1}/{:.0} tokens available",
+                        rl.route, rl.tokens_available, rl.capacity
+                    ),
+                )
+                .with_attr("route", rl.route.clone())
+                .with_attr("tokens_available", rl.tokens_available)
+                .with_attr("capacity", rl.capacity)
+                .with_attr("refill_rate", rl.refill_rate)],
                 suggested_actions: vec![
                     SuggestedAction {
                         description: "Review if rate limit is appropriate for current traffic"
@@ -222,6 +280,43 @@ impl DiagnosticRule for NoHealthyBackends {
                             )
                         })
                         .collect(),
+                    ontology_evidence: if route.backends.is_empty() {
+                        vec![OntologyEvidence::new(
+                            format!("{}:{}:route-backends", self.id(), route.pattern),
+                            EvidenceKind::RouteState,
+                            route_entity(&route.method, &route.pattern),
+                            format!("Route {} {} has no backends", route.method, route.pattern),
+                        )
+                        .with_attr("backend_count", backend_count)]
+                    } else {
+                        route
+                            .backends
+                            .iter()
+                            .map(|backend| {
+                                OntologyEvidence::new(
+                                    format!(
+                                        "{}:{}:{}:{}:backend-health",
+                                        self.id(),
+                                        route.pattern,
+                                        backend.address,
+                                        backend.port
+                                    ),
+                                    EvidenceKind::BackendHealth,
+                                    backend_entity(format!("{}:{}", backend.address, backend.port)),
+                                    format!(
+                                        "Backend {}:{} health_score={:?} draining={}",
+                                        backend.address,
+                                        backend.port,
+                                        backend.health_score,
+                                        backend.is_draining
+                                    ),
+                                )
+                                .with_attr("route", route.pattern.clone())
+                                .with_attr("health_score", backend.health_score.unwrap_or(0.0))
+                                .with_attr("is_draining", backend.is_draining)
+                            })
+                            .collect()
+                    },
                     suggested_actions: vec![
                         SuggestedAction {
                             description: "Check backend pod status in Kubernetes".to_string(),
@@ -273,6 +368,26 @@ impl DiagnosticRule for AllBackendsDraining {
                     .iter()
                     .map(|b| format!("Backend {}:{} is draining", b.address, b.port))
                     .collect(),
+                ontology_evidence: route
+                    .backends
+                    .iter()
+                    .map(|backend| {
+                        OntologyEvidence::new(
+                            format!(
+                                "{}:{}:{}:{}:draining",
+                                self.id(),
+                                route.pattern,
+                                backend.address,
+                                backend.port
+                            ),
+                            EvidenceKind::BackendDrainState,
+                            backend_entity(format!("{}:{}", backend.address, backend.port)),
+                            format!("Backend {}:{} is draining", backend.address, backend.port),
+                        )
+                        .with_attr("route", route.pattern.clone())
+                        .with_attr("is_draining", backend.is_draining)
+                    })
+                    .collect(),
                 suggested_actions: vec![SuggestedAction {
                     description: "Ensure replacement backends are being provisioned".to_string(),
                     cli_command: Some("rauta backends health".to_string()),
@@ -318,6 +433,21 @@ impl DiagnosticRule for LowCacheHitRate {
                         cache.size,
                         cache.hit_rate * 100.0
                     )],
+                    ontology_evidence: vec![OntologyEvidence::new(
+                        format!("{}:route-cache", self.id()),
+                        EvidenceKind::CacheState,
+                        EntityRef::new(EntityKind::Cache, "route-cache"),
+                        format!(
+                            "Route cache hit rate is {:.1}% with {} hits and {} misses",
+                            cache.hit_rate * 100.0,
+                            cache.hits,
+                            cache.misses
+                        ),
+                    )
+                    .with_attr("hits", cache.hits)
+                    .with_attr("misses", cache.misses)
+                    .with_attr("size", cache.size)
+                    .with_attr("hit_rate", cache.hit_rate)],
                     suggested_actions: vec![SuggestedAction {
                         description:
                             "Consider if path cardinality is expected (API versioning, UUIDs in paths)"
@@ -373,6 +503,19 @@ impl DiagnosticRule for ListenerConflict {
                 evidence: protocols
                     .iter()
                     .map(|p| format!("Protocol: {} on port {}", p, port))
+                    .collect(),
+                ontology_evidence: protocols
+                    .iter()
+                    .map(|protocol| {
+                        OntologyEvidence::new(
+                            format!("{}:{}:{}:listener", self.id(), port, protocol),
+                            EvidenceKind::ListenerState,
+                            EntityRef::new(EntityKind::Listener, format!("{}:{}", protocol, port)),
+                            format!("Protocol: {} on port {}", protocol, port),
+                        )
+                        .with_attr("port", *port as u64)
+                        .with_attr("protocol", (*protocol).to_string())
+                    })
                     .collect(),
                 suggested_actions: vec![SuggestedAction {
                     description: "Review Gateway resources for port conflicts".to_string(),

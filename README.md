@@ -132,6 +132,8 @@ $ rauta diagnose circuit-breaker-cascade
   Action: Check if backends share a common upstream dependency (rauta backends health)
 ```
 
+Agent-facing diagnostic responses also include `ontology_evidence`: schema-versioned entities and evidence attributes for routes, backends, listeners, circuit breakers, rate limiters, and cache state. Existing human-readable `evidence` strings remain for compatibility.
+
 ---
 
 ## Gateway API
@@ -225,7 +227,7 @@ Pre-commit and pre-push hooks enforce fmt, clippy, and tests.
 
 RAUTA's next major direction is agentic operation:
 
-- **Ontology** — versioned gateway entities, evidence, actions, and causal links.
+- **Ontology** — versioned gateway entities and diagnostic evidence are now present; actions and causal links are the next expansion.
 - **Timeline** — recent event journal, snapshots, diffs, and time-window diagnostics.
 - **Safe actions** — bounded drain, undrain, quarantine, and verification loops.
 - **eBPF evidence** — optional Linux kernel TCP signals feeding diagnostics.
