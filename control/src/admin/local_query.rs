@@ -21,6 +21,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::observability::ebpf::{sensor_from_env, TcpHealthSensor};
 use crate::proxy::circuit_breaker::CircuitBreakerManager;
 use crate::proxy::rate_limiter::RateLimiter;
 use crate::proxy::router::Router;
@@ -32,6 +33,7 @@ pub struct LocalGatewayQuery {
     rate_limiter: Arc<RateLimiter>,
     start_time: Instant,
     temporal: Mutex<TemporalState>,
+    tcp_sensor: Box<dyn TcpHealthSensor>,
 }
 
 impl LocalGatewayQuery {
@@ -46,6 +48,7 @@ impl LocalGatewayQuery {
             rate_limiter,
             start_time: Instant::now(),
             temporal: Mutex::new(TemporalState::new(DEFAULT_TEMPORAL_RETENTION)),
+            tcp_sensor: sensor_from_env(),
         }
     }
 }
@@ -324,6 +327,12 @@ impl GatewayQuery for LocalGatewayQuery {
         Ok(snapshots)
     }
 
+    async fn tcp_health_evidence(
+        &self,
+    ) -> anyhow::Result<agent_api::ebpf::TcpHealthEvidenceSnapshot> {
+        Ok(self.tcp_sensor.snapshot())
+    }
+
     async fn timeline(&self, query: TemporalQuery) -> anyhow::Result<TimelineSnapshot> {
         self.snapshot().await?;
 
@@ -388,12 +397,14 @@ impl GatewayQuery for LocalGatewayQuery {
         let routes = self.router.list_routes();
         let circuit_breakers = self.circuit_breaker.snapshot_all();
         let rate_limiters = self.rate_limiter.snapshot_all();
+        let tcp_health = Some(self.tcp_sensor.snapshot());
 
         let ctx = DiagnosticContext {
             snapshot,
             routes,
             circuit_breakers,
             rate_limiters,
+            tcp_health,
         };
 
         let engine = DiagnosticsEngine::with_builtin_rules();

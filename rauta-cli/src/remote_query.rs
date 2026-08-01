@@ -4,6 +4,7 @@
 //! Implements `GatewayQuery` trait so it can be used with the MCP handler.
 
 use agent_api::actions::ActionResult;
+use agent_api::ebpf::TcpHealthEvidenceSnapshot;
 use agent_api::query::GatewayQuery;
 use agent_api::temporal::{GatewayDiff, TemporalQuery, TimelineSnapshot};
 use agent_api::types::*;
@@ -65,6 +66,10 @@ impl RemoteGatewayQuery {
         ttl_secs: u64,
     ) -> anyhow::Result<ActionResult> {
         GatewayQuery::quarantine_backend(self, backend, ttl_secs).await
+    }
+
+    pub async fn tcp_health_evidence(&self) -> anyhow::Result<TcpHealthEvidenceSnapshot> {
+        GatewayQuery::tcp_health_evidence(self).await
     }
 }
 
@@ -158,6 +163,12 @@ impl GatewayQuery for RemoteGatewayQuery {
         }
 
         Ok(metrics)
+    }
+
+    async fn tcp_health_evidence(&self) -> anyhow::Result<TcpHealthEvidenceSnapshot> {
+        let url = format!("{}/api/v1/ebpf/tcp-health", self.base_url);
+        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        Ok(resp.json().await?)
     }
 
     async fn timeline(&self, query: TemporalQuery) -> anyhow::Result<TimelineSnapshot> {

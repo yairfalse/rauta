@@ -62,6 +62,12 @@ enum Commands {
         action: MetricsAction,
     },
 
+    /// Optional eBPF/kernel evidence
+    Ebpf {
+        #[command(subcommand)]
+        action: EbpfAction,
+    },
+
     /// Run diagnostics
     Diagnose {
         /// Symptom to diagnose (e.g., "high-latency", "circuit-breaker-cascade")
@@ -151,6 +157,12 @@ enum MetricsAction {
     },
 }
 
+#[derive(Subcommand)]
+enum EbpfAction {
+    /// Show optional TCP health evidence
+    TcpHealth,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -208,6 +220,12 @@ async fn main() -> anyhow::Result<()> {
             MetricsAction::Query { metric } => {
                 let metrics = client.metrics_snapshot(Some(&metric)).await?;
                 output::render_metrics(&metrics, &cli.format);
+            }
+        },
+        Commands::Ebpf { action } => match action {
+            EbpfAction::TcpHealth => {
+                let evidence = client.tcp_health_evidence().await?;
+                println!("{}", serde_json::to_string_pretty(&evidence)?);
             }
         },
         Commands::Diagnose {

@@ -525,3 +525,67 @@ impl DiagnosticRule for ListenerConflict {
             .collect()
     }
 }
+
+/// RAUTA-TCP-001: Kernel TCP health anomalies from optional sensors
+pub struct TcpHealthAnomaly;
+
+impl DiagnosticRule for TcpHealthAnomaly {
+    fn id(&self) -> &str {
+        "RAUTA-TCP-001"
+    }
+
+    fn symptom(&self) -> &str {
+        "tcp-health-anomaly"
+    }
+
+    fn evaluate(&self, ctx: &DiagnosticContext) -> Vec<Diagnosis> {
+        let Some(tcp_health) = &ctx.tcp_health else {
+            return vec![];
+        };
+        if !tcp_health.available {
+            return vec![];
+        }
+
+        tcp_health
+            .signals
+            .iter()
+            .filter(|signal| {
+                signal.retransmits > 0
+                    || signal.resets > 0
+                    || signal.connection_failures > 0
+                    || signal.congestion_events > 0
+                    || signal.rtt_us.is_some_and(|rtt| rtt > 250_000)
+            })
+            .map(|signal| Diagnosis {
+                rule_id: self.id().to_string(),
+                symptom: self.symptom().to_string(),
+                severity: if signal.connection_failures > 0 || signal.resets > 0 {
+                    Severity::Critical
+                } else {
+                    Severity::Warning
+                },
+                confidence: 0.85,
+                causal_chain: vec![
+                    format!("TCP health evidence indicates backend {}", signal.backend),
+                    "Kernel/network signals can explain latency or connection failure symptoms"
+                        .to_string(),
+                ],
+                evidence: vec![format!(
+                    "backend={} rtt_us={:?} retransmits={} resets={} connection_failures={} congestion_events={}",
+                    signal.backend,
+                    signal.rtt_us,
+                    signal.retransmits,
+                    signal.resets,
+                    signal.connection_failures,
+                    signal.congestion_events
+                )],
+                ontology_evidence: signal.ontology_evidence.clone(),
+                suggested_actions: vec![SuggestedAction {
+                    description: "Inspect backend network path and recent kernel TCP evidence"
+                        .to_string(),
+                    cli_command: Some("rauta ebpf tcp-health --format=json".to_string()),
+                }],
+            })
+            .collect()
+    }
+}
