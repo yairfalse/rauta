@@ -106,6 +106,8 @@ Diagnostic rules must preserve human-readable `evidence` and also attach `ontolo
 
 **Adding safe actions:** Use `agent-api/src/actions.rs` for action responses. Mutating backend actions must validate preconditions, stay bounded by TTL/timeout, return before/after evidence plus rollback metadata, and emit a temporal admin-action event.
 
+**Adding proof/demo behavior:** Keep proof workflows command-reproducible. Prefer `rauta proof ...` CLI surfaces plus README commands over hidden scripts when the active scope does not include deploy or CI files.
+
 ## MCP Server (AI Agent Integration)
 
 The MCP server lives in `rauta-cli`, not `control`. Start it with:

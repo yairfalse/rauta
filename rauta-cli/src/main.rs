@@ -11,6 +11,7 @@ mod remote_query;
 use agent_api::query::GatewayQuery;
 use agent_api::temporal::TemporalQuery;
 use clap::{Parser, Subcommand, ValueEnum};
+use std::process::Command as ProcessCommand;
 
 #[derive(Parser)]
 #[command(name = "rauta", version, about = "RAUTA gateway management CLI")]
@@ -66,6 +67,12 @@ enum Commands {
     Ebpf {
         #[command(subcommand)]
         action: EbpfAction,
+    },
+
+    /// Proof and demo workflows
+    Proof {
+        #[command(subcommand)]
+        action: ProofAction,
     },
 
     /// Run diagnostics
@@ -163,6 +170,28 @@ enum EbpfAction {
     TcpHealth,
 }
 
+#[derive(Subcommand)]
+enum ProofAction {
+    /// Print or run the Kind incident demo workflow
+    IncidentDemo {
+        /// Execute the commands instead of printing the plan
+        #[arg(long)]
+        execute: bool,
+        /// Kind cluster name
+        #[arg(long, default_value = "rauta-proof")]
+        cluster: String,
+        /// Kubernetes namespace
+        #[arg(long, default_value = "rauta-system")]
+        namespace: String,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct ProofStep {
+    name: &'static str,
+    command: String,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -228,6 +257,20 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&evidence)?);
             }
         },
+        Commands::Proof { action } => match action {
+            ProofAction::IncidentDemo {
+                execute,
+                cluster,
+                namespace,
+            } => {
+                let steps = proof_incident_demo_steps(&cluster, &namespace);
+                if execute {
+                    run_proof_steps(&steps)?;
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&steps)?);
+                }
+            }
+        },
         Commands::Diagnose {
             symptom,
             route: _,
@@ -286,5 +329,60 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn proof_incident_demo_steps(cluster: &str, namespace: &str) -> Vec<ProofStep> {
+    vec![
+        ProofStep {
+            name: "create-kind-cluster",
+            command: format!("kind create cluster --name {} --config deploy/kind-config.yaml", cluster),
+        },
+        ProofStep {
+            name: "install-gateway-api",
+            command: "kubectl apply -f deploy/gateway-api.yaml".to_string(),
+        },
+        ProofStep {
+            name: "deploy-rauta",
+            command: format!("kubectl create namespace {} --dry-run=client -o yaml | kubectl apply -f - && kubectl apply -f deploy/rauta-daemonset.yaml", namespace),
+        },
+        ProofStep {
+            name: "deploy-demo-backend",
+            command: "kubectl apply -f deploy/demo-backend.yaml".to_string(),
+        },
+        ProofStep {
+            name: "send-traffic",
+            command: "kubectl -n rauta-system port-forward svc/rauta-admin 9091:9091 & sleep 2 && rauta status --format=json".to_string(),
+        },
+        ProofStep {
+            name: "inject-failure",
+            command: "kubectl scale deploy/demo-backend --replicas=0".to_string(),
+        },
+        ProofStep {
+            name: "diagnose",
+            command: "rauta diagnose degraded --since-seconds=300 --format=agent".to_string(),
+        },
+        ProofStep {
+            name: "safe-action",
+            command: "rauta backends quarantine 127.0.0.1:8080 --ttl=300".to_string(),
+        },
+        ProofStep {
+            name: "recover",
+            command: "kubectl scale deploy/demo-backend --replicas=1 && rauta diff --since-seconds=300".to_string(),
+        },
+    ]
+}
+
+fn run_proof_steps(steps: &[ProofStep]) -> anyhow::Result<()> {
+    for step in steps {
+        eprintln!("==> {}", step.name);
+        let status = ProcessCommand::new("sh")
+            .arg("-lc")
+            .arg(&step.command)
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("proof step '{}' failed with {}", step.name, status);
+        }
+    }
     Ok(())
 }

@@ -98,6 +98,7 @@ rauta diff --since-seconds=300                # semantic recent-state diff
 rauta ebpf tcp-health --format=json           # optional TCP health evidence
 rauta backends drain 10.0.1.5:8080            # bounded drain with rollback metadata
 rauta backends quarantine 10.0.1.5:8080 --ttl=300
+rauta proof incident-demo                     # print reproducible Kind incident demo
 ```
 
 The `--format=agent` output includes `_meta` and `_hints` blocks designed for LLM consumption. The binary is also available as `kubectl-rauta`.
@@ -235,6 +236,17 @@ make ci-local                                             # full CI
 ```
 
 Pre-commit and pre-push hooks enforce fmt, clippy, and tests.
+
+## Proof paths
+
+RAUTA proof should be reproducible from local commands:
+
+- Gateway API conformance status: HTTPRoute/Gateway parsing, listener validation, filters, retries, timeouts, backend refs, EndpointSlice updates, and TLS reference validation are covered by `cargo test -p control`. Unsupported or partial areas remain non-HTTP route kinds, full Gateway API upstream conformance harness automation, and service-mesh policy behavior.
+- Live oracle: run `cargo run -p oracle -- --help` for the live gateway oracle binary, or use `eval/k8s/oracle-job.yaml` for Kubernetes automation.
+- Hot-path benchmark: run `cargo bench -p control --bench hot_path` and preserve Criterion output as the benchmark artifact.
+- Incident demo: run `rauta proof incident-demo` to print the Kind workflow, or `rauta proof incident-demo --execute` to execute cluster create, deploy, traffic, failure injection, diagnosis, safe action, and recovery verification steps.
+
+The proof demo is intentionally command-driven. It does not hide cluster prerequisites: `kind`, `kubectl`, Docker, and a locally built/published RAUTA image must match the deploy manifests.
 
 ## Roadmap
 
