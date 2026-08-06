@@ -410,6 +410,7 @@ impl Router {
     /// Reads the route table under a brief read lock and converts internal
     /// Route structs to public RouteSnapshot types for the admin API/CLI/MCP.
     pub fn list_routes(&self) -> Vec<agent_api::types::RouteSnapshot> {
+        self.cleanup_expired_draining_backends();
         let routes = safe_read(&self.routes);
         let health_snapshot = self.health.load();
 
@@ -632,13 +633,22 @@ impl Router {
     /// **Supports both IPv4 and IPv6** backends.
     #[allow(dead_code)] // Used in tests
     pub fn is_backend_draining(&self, backend: Backend) -> bool {
+        self.cleanup_expired_draining_backends();
         // Lock-free read via ArcSwap::load() (~1ns atomic load)
         let health = self.health.load();
         health.draining_backends.contains_key(&backend)
     }
 
+    /// Remove backend from draining state.
+    pub fn undrain_backend(&self, backend: Backend) -> bool {
+        let current = self.health.load();
+        let mut new_health = (**current).clone();
+        let removed = new_health.draining_backends.remove(&backend).is_some();
+        self.health.store(Arc::new(new_health));
+        removed
+    }
+
     /// Clean up expired draining backends
-    #[allow(dead_code)] // Will be used in EndpointSlice watcher integration
     fn cleanup_expired_draining_backends(&self) {
         let current = self.health.load();
         let mut new_health = (**current).clone();

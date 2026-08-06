@@ -1,4 +1,6 @@
+pub mod actions;
 pub mod diagnostics;
+pub mod ebpf;
 pub mod ontology;
 pub mod query;
 pub mod temporal;

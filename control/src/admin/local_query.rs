@@ -3,7 +3,10 @@
 //! Reads directly from `Arc<Router>`, `Arc<CircuitBreakerManager>`, and `Arc<RateLimiter>`.
 //! Used by the admin server and MCP server when running in-process.
 
-use agent_api::ontology::{EntityKind, EntityRef, EvidenceValue};
+use agent_api::actions::{
+    ActionEvidence, ActionPrecondition, ActionResult, ActionRisk, ActionStatus, RollbackMetadata,
+};
+use agent_api::ontology::{ActionKind, EntityKind, EntityRef, EvidenceValue};
 use agent_api::query::GatewayQuery;
 use agent_api::temporal::{
     GatewayDiff, SnapshotHistoryEntry, TemporalEvent, TemporalEventKind, TemporalQuery,
@@ -11,11 +14,14 @@ use agent_api::temporal::{
 };
 use agent_api::types::*;
 use async_trait::async_trait;
+use common::Backend;
 use prometheus::proto::{Metric, MetricFamily, MetricType};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::observability::ebpf::{sensor_from_env, TcpHealthSensor};
 use crate::proxy::circuit_breaker::CircuitBreakerManager;
 use crate::proxy::rate_limiter::RateLimiter;
 use crate::proxy::router::Router;
@@ -27,6 +33,7 @@ pub struct LocalGatewayQuery {
     rate_limiter: Arc<RateLimiter>,
     start_time: Instant,
     temporal: Mutex<TemporalState>,
+    tcp_sensor: Box<dyn TcpHealthSensor>,
 }
 
 impl LocalGatewayQuery {
@@ -41,6 +48,7 @@ impl LocalGatewayQuery {
             rate_limiter,
             start_time: Instant::now(),
             temporal: Mutex::new(TemporalState::new(DEFAULT_TEMPORAL_RETENTION)),
+            tcp_sensor: sensor_from_env(),
         }
     }
 }
@@ -59,6 +67,16 @@ struct TemporalState {
     next_sequence: u64,
     events: VecDeque<TemporalEvent>,
     observations: VecDeque<ObservedState>,
+}
+
+struct BackendActionBuild {
+    kind: ActionKind,
+    backend: Backend,
+    risk: ActionRisk,
+    ttl_secs: u64,
+    before: ActionEvidence,
+    after: ActionEvidence,
+    expires_at_unix_ms: Option<u64>,
 }
 
 impl TemporalState {
@@ -309,6 +327,12 @@ impl GatewayQuery for LocalGatewayQuery {
         Ok(snapshots)
     }
 
+    async fn tcp_health_evidence(
+        &self,
+    ) -> anyhow::Result<agent_api::ebpf::TcpHealthEvidenceSnapshot> {
+        Ok(self.tcp_sensor.snapshot())
+    }
+
     async fn timeline(&self, query: TemporalQuery) -> anyhow::Result<TimelineSnapshot> {
         self.snapshot().await?;
 
@@ -364,21 +388,38 @@ impl GatewayQuery for LocalGatewayQuery {
     async fn diagnose(
         &self,
         symptom: &str,
-        _route_filter: Option<&str>,
-        _backend_filter: Option<&str>,
+        route_filter: Option<&str>,
+        backend_filter: Option<&str>,
     ) -> anyhow::Result<Vec<Diagnosis>> {
         use agent_api::diagnostics::engine::{DiagnosticContext, DiagnosticsEngine};
 
-        let snapshot = self.snapshot().await?;
-        let routes = self.router.list_routes();
-        let circuit_breakers = self.circuit_breaker.snapshot_all();
-        let rate_limiters = self.rate_limiter.snapshot_all();
+        let mut snapshot = self.snapshot().await?;
+        let mut routes = self.router.list_routes();
+        apply_route_filter(&mut routes, route_filter);
+        apply_backend_filter_to_routes(&mut routes, backend_filter);
+        let mut circuit_breakers = self.circuit_breaker.snapshot_all();
+        apply_backend_filter_to_breakers(&mut circuit_breakers, backend_filter);
+        let mut rate_limiters = self.rate_limiter.snapshot_all();
+        apply_route_filter_to_limiters(&mut rate_limiters, route_filter);
+        let mut tcp_health = self.tcp_sensor.snapshot();
+        apply_backend_filter_to_tcp_health(&mut tcp_health, backend_filter);
+
+        snapshot.route_count = routes.len();
+        snapshot.open_circuits = circuit_breakers
+            .iter()
+            .filter(|breaker| breaker.state == "Open")
+            .count();
+        snapshot.exhausted_rate_limiters = rate_limiters
+            .iter()
+            .filter(|limiter| limiter.tokens_available <= 0.0)
+            .count();
 
         let ctx = DiagnosticContext {
             snapshot,
             routes,
             circuit_breakers,
             rate_limiters,
+            tcp_health: Some(tcp_health),
         };
 
         let engine = DiagnosticsEngine::with_builtin_rules();
@@ -416,14 +457,32 @@ impl GatewayQuery for LocalGatewayQuery {
 
     async fn drain_backend(
         &self,
-        _backend: &str,
-        _timeout_secs: Option<u64>,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("drain_backend not yet implemented via admin API")
+        backend: &str,
+        timeout_secs: Option<u64>,
+    ) -> anyhow::Result<ActionResult> {
+        self.apply_backend_action(
+            ActionKind::DrainBackend,
+            backend,
+            timeout_secs.unwrap_or(30),
+            ActionRisk::Medium,
+        )
     }
 
-    async fn undrain_backend(&self, _backend: &str) -> anyhow::Result<()> {
-        anyhow::bail!("undrain_backend not yet implemented via admin API")
+    async fn undrain_backend(&self, backend: &str) -> anyhow::Result<ActionResult> {
+        self.apply_undrain_action(backend)
+    }
+
+    async fn quarantine_backend(
+        &self,
+        backend: &str,
+        ttl_secs: u64,
+    ) -> anyhow::Result<ActionResult> {
+        self.apply_backend_action(
+            ActionKind::QuarantineBackend,
+            backend,
+            ttl_secs,
+            ActionRisk::High,
+        )
     }
 }
 
@@ -515,6 +574,237 @@ impl LocalGatewayQuery {
             .push_observation(observation);
         Ok(())
     }
+
+    fn apply_backend_action(
+        &self,
+        kind: ActionKind,
+        backend_text: &str,
+        ttl_secs: u64,
+        risk: ActionRisk,
+    ) -> anyhow::Result<ActionResult> {
+        if ttl_secs == 0 || ttl_secs > 86_400 {
+            anyhow::bail!("action_failed: ttl_secs must be between 1 and 86400");
+        }
+        let backend = parse_backend(backend_text)?;
+        let before = self.action_evidence(backend);
+        let exists = !before.affected_routes.is_empty();
+        if !exists {
+            anyhow::bail!(
+                "action_failed: backend {} is not present in any route",
+                backend
+            );
+        }
+        if before.is_draining {
+            anyhow::bail!("action_failed: backend {} is already draining", backend);
+        }
+
+        self.router
+            .drain_backend(backend, Duration::from_secs(ttl_secs));
+        let after = self.action_evidence(backend);
+        let expires_at_unix_ms = Some(now_unix_ms().saturating_add(ttl_secs.saturating_mul(1000)));
+        self.action_result(BackendActionBuild {
+            kind,
+            backend,
+            risk,
+            ttl_secs,
+            before,
+            after,
+            expires_at_unix_ms,
+        })
+    }
+
+    fn apply_undrain_action(&self, backend_text: &str) -> anyhow::Result<ActionResult> {
+        let backend = parse_backend(backend_text)?;
+        let before = self.action_evidence(backend);
+        if before.affected_routes.is_empty() {
+            anyhow::bail!(
+                "action_failed: backend {} is not present in any route",
+                backend
+            );
+        }
+        if !before.is_draining {
+            anyhow::bail!("action_failed: backend {} is not draining", backend);
+        }
+
+        self.router.undrain_backend(backend);
+        let after = self.action_evidence(backend);
+        self.action_result(BackendActionBuild {
+            kind: ActionKind::UndrainBackend,
+            backend,
+            risk: ActionRisk::Low,
+            ttl_secs: 0,
+            before,
+            after,
+            expires_at_unix_ms: None,
+        })
+    }
+
+    fn action_result(&self, build: BackendActionBuild) -> anyhow::Result<ActionResult> {
+        let sequence = self.next_temporal_sequence()?;
+        let summary = match build.kind {
+            ActionKind::DrainBackend => format!("Backend {} marked draining", build.backend),
+            ActionKind::UndrainBackend => {
+                format!("Backend {} restored to active service", build.backend)
+            }
+            ActionKind::QuarantineBackend => format!("Backend {} quarantined", build.backend),
+            _ => format!("Backend action applied to {}", build.backend),
+        };
+        let mut attributes = BTreeMap::new();
+        attributes.insert("ttl_secs".to_string(), EvidenceValue::from(build.ttl_secs));
+        attributes.insert(
+            "affected_routes".to_string(),
+            EvidenceValue::from(build.after.affected_routes.len()),
+        );
+        let timeline_event = TemporalEvent {
+            sequence,
+            timestamp_unix_ms: now_unix_ms(),
+            kind: TemporalEventKind::AdminAction,
+            subject: EntityRef::new(EntityKind::Backend, build.backend.to_string()),
+            summary,
+            attributes,
+        };
+        self.push_temporal_event(timeline_event.clone())?;
+
+        let rollback = match build.kind {
+            ActionKind::DrainBackend | ActionKind::QuarantineBackend => Some(RollbackMetadata {
+                action: ActionKind::UndrainBackend,
+                cli_command: format!("rauta backends undrain {}", build.backend),
+                reason: "Restore backend to active routing before expiry".to_string(),
+            }),
+            ActionKind::UndrainBackend => Some(RollbackMetadata {
+                action: ActionKind::DrainBackend,
+                cli_command: format!("rauta backends drain {}", build.backend),
+                reason: "Reapply draining if backend remains unsafe".to_string(),
+            }),
+            _ => None,
+        };
+
+        Ok(ActionResult {
+            action_id: format!("action-{}-{}", timeline_event.sequence, build.backend),
+            kind: build.kind,
+            target: EntityRef::new(EntityKind::Backend, build.backend.to_string()),
+            status: ActionStatus::Applied,
+            risk: build.risk,
+            preconditions: vec![
+                ActionPrecondition {
+                    name: "backend_present".to_string(),
+                    passed: true,
+                    message: "Backend is referenced by at least one route".to_string(),
+                },
+                ActionPrecondition {
+                    name: "bounded_duration".to_string(),
+                    passed: true,
+                    message: "Action duration is bounded".to_string(),
+                },
+            ],
+            before: build.before,
+            after: build.after,
+            rollback,
+            expires_at_unix_ms: build.expires_at_unix_ms,
+            timeline_event,
+        })
+    }
+
+    fn action_evidence(&self, backend: Backend) -> ActionEvidence {
+        let backend_text = backend.to_string();
+        let affected_routes = self
+            .router
+            .list_routes()
+            .into_iter()
+            .filter(|route| {
+                route.backends.iter().any(|candidate| {
+                    format!("{}:{}", candidate.address, candidate.port) == backend_text
+                })
+            })
+            .map(|route| route.pattern)
+            .collect();
+        let is_draining = self.router.is_backend_draining(backend);
+
+        ActionEvidence {
+            backend: backend_text,
+            was_draining: is_draining,
+            is_draining,
+            affected_routes,
+        }
+    }
+
+    fn next_temporal_sequence(&self) -> anyhow::Result<u64> {
+        let mut temporal = self
+            .temporal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("temporal state lock poisoned"))?;
+        let sequence = temporal.next_sequence;
+        temporal.next_sequence += 1;
+        Ok(sequence)
+    }
+
+    fn push_temporal_event(&self, event: TemporalEvent) -> anyhow::Result<()> {
+        self.temporal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("temporal state lock poisoned"))?
+            .push_event(event);
+        Ok(())
+    }
+}
+
+fn parse_backend(value: &str) -> anyhow::Result<Backend> {
+    let socket_addr: SocketAddr = value
+        .parse()
+        .map_err(|e| anyhow::anyhow!("action_failed: backend must be host:port: {}", e))?;
+    Ok(match socket_addr {
+        SocketAddr::V4(addr) => Backend::from_ipv4(*addr.ip(), addr.port(), 1),
+        SocketAddr::V6(addr) => Backend::from_ipv6(*addr.ip(), addr.port(), 1),
+    })
+}
+
+fn apply_route_filter(routes: &mut Vec<RouteSnapshot>, route_filter: Option<&str>) {
+    if let Some(filter) = route_filter {
+        routes.retain(|route| route.pattern.contains(filter));
+    }
+}
+
+fn apply_backend_filter_to_routes(routes: &mut Vec<RouteSnapshot>, backend_filter: Option<&str>) {
+    if let Some(filter) = backend_filter {
+        routes.retain_mut(|route| {
+            route
+                .backends
+                .retain(|backend| backend_id(backend).contains(filter));
+            !route.backends.is_empty()
+        });
+    }
+}
+
+fn apply_backend_filter_to_breakers(
+    breakers: &mut Vec<CircuitBreakerSnapshot>,
+    backend_filter: Option<&str>,
+) {
+    if let Some(filter) = backend_filter {
+        breakers.retain(|breaker| breaker.backend_id.contains(filter));
+    }
+}
+
+fn apply_route_filter_to_limiters(
+    limiters: &mut Vec<RateLimiterSnapshot>,
+    route_filter: Option<&str>,
+) {
+    if let Some(filter) = route_filter {
+        limiters.retain(|limiter| limiter.route.contains(filter));
+    }
+}
+
+fn apply_backend_filter_to_tcp_health(
+    tcp_health: &mut agent_api::ebpf::TcpHealthEvidenceSnapshot,
+    backend_filter: Option<&str>,
+) {
+    if let Some(filter) = backend_filter {
+        tcp_health
+            .signals
+            .retain(|signal| signal.backend.contains(filter));
+    }
+}
+
+fn backend_id(backend: &BackendSnapshot) -> String {
+    format!("{}:{}", backend.address, backend.port)
 }
 
 fn now_unix_ms() -> u64 {

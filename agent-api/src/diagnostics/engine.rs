@@ -3,6 +3,7 @@
 //! Deterministic Rust rules that correlate gateway state, explain failures,
 //! and suggest actions. No LLM — pure structured reasoning.
 
+use crate::ebpf::TcpHealthEvidenceSnapshot;
 use crate::types::{
     CircuitBreakerSnapshot, Diagnosis, GatewaySnapshot, RateLimiterSnapshot, RouteSnapshot,
 };
@@ -13,6 +14,7 @@ pub struct DiagnosticContext {
     pub routes: Vec<RouteSnapshot>,
     pub circuit_breakers: Vec<CircuitBreakerSnapshot>,
     pub rate_limiters: Vec<RateLimiterSnapshot>,
+    pub tcp_health: Option<TcpHealthEvidenceSnapshot>,
 }
 
 /// A diagnostic rule that evaluates gateway state
@@ -48,6 +50,7 @@ impl DiagnosticsEngine {
         engine.register(Box::new(super::rules::AllBackendsDraining));
         engine.register(Box::new(super::rules::LowCacheHitRate));
         engine.register(Box::new(super::rules::ListenerConflict));
+        engine.register(Box::new(super::rules::TcpHealthAnomaly));
         engine
     }
 
@@ -105,6 +108,7 @@ mod tests {
             routes: vec![],
             circuit_breakers: vec![],
             rate_limiters: vec![],
+            tcp_health: None,
         }
     }
 

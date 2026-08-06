@@ -102,6 +102,12 @@ Diagnostic rules must preserve human-readable `evidence` and also attach `ontolo
 
 **Adding ontology or timeline behavior:** Use `agent-api/src/ontology.rs` for stable agent-facing entities and evidence. Use `agent-api/src/temporal.rs` for bounded recent-history contracts and keep `LocalGatewayQuery` retention finite. Keep eBPF as an optional evidence source that feeds ontology evidence, not as a required routing dependency.
 
+**Adding eBPF evidence:** Use `agent-api/src/ebpf.rs` for TCP evidence contracts and `control/src/observability/ebpf.rs` for sensor implementations. The default mode must be unavailable, mock mode must be deterministic, and Linux eBPF mode must be target-gated/capability-documented.
+
+**Adding safe actions:** Use `agent-api/src/actions.rs` for action responses. Mutating backend actions must validate preconditions, stay bounded by TTL/timeout, return before/after evidence plus rollback metadata, and emit a temporal admin-action event.
+
+**Adding proof/demo behavior:** Keep proof workflows command-reproducible. Prefer `rauta proof ...` CLI surfaces plus README commands over hidden scripts when the active scope does not include deploy or CI files.
+
 ## MCP Server (AI Agent Integration)
 
 The MCP server lives in `rauta-cli`, not `control`. Start it with:
@@ -112,7 +118,7 @@ rauta --endpoint http://localhost:9091 mcp
 
 This runs stdio transport: MCP JSON-RPC frames on stdout, tracing logs on stderr. Used by Claude Code, Cursor, and other MCP clients. The `RemoteGatewayQuery` (HTTP client to admin API) is wrapped in `RautaMcpHandler` and served over `rmcp::transport::stdio()`. Streamable HTTP transport (`POST /mcp` on admin port) is planned but not yet implemented.
 
-Current remote read tools are wired through the admin API, including bounded timeline and diff reads. Backend drain and undrain are intentionally explicit-unavailable operations until the safe-actions spec adds bounded action semantics.
+Current remote tools are wired through the admin API, including bounded timeline/diff reads and safe backend drain, undrain, and quarantine actions.
 
 ## Environment Variables
 
