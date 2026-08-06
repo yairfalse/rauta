@@ -388,23 +388,38 @@ impl GatewayQuery for LocalGatewayQuery {
     async fn diagnose(
         &self,
         symptom: &str,
-        _route_filter: Option<&str>,
-        _backend_filter: Option<&str>,
+        route_filter: Option<&str>,
+        backend_filter: Option<&str>,
     ) -> anyhow::Result<Vec<Diagnosis>> {
         use agent_api::diagnostics::engine::{DiagnosticContext, DiagnosticsEngine};
 
-        let snapshot = self.snapshot().await?;
-        let routes = self.router.list_routes();
-        let circuit_breakers = self.circuit_breaker.snapshot_all();
-        let rate_limiters = self.rate_limiter.snapshot_all();
-        let tcp_health = Some(self.tcp_sensor.snapshot());
+        let mut snapshot = self.snapshot().await?;
+        let mut routes = self.router.list_routes();
+        apply_route_filter(&mut routes, route_filter);
+        apply_backend_filter_to_routes(&mut routes, backend_filter);
+        let mut circuit_breakers = self.circuit_breaker.snapshot_all();
+        apply_backend_filter_to_breakers(&mut circuit_breakers, backend_filter);
+        let mut rate_limiters = self.rate_limiter.snapshot_all();
+        apply_route_filter_to_limiters(&mut rate_limiters, route_filter);
+        let mut tcp_health = self.tcp_sensor.snapshot();
+        apply_backend_filter_to_tcp_health(&mut tcp_health, backend_filter);
+
+        snapshot.route_count = routes.len();
+        snapshot.open_circuits = circuit_breakers
+            .iter()
+            .filter(|breaker| breaker.state == "Open")
+            .count();
+        snapshot.exhausted_rate_limiters = rate_limiters
+            .iter()
+            .filter(|limiter| limiter.tokens_available <= 0.0)
+            .count();
 
         let ctx = DiagnosticContext {
             snapshot,
             routes,
             circuit_breakers,
             rate_limiters,
-            tcp_health,
+            tcp_health: Some(tcp_health),
         };
 
         let engine = DiagnosticsEngine::with_builtin_rules();
@@ -740,6 +755,56 @@ fn parse_backend(value: &str) -> anyhow::Result<Backend> {
         SocketAddr::V4(addr) => Backend::from_ipv4(*addr.ip(), addr.port(), 1),
         SocketAddr::V6(addr) => Backend::from_ipv6(*addr.ip(), addr.port(), 1),
     })
+}
+
+fn apply_route_filter(routes: &mut Vec<RouteSnapshot>, route_filter: Option<&str>) {
+    if let Some(filter) = route_filter {
+        routes.retain(|route| route.pattern.contains(filter));
+    }
+}
+
+fn apply_backend_filter_to_routes(routes: &mut Vec<RouteSnapshot>, backend_filter: Option<&str>) {
+    if let Some(filter) = backend_filter {
+        routes.retain_mut(|route| {
+            route
+                .backends
+                .retain(|backend| backend_id(backend).contains(filter));
+            !route.backends.is_empty()
+        });
+    }
+}
+
+fn apply_backend_filter_to_breakers(
+    breakers: &mut Vec<CircuitBreakerSnapshot>,
+    backend_filter: Option<&str>,
+) {
+    if let Some(filter) = backend_filter {
+        breakers.retain(|breaker| breaker.backend_id.contains(filter));
+    }
+}
+
+fn apply_route_filter_to_limiters(
+    limiters: &mut Vec<RateLimiterSnapshot>,
+    route_filter: Option<&str>,
+) {
+    if let Some(filter) = route_filter {
+        limiters.retain(|limiter| limiter.route.contains(filter));
+    }
+}
+
+fn apply_backend_filter_to_tcp_health(
+    tcp_health: &mut agent_api::ebpf::TcpHealthEvidenceSnapshot,
+    backend_filter: Option<&str>,
+) {
+    if let Some(filter) = backend_filter {
+        tcp_health
+            .signals
+            .retain(|signal| signal.backend.contains(filter));
+    }
+}
+
+fn backend_id(backend: &BackendSnapshot) -> String {
+    format!("{}:{}", backend.address, backend.port)
 }
 
 fn now_unix_ms() -> u64 {

@@ -273,10 +273,12 @@ async fn main() -> anyhow::Result<()> {
         },
         Commands::Diagnose {
             symptom,
-            route: _,
+            route,
             since_seconds,
         } => {
-            let diagnoses = client.diagnose_since(&symptom, since_seconds).await?;
+            let diagnoses = client
+                .diagnose_since(&symptom, route.as_deref(), None, since_seconds)
+                .await?;
             output::render_diagnoses(&diagnoses, &cli.format);
         }
         Commands::Timeline { since_seconds } => {

@@ -43,9 +43,12 @@ impl RemoteGatewayQuery {
     pub async fn diagnose_since(
         &self,
         symptom: &str,
+        route_filter: Option<&str>,
+        backend_filter: Option<&str>,
         since_seconds: Option<u64>,
     ) -> anyhow::Result<Vec<Diagnosis>> {
-        GatewayQuery::diagnose_since(self, symptom, None, None, since_seconds).await
+        GatewayQuery::diagnose_since(self, symptom, route_filter, backend_filter, since_seconds)
+            .await
     }
 
     pub async fn drain_backend(
@@ -198,14 +201,21 @@ impl GatewayQuery for RemoteGatewayQuery {
     async fn diagnose(
         &self,
         symptom: &str,
-        _route_filter: Option<&str>,
-        _backend_filter: Option<&str>,
+        route_filter: Option<&str>,
+        backend_filter: Option<&str>,
     ) -> anyhow::Result<Vec<Diagnosis>> {
         let url = format!("{}/api/v1/diagnose", self.base_url);
+        let mut query = vec![("symptom".to_string(), symptom.to_string())];
+        if let Some(route) = route_filter {
+            query.push(("route".to_string(), route.to_string()));
+        }
+        if let Some(backend) = backend_filter {
+            query.push(("backend".to_string(), backend.to_string()));
+        }
         let resp = self
             .client
             .post(&url)
-            .query(&[("symptom", symptom)])
+            .query(&query)
             .send()
             .await?
             .error_for_status()?;
@@ -215,12 +225,18 @@ impl GatewayQuery for RemoteGatewayQuery {
     async fn diagnose_since(
         &self,
         symptom: &str,
-        _route_filter: Option<&str>,
-        _backend_filter: Option<&str>,
+        route_filter: Option<&str>,
+        backend_filter: Option<&str>,
         since_seconds: Option<u64>,
     ) -> anyhow::Result<Vec<Diagnosis>> {
         let url = format!("{}/api/v1/diagnose", self.base_url);
         let mut query = vec![("symptom".to_string(), symptom.to_string())];
+        if let Some(route) = route_filter {
+            query.push(("route".to_string(), route.to_string()));
+        }
+        if let Some(backend) = backend_filter {
+            query.push(("backend".to_string(), backend.to_string()));
+        }
         if let Some(seconds) = since_seconds {
             query.push(("since_seconds".to_string(), seconds.to_string()));
         }
