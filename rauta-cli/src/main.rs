@@ -11,6 +11,7 @@ mod remote_query;
 use agent_api::query::GatewayQuery;
 use agent_api::temporal::TemporalQuery;
 use clap::{Parser, Subcommand, ValueEnum};
+use std::process::Command as ProcessCommand;
 
 #[derive(Parser)]
 #[command(name = "rauta", version, about = "RAUTA gateway management CLI")]
@@ -66,6 +67,12 @@ enum Commands {
     Ebpf {
         #[command(subcommand)]
         action: EbpfAction,
+    },
+
+    /// Proof and demo workflows
+    Proof {
+        #[command(subcommand)]
+        action: ProofAction,
     },
 
     /// Run diagnostics
@@ -163,6 +170,25 @@ enum EbpfAction {
     TcpHealth,
 }
 
+#[derive(Subcommand)]
+enum ProofAction {
+    /// Print or run the Kind incident demo workflow
+    IncidentDemo {
+        /// Execute the commands instead of printing the plan
+        #[arg(long)]
+        execute: bool,
+        /// Kind cluster name
+        #[arg(long, default_value = "rauta-proof")]
+        cluster: String,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct ProofStep {
+    name: &'static str,
+    command: String,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -228,12 +254,24 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&evidence)?);
             }
         },
+        Commands::Proof { action } => match action {
+            ProofAction::IncidentDemo { execute, cluster } => {
+                let steps = proof_incident_demo_steps(&cluster);
+                if execute {
+                    run_proof_steps(&steps)?;
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&steps)?);
+                }
+            }
+        },
         Commands::Diagnose {
             symptom,
-            route: _,
+            route,
             since_seconds,
         } => {
-            let diagnoses = client.diagnose_since(&symptom, since_seconds).await?;
+            let diagnoses = client
+                .diagnose_since(&symptom, route.as_deref(), None, since_seconds)
+                .await?;
             output::render_diagnoses(&diagnoses, &cli.format);
         }
         Commands::Timeline { since_seconds } => {
@@ -286,5 +324,80 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn proof_incident_demo_steps(cluster: &str) -> Vec<ProofStep> {
+    vec![
+        ProofStep {
+            name: "create-kind-cluster",
+            command: format!("kind create cluster --name {} --config deploy/kind-config.yaml", cluster),
+        },
+        ProofStep {
+            name: "install-gateway-api-crds",
+            command: "kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml && kubectl wait --for condition=established --timeout=60s crd/gatewayclasses.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io crd/httproutes.gateway.networking.k8s.io".to_string(),
+        },
+        ProofStep {
+            name: "build-rauta-image",
+            command: "docker build -t rauta:latest -f docker/Dockerfile.prod .".to_string(),
+        },
+        ProofStep {
+            name: "load-rauta-image",
+            command: format!("kind load docker-image rauta:latest --name {}", cluster),
+        },
+        ProofStep {
+            name: "build-demo-backend-image",
+            command: "cargo build --release --example http2_backend && docker build -t rauta-backend:latest -f docker/Dockerfile.backend-local .".to_string(),
+        },
+        ProofStep {
+            name: "load-demo-backend-image",
+            command: format!("kind load docker-image rauta-backend:latest --name {}", cluster),
+        },
+        ProofStep {
+            name: "deploy-rauta",
+            command: "kubectl apply -f deploy/rauta-daemonset.yaml && kubectl wait --for=condition=ready pod -l app=rauta -n rauta-system --timeout=120s".to_string(),
+        },
+        ProofStep {
+            name: "deploy-demo-backend",
+            command: "kubectl apply -f deploy/demo-backend.yaml && kubectl wait --for=condition=ready pod -l app=echo -n demo --timeout=120s".to_string(),
+        },
+        ProofStep {
+            name: "deploy-gateway-resources",
+            command: "kubectl apply -f deploy/gateway-api.yaml".to_string(),
+        },
+        ProofStep {
+            name: "send-traffic",
+            command: "kubectl -n rauta-system port-forward pod/$(kubectl -n rauta-system get pod -l app=rauta -o jsonpath='{.items[0].metadata.name}') 9091:9091 >/tmp/rauta-proof-admin.log 2>&1 & echo $! >/tmp/rauta-proof-admin.pid && sleep 2 && for i in $(seq 1 20); do curl -fsS -H 'Host: echo.local' http://localhost:8080/api >/dev/null; done && rauta status --format=json".to_string(),
+        },
+        ProofStep {
+            name: "safe-action",
+            command: "backend=$(kubectl -n demo get endpointslice -l kubernetes.io/service-name=echo-stable -o jsonpath='{.items[0].endpoints[0].addresses[0]}'):8080 && rauta backends quarantine \"$backend\" --ttl=300".to_string(),
+        },
+        ProofStep {
+            name: "inject-failure",
+            command: "kubectl -n demo scale deploy/echo-v1 deploy/echo-v2-canary --replicas=0 && kubectl -n demo wait --for=delete pod -l app=echo --timeout=120s && sleep 5".to_string(),
+        },
+        ProofStep {
+            name: "diagnose",
+            command: "rauta diagnose no-healthy-backends --since-seconds=300 --format=agent".to_string(),
+        },
+        ProofStep {
+            name: "recover",
+            command: "kubectl -n demo scale deploy/echo-v1 --replicas=3 && kubectl -n demo scale deploy/echo-v2-canary --replicas=1 && kubectl wait --for=condition=ready pod -l app=echo -n demo --timeout=120s && rauta diff --since-seconds=300".to_string(),
+        },
+    ]
+}
+
+fn run_proof_steps(steps: &[ProofStep]) -> anyhow::Result<()> {
+    for step in steps {
+        eprintln!("==> {}", step.name);
+        let status = ProcessCommand::new("sh")
+            .arg("-lc")
+            .arg(&step.command)
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("proof step '{}' failed with {}", step.name, status);
+        }
+    }
     Ok(())
 }
