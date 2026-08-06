@@ -148,6 +148,12 @@ Agent-facing diagnostic responses also include `ontology_evidence`: schema-versi
 
 Optional TCP evidence is controlled by `RAUTA_TCP_EVIDENCE_MODE`: `unavailable` (default), `mock`, or `linux-ebpf`. The Linux eBPF mode is target-gated and reports unavailable unless the process has the required Linux capabilities such as `CAP_BPF`/`CAP_PERFMON` or equivalent privileged execution; it never becomes a routing dependency.
 
+Mock TCP evidence can be made anomalous with deterministic environment inputs:
+`RAUTA_TCP_EVIDENCE_MOCK_BACKEND`, `RAUTA_TCP_EVIDENCE_MOCK_RTT_US`,
+`RAUTA_TCP_EVIDENCE_MOCK_RETRANSMITS`, `RAUTA_TCP_EVIDENCE_MOCK_RESETS`,
+`RAUTA_TCP_EVIDENCE_MOCK_CONNECTION_FAILURES`, and
+`RAUTA_TCP_EVIDENCE_MOCK_CONGESTION_EVENTS`.
+
 ---
 
 ## Gateway API
