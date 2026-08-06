@@ -292,6 +292,20 @@ impl RautaMcpHandler {
     }
 
     #[tool(
+        description = "Get optional TCP health evidence from unavailable, mock, or Linux eBPF sensors"
+    )]
+    async fn rauta_tcp_health(&self) -> Result<CallToolResult, McpError> {
+        let evidence = self
+            .query
+            .tcp_health_evidence()
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let json = serde_json::to_string_pretty(&evidence)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
         description = "Gracefully drain a backend, preventing new requests while allowing existing connections to finish"
     )]
     async fn rauta_drain_backend(
@@ -365,6 +379,7 @@ mod tests {
         ActionEvidence, ActionPrecondition, ActionResult, ActionRisk, ActionStatus,
         RollbackMetadata,
     };
+    use agent_api::ebpf::{TcpEvidenceMode, TcpHealthEvidenceSnapshot};
     use agent_api::ontology::{ActionKind, EntityKind, EntityRef};
     use agent_api::temporal::{GatewayDiff, TimelineSnapshot};
     use agent_api::types::{
@@ -493,6 +508,16 @@ mod tests {
                     value: 1.0,
                 }],
             }])
+        }
+
+        async fn tcp_health_evidence(&self) -> anyhow::Result<TcpHealthEvidenceSnapshot> {
+            self.record("tcp_health_evidence");
+            Ok(TcpHealthEvidenceSnapshot {
+                mode: TcpEvidenceMode::Unavailable,
+                available: false,
+                message: "disabled".to_string(),
+                signals: vec![],
+            })
         }
 
         async fn timeline(&self, query: TemporalQuery) -> anyhow::Result<TimelineSnapshot> {
@@ -719,6 +744,10 @@ mod tests {
             .rauta_list_listeners()
             .await
             .expect("list listeners succeeds");
+        handler
+            .rauta_tcp_health()
+            .await
+            .expect("tcp health succeeds");
 
         assert_eq!(
             query.calls(),
@@ -726,7 +755,8 @@ mod tests {
                 "list_circuit_breakers",
                 "list_rate_limiters",
                 "cache_stats",
-                "list_listeners"
+                "list_listeners",
+                "tcp_health_evidence"
             ]
         );
     }

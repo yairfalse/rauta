@@ -71,6 +71,7 @@ async fn handle_admin_request(
         ("GET", "/api/v1/rate-limiters") => handle_rate_limiters(&query).await,
         ("GET", "/api/v1/listeners") => handle_listeners(&query).await,
         ("GET", "/api/v1/metrics") => handle_metrics(&query).await,
+        ("GET", "/api/v1/ebpf/tcp-health") => handle_tcp_health(&query).await,
         ("GET", "/api/v1/timeline") => handle_timeline(&query, req.uri().query()).await,
         ("GET", "/api/v1/diff") => handle_diff(&query, req.uri().query()).await,
         ("POST", "/api/v1/backends/drain") => handle_drain(&query, req).await,
@@ -83,8 +84,17 @@ async fn handle_admin_request(
                 .and_then(|q| query_value(q, "symptom"))
                 .unwrap_or_else(|| "degraded".to_string());
             let since_seconds = query_string.and_then(query_u64("since_seconds"));
+            let route_filter = query_string.and_then(|q| query_value(q, "route"));
+            let backend_filter = query_string.and_then(|q| query_value(q, "backend"));
 
-            handle_diagnose(&query, &symptom, since_seconds).await
+            handle_diagnose(
+                &query,
+                &symptom,
+                route_filter.as_deref(),
+                backend_filter.as_deref(),
+                since_seconds,
+            )
+            .await
         }
         ("GET", "/healthz") => json_response(StatusCode::OK, r#"{"status":"ok"}"#),
         _ => json_response(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#),
@@ -121,6 +131,10 @@ async fn handle_listeners(query: &LocalGatewayQuery) -> Response<BoxBody<Bytes, 
 
 async fn handle_metrics(query: &LocalGatewayQuery) -> Response<BoxBody<Bytes, hyper::Error>> {
     query_response(query.metrics_snapshot(None).await)
+}
+
+async fn handle_tcp_health(query: &LocalGatewayQuery) -> Response<BoxBody<Bytes, hyper::Error>> {
+    query_response(query.tcp_health_evidence().await)
 }
 
 async fn handle_timeline(
@@ -190,11 +204,13 @@ async fn handle_quarantine(
 async fn handle_diagnose(
     query: &LocalGatewayQuery,
     symptom: &str,
+    route_filter: Option<&str>,
+    backend_filter: Option<&str>,
     since_seconds: Option<u64>,
 ) -> Response<BoxBody<Bytes, hyper::Error>> {
     query_response(
         query
-            .diagnose_since(symptom, None, None, since_seconds)
+            .diagnose_since(symptom, route_filter, backend_filter, since_seconds)
             .await,
     )
 }

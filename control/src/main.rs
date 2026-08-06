@@ -15,6 +15,7 @@ mod admin;
 mod apis;
 mod config;
 mod error;
+mod observability;
 mod proxy;
 
 use apis::gateway::endpointslice_watcher::watch_endpointslices;

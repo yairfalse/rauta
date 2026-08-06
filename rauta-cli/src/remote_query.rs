@@ -4,6 +4,7 @@
 //! Implements `GatewayQuery` trait so it can be used with the MCP handler.
 
 use agent_api::actions::ActionResult;
+use agent_api::ebpf::TcpHealthEvidenceSnapshot;
 use agent_api::query::GatewayQuery;
 use agent_api::temporal::{GatewayDiff, TemporalQuery, TimelineSnapshot};
 use agent_api::types::*;
@@ -42,9 +43,12 @@ impl RemoteGatewayQuery {
     pub async fn diagnose_since(
         &self,
         symptom: &str,
+        route_filter: Option<&str>,
+        backend_filter: Option<&str>,
         since_seconds: Option<u64>,
     ) -> anyhow::Result<Vec<Diagnosis>> {
-        GatewayQuery::diagnose_since(self, symptom, None, None, since_seconds).await
+        GatewayQuery::diagnose_since(self, symptom, route_filter, backend_filter, since_seconds)
+            .await
     }
 
     pub async fn drain_backend(
@@ -65,6 +69,10 @@ impl RemoteGatewayQuery {
         ttl_secs: u64,
     ) -> anyhow::Result<ActionResult> {
         GatewayQuery::quarantine_backend(self, backend, ttl_secs).await
+    }
+
+    pub async fn tcp_health_evidence(&self) -> anyhow::Result<TcpHealthEvidenceSnapshot> {
+        GatewayQuery::tcp_health_evidence(self).await
     }
 }
 
@@ -160,6 +168,12 @@ impl GatewayQuery for RemoteGatewayQuery {
         Ok(metrics)
     }
 
+    async fn tcp_health_evidence(&self) -> anyhow::Result<TcpHealthEvidenceSnapshot> {
+        let url = format!("{}/api/v1/ebpf/tcp-health", self.base_url);
+        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        Ok(resp.json().await?)
+    }
+
     async fn timeline(&self, query: TemporalQuery) -> anyhow::Result<TimelineSnapshot> {
         let url = format!("{}/api/v1/timeline", self.base_url);
         let resp = self
@@ -187,14 +201,21 @@ impl GatewayQuery for RemoteGatewayQuery {
     async fn diagnose(
         &self,
         symptom: &str,
-        _route_filter: Option<&str>,
-        _backend_filter: Option<&str>,
+        route_filter: Option<&str>,
+        backend_filter: Option<&str>,
     ) -> anyhow::Result<Vec<Diagnosis>> {
         let url = format!("{}/api/v1/diagnose", self.base_url);
+        let mut query = vec![("symptom".to_string(), symptom.to_string())];
+        if let Some(route) = route_filter {
+            query.push(("route".to_string(), route.to_string()));
+        }
+        if let Some(backend) = backend_filter {
+            query.push(("backend".to_string(), backend.to_string()));
+        }
         let resp = self
             .client
             .post(&url)
-            .query(&[("symptom", symptom)])
+            .query(&query)
             .send()
             .await?
             .error_for_status()?;
@@ -204,12 +225,18 @@ impl GatewayQuery for RemoteGatewayQuery {
     async fn diagnose_since(
         &self,
         symptom: &str,
-        _route_filter: Option<&str>,
-        _backend_filter: Option<&str>,
+        route_filter: Option<&str>,
+        backend_filter: Option<&str>,
         since_seconds: Option<u64>,
     ) -> anyhow::Result<Vec<Diagnosis>> {
         let url = format!("{}/api/v1/diagnose", self.base_url);
         let mut query = vec![("symptom".to_string(), symptom.to_string())];
+        if let Some(route) = route_filter {
+            query.push(("route".to_string(), route.to_string()));
+        }
+        if let Some(backend) = backend_filter {
+            query.push(("backend".to_string(), backend.to_string()));
+        }
         if let Some(seconds) = since_seconds {
             query.push(("since_seconds".to_string(), seconds.to_string()));
         }

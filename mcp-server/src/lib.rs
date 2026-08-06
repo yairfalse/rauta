@@ -19,6 +19,7 @@
 //! | `rauta_list_listeners` | Active listeners |
 //! | `rauta_timeline` | Recent events and compact snapshots |
 //! | `rauta_diff` | Semantic recent-state diff |
+//! | `rauta_tcp_health` | Optional TCP health evidence |
 //! | `rauta_drain_backend` | Graceful drain with before/after evidence |
 //! | `rauta_undrain_backend` | Cancel drain with before/after evidence |
 //! | `rauta_quarantine_backend` | Bounded backend quarantine with expiry |

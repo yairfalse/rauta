@@ -102,7 +102,11 @@ Diagnostic rules must preserve human-readable `evidence` and also attach `ontolo
 
 **Adding ontology or timeline behavior:** Use `agent-api/src/ontology.rs` for stable agent-facing entities and evidence. Use `agent-api/src/temporal.rs` for bounded recent-history contracts and keep `LocalGatewayQuery` retention finite. Keep eBPF as an optional evidence source that feeds ontology evidence, not as a required routing dependency.
 
+**Adding eBPF evidence:** Use `agent-api/src/ebpf.rs` for TCP evidence contracts and `control/src/observability/ebpf.rs` for sensor implementations. The default mode must be unavailable, mock mode must be deterministic, and Linux eBPF mode must be target-gated/capability-documented.
+
 **Adding safe actions:** Use `agent-api/src/actions.rs` for action responses. Mutating backend actions must validate preconditions, stay bounded by TTL/timeout, return before/after evidence plus rollback metadata, and emit a temporal admin-action event.
+
+**Adding proof/demo behavior:** Keep proof workflows command-reproducible. Prefer `rauta proof ...` CLI surfaces plus README commands over hidden scripts when the active scope does not include deploy or CI files.
 
 ## MCP Server (AI Agent Integration)
 

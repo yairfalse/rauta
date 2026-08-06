@@ -71,7 +71,7 @@ Three ways to talk to a running gateway. Same data model, different interfaces:
 
 ### MCP — for AI agents
 
-14 tools are defined for Claude Code, Cursor, or any MCP-compatible client:
+15 tools are defined for Claude Code, Cursor, or any MCP-compatible client:
 
 ```
 rauta_status                 rauta_list_routes           rauta_get_route
@@ -79,9 +79,10 @@ rauta_list_circuit_breakers  rauta_list_rate_limiters    rauta_diagnose
 rauta_drain_backend          rauta_undrain_backend       rauta_cache_stats
 rauta_list_listeners         rauta_metrics_snapshot      rauta_timeline
 rauta_diff                   rauta_quarantine_backend
+rauta_tcp_health
 ```
 
-Read paths such as status, routes, circuit breakers, rate limiters, listeners, cache stats, metrics, timeline, semantic diffs, and diagnostics are wired through the admin API. Mutating backend actions are bounded safe actions that return preconditions, before/after evidence, timeline event metadata, and rollback commands.
+Read paths such as status, routes, circuit breakers, rate limiters, listeners, cache stats, metrics, optional TCP health evidence, timeline, semantic diffs, and diagnostics are wired through the admin API. Mutating backend actions are bounded safe actions that return preconditions, before/after evidence, timeline event metadata, and rollback commands.
 
 ### CLI — for humans and scripts
 
@@ -94,8 +95,10 @@ rauta diagnose circuit-breaker-cascade --format=agent  # LLM-optimized
 rauta diagnose degraded --since-seconds=300 --format=agent
 rauta timeline --since-seconds=300            # recent events and compact snapshots
 rauta diff --since-seconds=300                # semantic recent-state diff
+rauta ebpf tcp-health --format=json           # optional TCP health evidence
 rauta backends drain 10.0.1.5:8080            # bounded drain with rollback metadata
 rauta backends quarantine 10.0.1.5:8080 --ttl=300
+rauta proof incident-demo                     # print reproducible Kind incident demo
 ```
 
 The `--format=agent` output includes `_meta` and `_hints` blocks designed for LLM consumption. The binary is also available as `kubectl-rauta`.
@@ -105,6 +108,7 @@ The `--format=agent` output includes `_meta` and `_hints` blocks designed for LL
 ```
 GET  /api/v1/status             GET  /api/v1/routes
 GET  /api/v1/cache              GET  /api/v1/metrics
+GET  /api/v1/ebpf/tcp-health
 GET  /api/v1/circuit-breakers   GET  /api/v1/rate-limiters
 GET  /api/v1/listeners          GET  /api/v1/timeline?since_seconds=300
 GET  /api/v1/diff?since_seconds=300
@@ -141,6 +145,8 @@ $ rauta diagnose circuit-breaker-cascade
 ```
 
 Agent-facing diagnostic responses also include `ontology_evidence`: schema-versioned entities and evidence attributes for routes, backends, listeners, circuit breakers, rate limiters, and cache state. Existing human-readable `evidence` strings remain for compatibility.
+
+Optional TCP evidence is controlled by `RAUTA_TCP_EVIDENCE_MODE`: `unavailable` (default), `mock`, or `linux-ebpf`. The Linux eBPF mode is target-gated and reports unavailable unless the process has the required Linux capabilities such as `CAP_BPF`/`CAP_PERFMON` or equivalent privileged execution; it never becomes a routing dependency.
 
 ---
 
@@ -231,6 +237,17 @@ make ci-local                                             # full CI
 
 Pre-commit and pre-push hooks enforce fmt, clippy, and tests.
 
+## Proof paths
+
+RAUTA proof should be reproducible from local commands:
+
+- Gateway API conformance status: HTTPRoute/Gateway parsing, listener validation, filters, retries, timeouts, backend refs, EndpointSlice updates, and TLS reference validation are covered by `cargo test -p control`. Unsupported or partial areas remain non-HTTP route kinds, full Gateway API upstream conformance harness automation, and service-mesh policy behavior.
+- Live oracle: run `cargo run -p oracle -- --help` for the live gateway oracle binary, or use `eval/k8s/oracle-job.yaml` for Kubernetes automation.
+- Hot-path benchmark: run `cargo bench -p control --bench hot_path` and preserve Criterion output as the benchmark artifact.
+- Incident demo: run `rauta proof incident-demo` to print the Kind workflow, or `rauta proof incident-demo --execute` to execute cluster create, CRD install, image build/load, deploy, traffic, safe action, failure injection, diagnosis, and recovery verification steps.
+
+The proof demo is intentionally command-driven. It does not hide local prerequisites: `kind`, `kubectl`, Docker, Cargo, `curl`, and network access for Gateway API CRD installation.
+
 ## Roadmap
 
 RAUTA's next major direction is agentic operation:
@@ -238,7 +255,7 @@ RAUTA's next major direction is agentic operation:
 - **Ontology** — versioned gateway entities and diagnostic evidence are now present; actions and causal links are the next expansion.
 - **Timeline** — bounded in-memory event journal, compact snapshot history, semantic diffs, and time-window diagnostics are present.
 - **Safe actions** — bounded drain, undrain, quarantine, and verification loops.
-- **eBPF evidence** — optional Linux kernel TCP signals feeding diagnostics.
+- **eBPF evidence** — optional TCP RTT, retransmit, reset, connection failure, and congestion signals feed ontology evidence and diagnostics without becoming a routing dependency.
 
 See [docs/README.md](docs/README.md) and [docs/plan-agentic-gateway.md](docs/plan-agentic-gateway.md).
 

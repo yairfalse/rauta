@@ -6,6 +6,7 @@
 //! 2. `RemoteGatewayQuery` (in rauta-cli crate) — HTTP/Unix socket client
 
 use crate::actions::ActionResult;
+use crate::ebpf::TcpHealthEvidenceSnapshot;
 use crate::temporal::{GatewayDiff, TemporalQuery, TimelineSnapshot};
 use crate::types::{
     CacheStats, CircuitBreakerSnapshot, Diagnosis, GatewaySnapshot, ListenerSnapshot,
@@ -54,6 +55,9 @@ pub trait GatewayQuery: Send + Sync {
         &self,
         metric_filter: Option<&str>,
     ) -> anyhow::Result<Vec<MetricSnapshot>>;
+
+    /// Optional TCP health evidence from userspace/mock/eBPF sensors
+    async fn tcp_health_evidence(&self) -> anyhow::Result<TcpHealthEvidenceSnapshot>;
 
     /// Read recent bounded temporal history
     async fn timeline(&self, query: TemporalQuery) -> anyhow::Result<TimelineSnapshot>;
