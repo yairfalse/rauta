@@ -4,7 +4,7 @@
 # 1. Build stage: Compile control plane
 # 2. Runtime stage: Minimal image for testing
 
-FROM rust:1.83-bookworm as builder
+FROM rust:1.88-bookworm AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -17,25 +17,13 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /rauta
 
-# Copy workspace manifests first (for caching)
+# Copy everything needed to build
 COPY Cargo.toml Cargo.lock ./
-COPY common/Cargo.toml common/Cargo.toml
-COPY control/Cargo.toml control/Cargo.toml
-
-# Create dummy source files to cache dependencies
-RUN mkdir -p common/src control/src && \
-    echo "pub fn dummy() {}" > common/src/lib.rs && \
-    echo "fn main() {}" > control/src/main.rs
-
-# Build dependencies (this layer will be cached)
-RUN cargo build --release -p control || true
-
-# Remove dummy files
-RUN rm -rf common/src control/src
-
-# Copy actual source code
-COPY common/src common/src
-COPY control/src control/src
+COPY common/ common/
+COPY control/ control/
+COPY agent-api/ agent-api/
+COPY mcp-server/ mcp-server/
+COPY rauta-cli/ rauta-cli/
 
 # Build control plane
 RUN cargo build --release -p control

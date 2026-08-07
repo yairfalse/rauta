@@ -13,7 +13,7 @@ use arc_swap::ArcSwap;
 use common::{fnv1a_hash, maglev_build_compact_table, maglev_lookup_compact, Backend, HttpMethod};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 use tracing::warn;
@@ -138,6 +138,8 @@ fn get_cached_regex(pattern: &str) -> Option<Arc<Regex>> {
 ///
 /// Filters are wrapped in `Arc` so that constructing a `RouteMatch` is a cheap
 /// `Arc::clone` (~1ns atomic increment) instead of deep-cloning filter vecs.
+/// `Clone` is derived for RCU clone-modify-swap on the write path.
+#[derive(Clone)]
 struct Route {
     pattern: Arc<str>,
     backends: Vec<Backend>,
@@ -216,6 +218,17 @@ struct RouteKey {
     path_hash: u64,
 }
 
+/// Immutable route snapshot — loaded via `ArcSwap::load()` on every request.
+///
+/// Contains the routes HashMap and the matchit prefix router.
+/// Never mutated in place — writers clone routes, modify, rebuild prefix router, swap.
+struct RouteSnapshot {
+    /// Exact match: RouteKey → Route
+    routes: HashMap<RouteKey, Route>,
+    /// Prefix match: radix tree with method-prefixed paths
+    prefix_router: matchit::Router<RouteKey>,
+}
+
 /// HTTP Router - selects backend for incoming requests
 ///
 /// Uses hybrid matching strategy:
@@ -224,118 +237,21 @@ struct RouteKey {
 /// - Passive health checking (circuit breaker for unhealthy backends)
 /// - Active health checking (TCP probes with Prometheus metrics)
 ///
-/// Health data uses `ArcSwap` for lock-free reads on the hot path.
-/// Route data still uses `RwLock` (read-heavy, rarely written by K8s reconcilers).
+/// All route data uses `ArcSwap` for lock-free reads on the hot path.
+/// `select_backend()` acquires zero locks — just 2 atomic loads (routes + health).
 pub struct Router {
-    routes: Arc<RwLock<HashMap<RouteKey, Route>>>,
-    prefix_router: Arc<RwLock<matchit::Router<RouteKey>>>,
+    /// Route data — immutable snapshot, lock-free reads via ArcSwap.
+    /// Writers clone routes HashMap, modify, rebuild prefix_router, atomic swap.
+    route_data: ArcSwap<RouteSnapshot>,
+    /// Serializes write operations (only K8s reconcilers, never hot path)
+    write_lock: Mutex<()>,
     /// Lock-free health data (backend health + draining state)
-    /// ArcSwap::load() is a single atomic load (~1ns) vs RwLock::read() (~20ns)
     health: ArcSwap<HealthData>,
     /// Active health checker (TCP probes)
     health_checker: Arc<HealthChecker>,
-    /// Route lookup cache: (method, path_hash) -> RouteKey
-    /// Provides O(1) lookup for hot paths, avoiding prefix router traversal
-    route_cache: Arc<RwLock<RouteLruCache>>,
 }
 
-/// LRU cache for route lookups with hit/miss statistics
-struct RouteLruCache {
-    /// Cache entries: path_hash -> (RouteKey, access_order)
-    entries: HashMap<RouteKey, CacheEntry>,
-    /// Access order for LRU eviction (most recent at back)
-    access_order: VecDeque<RouteKey>,
-    /// Cache statistics
-    hits: u64,
-    misses: u64,
-    /// Maximum cache size
-    max_size: usize,
-}
-
-struct CacheEntry {
-    /// The resolved route key (for prefix matches)
-    resolved_key: RouteKey,
-}
-
-const ROUTE_CACHE_MAX_SIZE: usize = 128;
-
-impl RouteLruCache {
-    fn new(max_size: usize) -> Self {
-        Self {
-            entries: HashMap::with_capacity(max_size),
-            access_order: VecDeque::with_capacity(max_size),
-            hits: 0,
-            misses: 0,
-            max_size,
-        }
-    }
-
-    /// Get cached route key, returns None on miss
-    fn get(&mut self, key: &RouteKey) -> Option<RouteKey> {
-        if let Some(entry) = self.entries.get(key) {
-            self.hits += 1;
-            // Move to back of access order (most recently used)
-            if let Some(pos) = self.access_order.iter().position(|k| k == key) {
-                self.access_order.remove(pos);
-            }
-            self.access_order.push_back(*key);
-            Some(entry.resolved_key)
-        } else {
-            self.misses += 1;
-            None
-        }
-    }
-
-    /// Insert or update cache entry with LRU eviction
-    fn insert(&mut self, lookup_key: RouteKey, resolved_key: RouteKey) {
-        // If already present, just update
-        if self.entries.contains_key(&lookup_key) {
-            if let Some(entry) = self.entries.get_mut(&lookup_key) {
-                entry.resolved_key = resolved_key;
-            }
-            return;
-        }
-
-        // Evict oldest entry if at capacity
-        if self.entries.len() >= self.max_size {
-            if let Some(oldest) = self.access_order.pop_front() {
-                self.entries.remove(&oldest);
-            }
-        }
-
-        // Insert new entry
-        self.entries.insert(lookup_key, CacheEntry { resolved_key });
-        self.access_order.push_back(lookup_key);
-    }
-
-    /// Invalidate a specific key (e.g., when route is updated)
-    fn invalidate(&mut self, key: &RouteKey) {
-        self.entries.remove(key);
-        if let Some(pos) = self.access_order.iter().position(|k| k == key) {
-            self.access_order.remove(pos);
-        }
-    }
-
-    /// Clear all cache entries (e.g., when routes are rebuilt)
-    #[allow(dead_code)] // For future use when full route table is rebuilt
-    fn clear(&mut self) {
-        self.entries.clear();
-        self.access_order.clear();
-        // Don't reset stats - they're useful for monitoring
-    }
-
-    /// Get cache statistics
-    #[allow(dead_code)] // Reserved for future /metrics endpoint
-    fn stats(&self) -> (u64, u64) {
-        (self.hits, self.misses)
-    }
-
-    /// Get current cache size
-    #[allow(dead_code)] // Reserved for future /metrics endpoint
-    fn size(&self) -> usize {
-        self.entries.len()
-    }
-}
+// LRU cache removed — ArcSwap::load() (~1ns) is faster than cache lookup under write lock (~20ns)
 
 impl Default for Router {
     fn default() -> Self {
@@ -344,12 +260,15 @@ impl Default for Router {
         use prometheus::Registry;
         let registry = Registry::new();
 
+        let empty_snapshot = RouteSnapshot {
+            routes: HashMap::new(),
+            prefix_router: matchit::Router::new(),
+        };
         Self {
-            routes: Arc::new(RwLock::new(HashMap::new())),
-            prefix_router: Arc::new(RwLock::new(matchit::Router::new())),
+            route_data: ArcSwap::from_pointee(empty_snapshot),
+            write_lock: Mutex::new(()),
             health: ArcSwap::from_pointee(HealthData::new()),
             health_checker: Arc::new(HealthChecker::new(HealthCheckConfig::default(), &registry)),
-            route_cache: Arc::new(RwLock::new(RouteLruCache::new(ROUTE_CACHE_MAX_SIZE))),
         }
     }
 }
@@ -361,59 +280,93 @@ impl Router {
     }
 
     /// Create router with custom health check configuration
-    ///
-    /// Used for testing and production deployments where health checking
-    /// needs to be explicitly enabled or configured.
-    #[allow(dead_code)] // Used by tests and main.rs
+    #[allow(dead_code)]
     pub fn with_health_config(
         health_config: HealthCheckConfig,
         registry: &prometheus::Registry,
     ) -> Self {
+        let empty_snapshot = RouteSnapshot {
+            routes: HashMap::new(),
+            prefix_router: matchit::Router::new(),
+        };
         Self {
-            routes: Arc::new(RwLock::new(HashMap::new())),
-            prefix_router: Arc::new(RwLock::new(matchit::Router::new())),
+            route_data: ArcSwap::from_pointee(empty_snapshot),
+            write_lock: Mutex::new(()),
             health: ArcSwap::from_pointee(HealthData::new()),
             health_checker: Arc::new(HealthChecker::new(health_config, registry)),
-            route_cache: Arc::new(RwLock::new(RouteLruCache::new(ROUTE_CACHE_MAX_SIZE))),
         }
     }
 
-    /// Get route cache statistics (hits, misses)
-    ///
-    /// Useful for monitoring cache effectiveness.
-    /// Hit ratio = hits / (hits + misses)
-    #[allow(dead_code)] // Reserved for future /metrics endpoint
-    pub fn get_cache_stats(&self) -> (u64, u64) {
-        let cache = safe_read(&self.route_cache);
-        cache.stats()
-    }
-
-    /// Get current route cache size
-    ///
-    /// Returns the number of entries currently in the cache.
-    #[allow(dead_code)] // Reserved for future /metrics endpoint
-    pub fn get_cache_size(&self) -> usize {
-        let cache = safe_read(&self.route_cache);
-        cache.size()
-    }
-
     /// Get number of configured routes
-    ///
-    /// Returns the total number of routes currently registered.
     pub fn route_count(&self) -> usize {
-        let routes = safe_read(&self.routes);
-        routes.len()
+        let snapshot = self.route_data.load();
+        snapshot.routes.len()
+    }
+
+    /// Build prefix router from routes HashMap (used during write path)
+    fn build_prefix_router(
+        routes: &HashMap<RouteKey, Route>,
+    ) -> Result<matchit::Router<RouteKey>, String> {
+        let mut prefix_router = matchit::Router::new();
+        for (route_key, route) in routes.iter() {
+            let path_str = route.pattern.as_ref();
+            let method_prefix = get_method_prefix(route_key.method);
+
+            let method_prefixed_path = if method_prefix.is_empty() {
+                path_str.to_string()
+            } else {
+                format!("{}{}", method_prefix, path_str)
+            };
+
+            prefix_router
+                .insert(method_prefixed_path, *route_key)
+                .map_err(|e| format!("Failed to add exact route {}: {}", path_str, e))?;
+
+            let prefix_pattern = if path_str == "/" {
+                format!("{}/{{*rest}}", method_prefix)
+            } else {
+                format!(
+                    "{}{}/{{*rest}}",
+                    method_prefix,
+                    path_str.trim_end_matches('/')
+                )
+            };
+
+            prefix_router
+                .insert(prefix_pattern, *route_key)
+                .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
+        }
+        Ok(prefix_router)
+    }
+
+    /// Clone-modify-swap helper for write operations.
+    /// Clones the routes HashMap, applies the modification, rebuilds the prefix
+    /// router, and atomically swaps the snapshot. Serialized via write_lock.
+    fn modify_routes<F>(&self, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut HashMap<RouteKey, Route>),
+    {
+        let _guard = safe_lock(&self.write_lock);
+        let current = self.route_data.load();
+        let mut new_routes = current.routes.clone();
+        f(&mut new_routes);
+        let prefix_router = Self::build_prefix_router(&new_routes)?;
+        self.route_data.store(Arc::new(RouteSnapshot {
+            routes: new_routes,
+            prefix_router,
+        }));
+        Ok(())
     }
 
     /// List all configured routes as agent-api snapshots
     ///
-    /// Reads the route table under a brief read lock and converts internal
-    /// Route structs to public RouteSnapshot types for the admin API/CLI/MCP.
+    /// Lock-free read via ArcSwap::load().
     pub fn list_routes(&self) -> Vec<agent_api::types::RouteSnapshot> {
-        let routes = safe_read(&self.routes);
+        let snapshot = self.route_data.load();
         let health_snapshot = self.health.load();
 
-        routes
+        snapshot
+            .routes
             .iter()
             .map(|(key, route)| {
                 let method_str = match key.method {
@@ -476,8 +429,7 @@ impl Router {
     /// Add or update route with backends (idempotent)
     ///
     /// If the route already exists with the same backends, this is a no-op.
-    /// If the route exists with different backends, it's updated.
-    /// If the route doesn't exist, it's created.
+    /// Uses clone-modify-swap via ArcSwap — readers never block.
     pub fn add_route(
         &self,
         method: HttpMethod,
@@ -487,108 +439,38 @@ impl Router {
         let path_hash = fnv1a_hash(path.as_bytes());
         let key = RouteKey { method, path_hash };
 
-        // Check if route already exists with same backends (idempotent fast path)
+        // Idempotent check (lock-free read)
         {
-            let routes = safe_read(&self.routes);
-            if let Some(existing) = routes.get(&key) {
-                // Compare backends by content (O(n) Vec comparison; can be expensive for large backend lists)
+            let snapshot = self.route_data.load();
+            if let Some(existing) = snapshot.routes.get(&key) {
                 if existing.backends.len() == backends.len() && existing.backends == backends {
-                    // Route already exists with same backends - no-op
                     return Ok(());
                 }
             }
         }
 
-        // Build Maglev table for this route
-        let maglev_table = maglev_build_compact_table(&backends);
-
-        // Start active health checking for backends (if enabled in config)
+        // Start active health checking for backends
         self.health_checker
             .start_checking(backends.clone(), path.to_string());
 
+        let maglev_table = maglev_build_compact_table(&backends);
         let route = Route {
-            pattern: Arc::from(path), // Convert to Arc<str> once during route setup
+            pattern: Arc::from(path),
             backends,
             maglev_table,
-            header_matches: Vec::new(), // No header matching for basic routes
-            method_matches: None,       // No method constraints (match all methods)
-            query_param_matches: Vec::new(), // No query param constraints
-            request_filters: None,      // No request header filters
-            response_filters: None,     // No response header filters
-            redirect: None,             // No redirect filter
-            timeout: None,              // No timeout configuration
-            retry: None,                // No retry configuration
+            header_matches: Vec::new(),
+            method_matches: None,
+            query_param_matches: Vec::new(),
+            request_filters: None,
+            response_filters: None,
+            redirect: None,
+            timeout: None,
+            retry: None,
         };
 
-        // Update routes HashMap (minimize write lock duration)
-        {
-            let mut routes = safe_write(&self.routes);
+        self.modify_routes(|routes| {
             routes.insert(key, route);
-        } // Drop write lock immediately - allows concurrent lookups during rebuild
-
-        // Rebuild matchit router from scratch (since matchit doesn't support updates)
-        // Hold read lock during rebuild to allow concurrent route lookups
-        // This is O(n) but acceptable for typical K8s Ingress scale (<1000 routes)
-        let mut new_prefix_router = matchit::Router::new();
-        {
-            let routes = safe_read(&self.routes);
-            for (route_key, route) in routes.iter() {
-                let path_str = route.pattern.as_ref();
-
-                // Make path unique per HTTP method by prepending method
-                // This allows POST /api and GET /api to coexist
-                let method_prefix = match route_key.method {
-                    HttpMethod::GET => "GET:",
-                    HttpMethod::POST => "POST:",
-                    HttpMethod::PUT => "PUT:",
-                    HttpMethod::DELETE => "DELETE:",
-                    HttpMethod::PATCH => "PATCH:",
-                    HttpMethod::HEAD => "HEAD:",
-                    HttpMethod::OPTIONS => "OPTIONS:",
-                    HttpMethod::ALL => "",
-                };
-
-                let method_prefixed_path = if method_prefix.is_empty() {
-                    path_str.to_string()
-                } else {
-                    format!("{}{}", method_prefix, path_str)
-                };
-
-                // Add exact path
-                new_prefix_router
-                    .insert(method_prefixed_path.clone(), *route_key)
-                    .map_err(|e| format!("Failed to add exact route {}: {}", path_str, e))?;
-
-                // Add prefix wildcard (matchit syntax: {*rest})
-                let prefix_pattern = if path_str == "/" {
-                    format!("{}{{*rest}}", method_prefix)
-                } else {
-                    format!(
-                        "{}{}/{{*rest}}",
-                        method_prefix,
-                        path_str.trim_end_matches('/')
-                    )
-                };
-
-                new_prefix_router
-                    .insert(prefix_pattern, *route_key)
-                    .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
-            }
-        } // Drop read lock
-
-        // Swap in new prefix router atomically (brief write lock)
-        {
-            let mut prefix_router = safe_write(&self.prefix_router);
-            *prefix_router = new_prefix_router;
-        }
-
-        // Invalidate route cache for this key (the route was added/updated)
-        {
-            let mut cache = safe_write(&self.route_cache);
-            cache.invalidate(&key);
-        }
-
-        Ok(())
+        })
     }
 
     /// Update backends for an existing route
@@ -662,11 +544,10 @@ impl Router {
         self.health.store(Arc::new(new_health));
     }
 
-    /// Select backend for request
+    /// Select backend for request — **zero locks on the hot path**.
     ///
-    /// Tries LRU cache first (O(1)), then exact match (O(1)), then prefix match (O(log n)).
-    /// Uses Maglev consistent hashing for backend selection.
-    /// Returns backend + matched route pattern for metrics.
+    /// Loads the immutable route snapshot via ArcSwap (1 atomic load, ~1ns),
+    /// then does exact match (O(1)) → prefix match (O(log n)) → Maglev → health check.
     pub fn select_backend(
         &self,
         method: HttpMethod,
@@ -677,75 +558,28 @@ impl Router {
         let path_hash = fnv1a_hash(path.as_bytes());
         let key = RouteKey { method, path_hash };
 
-        // Try LRU cache first (O(1) for hot paths)
-        let cached_key = {
-            let mut cache = safe_write(&self.route_cache);
-            cache.get(&key)
-        };
+        // Single atomic load — entire route table as immutable snapshot
+        let snapshot = self.route_data.load();
 
-        let route_key = if let Some(cached) = cached_key {
-            // Cache hit - use cached route key
-            cached
-        } else {
-            // Cache miss - do normal lookup
-            let resolved_key = {
-                let routes = safe_read(&self.routes);
-                if routes.contains_key(&key) {
-                    // Exact match with specific method
-                    Some(key)
-                } else if method != HttpMethod::ALL {
-                    // Try HttpMethod::ALL fallback for exact match (O(1))
-                    // Gateway API: routes without method constraints match all methods
-                    let all_key = RouteKey {
-                        method: HttpMethod::ALL,
-                        path_hash,
-                    };
-                    if routes.contains_key(&all_key) {
-                        Some(all_key)
-                    } else {
-                        // Fall through to prefix match
-                        None
-                    }
-                } else {
-                    None
-                }
-                .or_else(|| {
-                    // Prefix match via matchit with method-aware routing
-                    let method_prefix = get_method_prefix(method);
-                    let method_prefixed_path = if method_prefix.is_empty() {
-                        path.to_string()
-                    } else {
-                        format!("{}{}", method_prefix, path)
-                    };
-
-                    let prefix_router = safe_read(&self.prefix_router);
-                    let found_key = prefix_router
-                        .at(&method_prefixed_path)
-                        .ok()
-                        .map(|m| *m.value);
-
-                    // If no match with specific method, try HttpMethod::ALL (wildcard)
-                    // This implements Gateway API behavior: routes without method constraints match all methods
-                    if found_key.is_none() && method != HttpMethod::ALL {
-                        prefix_router.at(path).ok().map(|m| *m.value)
-                    } else {
-                        found_key
-                    }
-                })
+        // Exact match (O(1))
+        let route_key = if snapshot.routes.contains_key(&key) {
+            key
+        } else if method != HttpMethod::ALL {
+            let all_key = RouteKey {
+                method: HttpMethod::ALL,
+                path_hash,
             };
-
-            // Cache the result for future lookups
-            if let Some(resolved) = resolved_key {
-                let mut cache = safe_write(&self.route_cache);
-                cache.insert(key, resolved);
+            if snapshot.routes.contains_key(&all_key) {
+                all_key
+            } else {
+                // Prefix match (O(log n))
+                self.prefix_match(&snapshot, method, path)?
             }
-
-            resolved_key?
+        } else {
+            self.prefix_match(&snapshot, method, path)?
         };
 
-        // Look up route
-        let routes = safe_read(&self.routes);
-        let route = routes.get(&route_key)?;
+        let route = snapshot.routes.get(&route_key)?;
 
         // GREEN phase: Check method constraints (Gateway API)
         if let Some(method_matches) = &route.method_matches {
@@ -820,6 +654,34 @@ impl Router {
 
         // All backends are either unhealthy or draining
         None
+    }
+
+    /// Prefix match against the snapshot's radix tree
+    fn prefix_match(
+        &self,
+        snapshot: &RouteSnapshot,
+        method: HttpMethod,
+        path: &str,
+    ) -> Option<RouteKey> {
+        let method_prefix = get_method_prefix(method);
+        let method_prefixed_path = if method_prefix.is_empty() {
+            path.to_string()
+        } else {
+            format!("{}{}", method_prefix, path)
+        };
+
+        let found_key = snapshot
+            .prefix_router
+            .at(&method_prefixed_path)
+            .ok()
+            .map(|m| *m.value);
+
+        // Fallback to HttpMethod::ALL wildcard
+        if found_key.is_none() && method != HttpMethod::ALL {
+            snapshot.prefix_router.at(path).ok().map(|m| *m.value)
+        } else {
+            found_key
+        }
     }
 
     /// Compute flow hash for load balancing
@@ -897,41 +759,9 @@ impl Router {
             retry: None,                     // No retry configuration
         };
 
-        // Update routes HashMap
-        {
-            let mut routes = safe_write(&self.routes);
+        self.modify_routes(|routes| {
             routes.insert(key, route);
-        }
-
-        // Rebuild matchit router (same as add_route)
-        let mut new_prefix_router = matchit::Router::new();
-        {
-            let routes = safe_read(&self.routes);
-            for (route_key, route) in routes.iter() {
-                let path_str = route.pattern.as_ref();
-
-                new_prefix_router
-                    .insert(path_str.to_string(), *route_key)
-                    .map_err(|e| format!("Failed to add exact route {}: {}", path_str, e))?;
-
-                let prefix_pattern = if path_str == "/" {
-                    "/{*rest}".to_string()
-                } else {
-                    format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
-                };
-
-                new_prefix_router
-                    .insert(prefix_pattern, *route_key)
-                    .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
-            }
-        }
-
-        {
-            let mut prefix_router = safe_write(&self.prefix_router);
-            *prefix_router = new_prefix_router;
-        }
-
-        Ok(())
+        })
     }
 
     /// Add route with method matching support (Gateway API conformance)
@@ -964,41 +794,9 @@ impl Router {
             retry: None,                          // No retry configuration
         };
 
-        // Update routes HashMap
-        {
-            let mut routes = safe_write(&self.routes);
+        self.modify_routes(|routes| {
             routes.insert(key, route);
-        }
-
-        // Rebuild matchit router (same as add_route)
-        let mut new_prefix_router = matchit::Router::new();
-        {
-            let routes = safe_read(&self.routes);
-            for (route_key, route) in routes.iter() {
-                let path_str = route.pattern.as_ref();
-
-                new_prefix_router
-                    .insert(path_str.to_string(), *route_key)
-                    .map_err(|e| format!("Failed to add exact route {}: {}", path_str, e))?;
-
-                let prefix_pattern = if path_str == "/" {
-                    "/{*rest}".to_string()
-                } else {
-                    format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
-                };
-
-                new_prefix_router
-                    .insert(prefix_pattern, *route_key)
-                    .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
-            }
-        }
-
-        {
-            let mut prefix_router = safe_write(&self.prefix_router);
-            *prefix_router = new_prefix_router;
-        }
-
-        Ok(())
+        })
     }
 
     /// Add route with query parameter matching support (Gateway API conformance)
@@ -1031,41 +829,9 @@ impl Router {
             retry: None,                // No retry configuration
         };
 
-        // Update routes HashMap
-        {
-            let mut routes = safe_write(&self.routes);
+        self.modify_routes(|routes| {
             routes.insert(key, route);
-        }
-
-        // Rebuild matchit router (same as add_route)
-        let mut new_prefix_router = matchit::Router::new();
-        {
-            let routes = safe_read(&self.routes);
-            for (route_key, route) in routes.iter() {
-                let path_str = route.pattern.as_ref();
-
-                new_prefix_router
-                    .insert(path_str.to_string(), *route_key)
-                    .map_err(|e| format!("Failed to add exact route {}: {}", path_str, e))?;
-
-                let prefix_pattern = if path_str == "/" {
-                    "/{*rest}".to_string()
-                } else {
-                    format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
-                };
-
-                new_prefix_router
-                    .insert(prefix_pattern, *route_key)
-                    .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
-            }
-        }
-
-        {
-            let mut prefix_router = safe_write(&self.prefix_router);
-            *prefix_router = new_prefix_router;
-        }
-
-        Ok(())
+        })
     }
 
     /// Add route with request header filters (Gateway API HTTPRouteBackendRequestHeaderModification)
@@ -1098,42 +864,9 @@ impl Router {
             retry: None,                     // No retry configuration
         };
 
-        // Update routes HashMap
-        {
-            let mut routes = safe_write(&self.routes);
+        self.modify_routes(|routes| {
             routes.insert(key, route);
-        }
-
-        // Rebuild matchit router from scratch (since matchit doesn't support updates)
-        let routes = safe_read(&self.routes);
-        let mut new_prefix_router = matchit::Router::new();
-
-        for (route_key, route) in routes.iter() {
-            let path_str = route.pattern.as_ref();
-
-            // Add exact match route
-            new_prefix_router
-                .insert(path_str.to_string(), *route_key)
-                .map_err(|e| format!("Failed to add route {}: {}", path_str, e))?;
-
-            // Add prefix match route (/{*rest} pattern)
-            let prefix_pattern = if path_str == "/" {
-                "/{*rest}".to_string()
-            } else {
-                format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
-            };
-
-            new_prefix_router
-                .insert(prefix_pattern, *route_key)
-                .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
-        }
-
-        {
-            let mut prefix_router = safe_write(&self.prefix_router);
-            *prefix_router = new_prefix_router;
-        }
-
-        Ok(())
+        })
     }
 
     /// Add route with response header filters (Gateway API HTTPRouteBackendResponseHeaderModification)
@@ -1166,42 +899,9 @@ impl Router {
             retry: None,                               // No retry configuration
         };
 
-        // Update routes HashMap
-        {
-            let mut routes = safe_write(&self.routes);
+        self.modify_routes(|routes| {
             routes.insert(key, route);
-        }
-
-        // Rebuild matchit router from scratch (since matchit doesn't support updates)
-        let routes = safe_read(&self.routes);
-        let mut new_prefix_router = matchit::Router::new();
-
-        for (route_key, route) in routes.iter() {
-            let path_str = route.pattern.as_ref();
-
-            // Add exact match route
-            new_prefix_router
-                .insert(path_str.to_string(), *route_key)
-                .map_err(|e| format!("Failed to add route {}: {}", path_str, e))?;
-
-            // Add prefix match route (/{*rest} pattern)
-            let prefix_pattern = if path_str == "/" {
-                "/{*rest}".to_string()
-            } else {
-                format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
-            };
-
-            new_prefix_router
-                .insert(prefix_pattern, *route_key)
-                .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
-        }
-
-        {
-            let mut prefix_router = safe_write(&self.prefix_router);
-            *prefix_router = new_prefix_router;
-        }
-
-        Ok(())
+        })
     }
 
     /// Add route with redirect filter (Gateway API HTTPRequestRedirectFilter - Core feature)
@@ -1234,42 +934,9 @@ impl Router {
             retry: None,                               // No retry configuration
         };
 
-        // Update routes HashMap
-        {
-            let mut routes = safe_write(&self.routes);
+        self.modify_routes(|routes| {
             routes.insert(key, route);
-        }
-
-        // Rebuild matchit router from scratch (since matchit doesn't support updates)
-        let routes = safe_read(&self.routes);
-        let mut new_prefix_router = matchit::Router::new();
-
-        for (route_key, route) in routes.iter() {
-            let path_str = route.pattern.as_ref();
-
-            // Add exact match route
-            new_prefix_router
-                .insert(path_str.to_string(), *route_key)
-                .map_err(|e| format!("Failed to add route {}: {}", path_str, e))?;
-
-            // Add prefix match route (/{*rest} pattern)
-            let prefix_pattern = if path_str == "/" {
-                "/{*rest}".to_string()
-            } else {
-                format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
-            };
-
-            new_prefix_router
-                .insert(prefix_pattern, *route_key)
-                .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
-        }
-
-        {
-            let mut prefix_router = safe_write(&self.prefix_router);
-            *prefix_router = new_prefix_router;
-        }
-
-        Ok(())
+        })
     }
 
     /// Add route with timeout configuration (Gateway API HTTPRouteTimeouts - Extended feature)
@@ -1304,42 +971,9 @@ impl Router {
             retry: None,                             // No retry configuration
         };
 
-        // Update routes HashMap
-        {
-            let mut routes = safe_write(&self.routes);
+        self.modify_routes(|routes| {
             routes.insert(key, route);
-        }
-
-        // Rebuild matchit router from scratch (since matchit doesn't support updates)
-        let routes = safe_read(&self.routes);
-        let mut new_prefix_router = matchit::Router::new();
-
-        for (route_key, route) in routes.iter() {
-            let path_str = route.pattern.as_ref();
-
-            // Add exact match route
-            new_prefix_router
-                .insert(path_str.to_string(), *route_key)
-                .map_err(|e| format!("Failed to add route {}: {}", path_str, e))?;
-
-            // Add prefix match route (/{*rest} pattern)
-            let prefix_pattern = if path_str == "/" {
-                "/{*rest}".to_string()
-            } else {
-                format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
-            };
-
-            new_prefix_router
-                .insert(prefix_pattern, *route_key)
-                .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
-        }
-
-        {
-            let mut prefix_router = safe_write(&self.prefix_router);
-            *prefix_router = new_prefix_router;
-        }
-
-        Ok(())
+        })
     }
 
     /// Add route with retry configuration (Gateway API HTTPRouteRetry - Extended feature)
@@ -1374,40 +1008,9 @@ impl Router {
             retry: Some(Arc::new(retry_config)), // Store retry config for server.rs to use
         };
 
-        // Update routes HashMap
-        {
-            let mut routes = safe_write(&self.routes);
+        self.modify_routes(|routes| {
             routes.insert(key, route);
-        }
-
-        // Rebuild matchit router from scratch
-        let routes = safe_read(&self.routes);
-        let mut new_prefix_router = matchit::Router::new();
-
-        for (route_key, route) in routes.iter() {
-            let path_str = route.pattern.as_ref();
-
-            new_prefix_router
-                .insert(path_str.to_string(), *route_key)
-                .map_err(|e| format!("Failed to add route {}: {}", path_str, e))?;
-
-            let prefix_pattern = if path_str == "/" {
-                "/{*rest}".to_string()
-            } else {
-                format!("{}/{{*rest}}", path_str.trim_end_matches('/'))
-            };
-
-            new_prefix_router
-                .insert(prefix_pattern, *route_key)
-                .map_err(|e| format!("Failed to add prefix route {}: {}", path_str, e))?;
-        }
-
-        {
-            let mut prefix_router = safe_write(&self.prefix_router);
-            *prefix_router = new_prefix_router;
-        }
-
-        Ok(())
+        })
     }
 
     /// Select backend with header matching support (Gateway API conformance)
@@ -1428,38 +1031,36 @@ impl Router {
         let path_hash = fnv1a_hash(path.as_bytes());
         let key = RouteKey { method, path_hash };
 
+        let snapshot = self.route_data.load();
+
         // Try exact match first, then prefix match (same as select_backend)
-        let route_key = {
-            let routes = safe_read(&self.routes);
-            if routes.contains_key(&key) {
-                Some(key)
+        let route_key = if snapshot.routes.contains_key(&key) {
+            Some(key)
+        } else {
+            // Prefix match via matchit with method-aware routing
+            let method_prefix = get_method_prefix(method);
+            let method_prefixed_path = if method_prefix.is_empty() {
+                path.to_string()
             } else {
-                // Prefix match via matchit with method-aware routing
-                let method_prefix = get_method_prefix(method);
-                let method_prefixed_path = if method_prefix.is_empty() {
-                    path.to_string()
-                } else {
-                    format!("{}{}", method_prefix, path)
-                };
+                format!("{}{}", method_prefix, path)
+            };
 
-                let prefix_router = safe_read(&self.prefix_router);
-                let found_key = prefix_router
-                    .at(&method_prefixed_path)
-                    .ok()
-                    .map(|m| *m.value);
+            let found_key = snapshot
+                .prefix_router
+                .at(&method_prefixed_path)
+                .ok()
+                .map(|m| *m.value);
 
-                // If no match with specific method, try HttpMethod::ALL (wildcard)
-                if found_key.is_none() && method != HttpMethod::ALL {
-                    prefix_router.at(path).ok().map(|m| *m.value)
-                } else {
-                    found_key
-                }
+            // If no match with specific method, try HttpMethod::ALL (wildcard)
+            if found_key.is_none() && method != HttpMethod::ALL {
+                snapshot.prefix_router.at(path).ok().map(|m| *m.value)
+            } else {
+                found_key
             }
         }?;
 
         // Look up route
-        let routes = safe_read(&self.routes);
-        let route = routes.get(&route_key)?;
+        let route = snapshot.routes.get(&route_key)?;
 
         // Check header matches (ALL must match - AND logic)
         if !route.header_matches.is_empty()
@@ -1531,38 +1132,36 @@ impl Router {
         let path_hash = fnv1a_hash(path.as_bytes());
         let key = RouteKey { method, path_hash };
 
+        let snapshot = self.route_data.load();
+
         // Try exact match first, then prefix match (same as select_backend)
-        let route_key = {
-            let routes = safe_read(&self.routes);
-            if routes.contains_key(&key) {
-                Some(key)
+        let route_key = if snapshot.routes.contains_key(&key) {
+            Some(key)
+        } else {
+            // Prefix match via matchit with method-aware routing
+            let method_prefix = get_method_prefix(method);
+            let method_prefixed_path = if method_prefix.is_empty() {
+                path.to_string()
             } else {
-                // Prefix match via matchit with method-aware routing
-                let method_prefix = get_method_prefix(method);
-                let method_prefixed_path = if method_prefix.is_empty() {
-                    path.to_string()
-                } else {
-                    format!("{}{}", method_prefix, path)
-                };
+                format!("{}{}", method_prefix, path)
+            };
 
-                let prefix_router = safe_read(&self.prefix_router);
-                let found_key = prefix_router
-                    .at(&method_prefixed_path)
-                    .ok()
-                    .map(|m| *m.value);
+            let found_key = snapshot
+                .prefix_router
+                .at(&method_prefixed_path)
+                .ok()
+                .map(|m| *m.value);
 
-                // If no match with specific method, try HttpMethod::ALL (wildcard)
-                if found_key.is_none() && method != HttpMethod::ALL {
-                    prefix_router.at(path).ok().map(|m| *m.value)
-                } else {
-                    found_key
-                }
+            // If no match with specific method, try HttpMethod::ALL (wildcard)
+            if found_key.is_none() && method != HttpMethod::ALL {
+                snapshot.prefix_router.at(path).ok().map(|m| *m.value)
+            } else {
+                found_key
             }
         }?;
 
         // Look up route
-        let routes = safe_read(&self.routes);
-        let route = routes.get(&route_key)?;
+        let route = snapshot.routes.get(&route_key)?;
 
         // Check query parameter matches (ALL must match - AND logic)
         if !route.query_param_matches.is_empty()
@@ -3199,74 +2798,41 @@ mod tests {
     // TDD Cycle: Route LRU Cache for Performance
     // ============================================================================
 
-    /// RED: Test route cache improves lookup performance
-    ///
-    /// This test verifies:
-    /// 1. Route cache stores route key lookups
-    /// 2. Cache hits are tracked (observable via metrics or stats)
-    /// 3. Cache has bounded size with LRU eviction
+    /// Test repeated route lookups return consistent results (cache removed, snapshot-based)
     #[test]
-    fn test_route_cache_performance() {
+    fn test_route_lookup_consistency() {
         let router = Router::new();
 
-        // Add route
         let backends = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100)];
         router
             .add_route(HttpMethod::GET, "/api/users", backends.clone())
             .expect("Should add route");
 
-        // First lookup - should miss cache, populate it
+        // Multiple lookups should return the same backend
         let match1 = router
             .select_backend(HttpMethod::GET, "/api/users", None, None)
             .expect("Should find route");
-        assert_eq!(
-            match1.backend.as_ipv4().unwrap(),
-            Ipv4Addr::new(10, 0, 1, 1)
-        );
-
-        // Get cache stats after first lookup
-        let (hits_before, misses_before) = router.get_cache_stats();
-        assert_eq!(misses_before, 1, "First lookup should be a cache miss");
-        assert_eq!(hits_before, 0, "No hits yet");
-
-        // Second lookup - should hit cache
         let match2 = router
             .select_backend(HttpMethod::GET, "/api/users", None, None)
             .expect("Should find route again");
+
         assert_eq!(
-            match2.backend.as_ipv4().unwrap(),
-            Ipv4Addr::new(10, 0, 1, 1)
+            match1.backend.as_ipv4().unwrap(),
+            match2.backend.as_ipv4().unwrap()
         );
-
-        let (hits_after, misses_after) = router.get_cache_stats();
-        assert_eq!(hits_after, 1, "Second lookup should be a cache hit");
-        assert_eq!(misses_after, 1, "Still only one miss");
-
-        // Third lookup - should also hit cache
-        let _ = router.select_backend(HttpMethod::GET, "/api/users", None, None);
-        let (hits_final, _) = router.get_cache_stats();
-        assert_eq!(hits_final, 2, "Third lookup should also hit cache");
     }
 
     #[test]
-    fn test_route_cache_invalidation_on_route_change() {
+    fn test_route_update_returns_new_backend() {
         let router = Router::new();
 
-        // Add initial route
         let backends1 = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 1), 8080, 100)];
         router
             .add_route(HttpMethod::GET, "/api/test", backends1)
             .expect("Should add route");
 
-        // First lookup - populates cache
+        // Lookup returns first backend
         let _ = router.select_backend(HttpMethod::GET, "/api/test", None, None);
-        let (_, misses1) = router.get_cache_stats();
-        assert_eq!(misses1, 1, "First lookup is cache miss");
-
-        // Second lookup - cache hit
-        let _ = router.select_backend(HttpMethod::GET, "/api/test", None, None);
-        let (hits1, _) = router.get_cache_stats();
-        assert_eq!(hits1, 1, "Second lookup is cache hit");
 
         // Update route (same path, different backends)
         let backends2 = vec![Backend::from_ipv4(Ipv4Addr::new(10, 0, 1, 2), 8080, 100)];
@@ -3274,8 +2840,7 @@ mod tests {
             .add_route(HttpMethod::GET, "/api/test", backends2)
             .expect("Should update route");
 
-        // After route update, cache should be invalidated for this route
-        // Lookup should get new backend
+        // Lookup should get new backend after route update
         let match3 = router
             .select_backend(HttpMethod::GET, "/api/test", None, None)
             .expect("Should find updated route");
@@ -3287,10 +2852,10 @@ mod tests {
     }
 
     #[test]
-    fn test_route_cache_lru_eviction() {
+    fn test_many_routes_lookup() {
         let router = Router::new();
 
-        // Add many routes (more than cache size)
+        // Add many routes
         for i in 0..150 {
             let path = format!("/api/route{}", i);
             let backends = vec![Backend::from_ipv4(
@@ -3303,19 +2868,12 @@ mod tests {
                 .expect("Should add route");
         }
 
-        // Access all routes once to populate cache
+        // All routes should be accessible
         for i in 0..150 {
             let path = format!("/api/route{}", i);
-            let _ = router.select_backend(HttpMethod::GET, &path, None, None);
+            let result = router.select_backend(HttpMethod::GET, &path, None, None);
+            assert!(result.is_some(), "Route {} should be found", path);
         }
-
-        // Cache should not grow unbounded (verify via cache_size)
-        let cache_size = router.get_cache_size();
-        assert!(
-            cache_size <= 128,
-            "Cache should be bounded (got {} entries)",
-            cache_size
-        );
     }
 
     // ============================================
