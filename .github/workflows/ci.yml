@@ -19,7 +19,7 @@ jobs:
     name: CI (just ci)
     runs-on: arc-arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev
       - uses: dtolnay/rust-toolchain@stable
