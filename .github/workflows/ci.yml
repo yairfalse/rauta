@@ -17,7 +17,7 @@ jobs:
   # Main CI job - just calls `just ci`
   ci:
     name: CI (just ci)
-    runs-on: arc-arm64
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -48,7 +48,7 @@ jobs:
   # Status check for branch protection
   status:
     name: CI Status
-    runs-on: arc-arm64
+    runs-on: ubuntu-24.04-arm
     needs: [ci]
     if: always()
     steps:
